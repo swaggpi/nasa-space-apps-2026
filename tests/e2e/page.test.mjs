@@ -516,7 +516,8 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
       (els) => els.map((el) => el.textContent.replace(/\s+/g, " ").trim()));
     assert.deepEqual(labels, [
       "Show target marker",
-      "Difference from the other frames (white: brighter, black: fainter)",
+      "Difference from the other frames (white: brighter, black: fainter; bright stars always "
+        + "leave some)",
       "RA", "Dec", "Detector D1 · 0.75–1.1 µm "
         + "D2 · 1.1–1.6 µm D3 · 1.6–2.4 µm "
         + "D4 · 2.4–3.8 µm D5 · 3.8–4.4 µm "
@@ -762,7 +763,7 @@ for (const [name, reply] of [
         example: reply, search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
       });
       assert.equal(await statusText(page), EXAMPLE_FAILED);
-      for (const id of ["#prev", "#play", "#next", "#slider"]) {
+      for (const id of ["#prev", "#play", "#next", "#slider", "#difference"]) {
         assert.equal(await page.isDisabled(id), true, id);
       }
       assert.equal(await text(page, "#name"), "");
@@ -2102,6 +2103,9 @@ test("at 360 px width nothing scrolls sideways", { timeout: TIMEOUT }, async () 
   await page.setViewportSize({ width: 360, height: 800 });
   const { width, scrollWidth } = await layout(page, ["#difference-control"]);
   assert.ok(scrollWidth <= width, `page scrolls to ${scrollWidth} of ${width}`);
+  // The label wraps here; the checkbox must keep its size instead of being squeezed.
+  assert.deepEqual(await page.$eval("#difference", (el) => [el.offsetWidth, el.offsetHeight]),
+    [18, 18]);
   assertCleanRun(log);
 });
 

@@ -1,6 +1,6 @@
 # Difference view on real data
 
-Source: http://127.0.0.1:8270. Run: 2026-11-14 19:55 UTC.
+Source: http://127.0.0.1:8281. Run: 2026-11-14 20:41 UTC.
 
 Each frame minus the exposure-weighted average of the other frames, averaged over 3×3 pixels and drawn as the page draws it. Grey distance = |grey − 127.5| on the 0–255 scale (127.5 = full scale). C: largest within 5 px of the centre (29, 29); F: largest beyond 9 px; H: pixels beyond 9 px at 64 (half scale) or more. Only frames from more than 5 exposures are judged. HD 2811 is a control: a constant flux standard, whose residual at the centre is that of a bright star that does not change.
 
@@ -101,4 +101,4 @@ Each frame minus the exposure-weighted average of the other frames, averaged ove
 
 ## Verdict
 
-Pass: every must-show loop has a frame from more than 5 exposures, every such frame has C ≥ 50 and C ≥ 2 F, and no frame from more than 5 exposures has H > 0. C measures how strongly the centre is drawn, not whether it changed: compare the control.
+Pass: every must-show loop has a frame from more than 5 exposures, every such frame has C ≥ 50 and C ≥ 2 F, and its strongest such frame has C ≥ 100; every control frame from more than 5 exposures has C < 85; and no frame from more than 5 exposures has H > 0. C measures how strongly the centre is drawn, not whether it changed: a single target frame can be no stronger than the control; only the strongest frame of each target loop clearly exceeds it.

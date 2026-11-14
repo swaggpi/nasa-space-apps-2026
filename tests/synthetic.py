@@ -159,3 +159,24 @@ class FakeRangeReader:
         if url not in self.blobs:
             raise RemoteReadError(f"unknown URL {url}")
         return self.blobs[url][start:stop]
+
+
+# Keywords WCS.to_header writes from the observation time, not from the WCS cards themselves.
+TIME_KEYS = {"DATE-BEG", "DATE-AVG", "DATE-END", "MJD-BEG", "MJD-AVG", "MJD-END", "XPOSURE",
+             "TELAPSE"}
+
+
+def assert_same_wcs(reduced: WCS, full: WCS, size: int, step: int) -> None:
+    """Assert byte-equal positions both ways on a ``size`` x ``size`` grid of spacing ``step``,
+    the same pixel shape and the same SIP arrays."""
+    yy, xx = np.mgrid[0:size:step, 0:size:step]
+    x, y = xx.ravel().astype(float), yy.ravel().astype(float)
+    sky = full.all_pix2world(x, y, 0)
+    for a, b in zip(reduced.all_pix2world(x, y, 0), sky):
+        assert a.tobytes() == b.tobytes()
+    for a, b in zip(reduced.all_world2pix(*sky, 0, quiet=True),
+                    full.all_world2pix(*sky, 0, quiet=True)):
+        assert a.tobytes() == b.tobytes()
+    assert reduced.pixel_shape == full.pixel_shape
+    for name in ("a", "b", "ap", "bp"):
+        assert getattr(reduced.sip, name).tobytes() == getattr(full.sip, name).tobytes()

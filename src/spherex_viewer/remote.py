@@ -8,6 +8,7 @@ is computed from the headers.
 
 import io
 import math
+import re
 import time
 from typing import Protocol
 
@@ -34,6 +35,27 @@ _PAD = 3
 # What malformed headers or data make the parsing code raise (missing or mistyped keywords,
 # impossible sizes, an undecodable WCS).
 _MALFORMED = (KeyError, TypeError, ValueError, IndexError, OverflowError)
+# Keywords that define a two-axis primary celestial TAN-SIP WCS. astropy's WCS constructor
+# renders and re-parses every card it is given, so the other IMAGE cards are left out.
+_WCS_KEYWORD = re.compile(
+    r"NAXIS[12]?|WCSAXES|(CRPIX|CDELT|CROTA|CUNIT|CTYPE|CRVAL)[12]|(PC|CD)[12]_[12]"
+    r"|P[VS][12]_\d{1,2}|LONPOLE|LATPOLE|RADESYS|RADECSYS|EQUINOX|EPOCH|MJD-OBS|DATE-OBS|MJDREF"
+    r"|TIMESYS|(A|B|AP|BP)_(ORDER|DMAX|\d_\d)")
+# Cards outside _WCS_KEYWORD that change what WCS(header) does; any of them sends the whole
+# header to astropy. Line 1: another distortion (astropy names a DP1 record card DP1.EXTVER,
+# hence [\w.]*); lines 2-3: a third or two-digit axis. WCS(header) refuses the first two
+# (a stray NAXIS3 changes its pixel shape), the reduced header would be used. Line 4: the
+# same for matrix and PV cards, plus forms astropy still honours: zero-padded indices
+# (PC01_01) and the pre-standard PCiiijjj; without them the positions are off by up to 85 deg,
+# silently. No real header has such a card; alternate WCSs (suffix A, W) do not match.
+_FOREIGN_WCS = re.compile(
+    r"(CPDIS|CQDIS|CPERR|CQERR|D2IM|DVERR|D[PQ]\d)[\w.]*"
+    r"|(CRPIX|CDELT|CROTA|CUNIT|CTYPE|CRVAL|CNAME|CRDER|CSYER|CZPHS|CPERI)([3-9]|\d{2,})"
+    r"|NAXIS([3-9]|\d{2,})"
+    r"|(PC|CD)(?![12]_[12]$)\d+_\d+|(PC|CD)\d{6}|P[VS]([3-9]|\d{2,})_\d+")
+_TABLE_KEYWORDS = frozenset(("XTENSION", "BITPIX", "NAXIS", "NAXIS1", "NAXIS2", "PCOUNT", "GCOUNT",
+                             "TFIELDS", "TTYPE1", "TFORM1"))
+_PRIMARY_HEADER = fits.PrimaryHDU().header.tostring().encode("ascii")
 
 
 class RemoteReadError(RuntimeError):
@@ -118,6 +140,21 @@ def data_length(header: fits.Header) -> int:
     return -(-size // _BLOCK) * _BLOCK
 
 
+def celestial_wcs(header: fits.Header) -> WCS:
+    """Primary celestial WCS of an IMAGE ``header``, equal to ``WCS(header)`` for every header
+    layout tested.
+
+    A TAN-SIP header without any card matching ``_FOREIGN_WCS`` is reduced to its WCS cards
+    first (same transform, a fraction of the parsing time); any other header goes to astropy
+    whole, so an unknown layout is slower, never wrong.
+    """
+    if (header.get("CTYPE1") == "RA---TAN-SIP" and header.get("CTYPE2") == "DEC--TAN-SIP"
+            and not any(_FOREIGN_WCS.fullmatch(key) for key in header)):
+        return WCS(fits.Header([card for card in header.cards
+                                if _WCS_KEYWORD.fullmatch(card.keyword)]))
+    return WCS(header)
+
+
 def _sky_radius(wcs: WCS, shape: tuple[int, int]) -> tuple[float, float, float]:
     """RA and Dec (radians) of the centre of a ``shape`` (ny, nx) pixel array, and the largest
     separation (radians) of a corner pixel centre from it, all via the pixel-to-sky transform.
@@ -194,23 +231,23 @@ def decode_flag_rows(header: fits.Header, descriptors: np.ndarray, heap: bytes,
 
     ``descriptors`` is (n, 2) (byte count, heap offset) for consecutive image rows, ``heap``
     the heap bytes beginning at heap offset ``heap_start``, ``header`` the FLAGS table header.
-    A minimal FITS file holding only these rows is decoded by astropy. Returns int32
-    (n, ZNAXIS1); raises UnsupportedLayoutError when the rows cannot be decoded.
+    A minimal FITS file holding only these rows and the table and compression cards of
+    ``header`` is decoded by astropy; ``header`` is not modified. Returns int32 (n, ZNAXIS1);
+    raises UnsupportedLayoutError when the rows cannot be decoded.
     """
     desc = np.asarray(descriptors, dtype=np.int64).reshape(-1, 2).copy()
     desc[:, 1] -= heap_start
     if np.any(desc < 0) or np.any(desc[:, 0] + desc[:, 1] > len(heap)):
         raise ValueError("descriptors point outside the given heap bytes")
     n_rows = desc.shape[0]
-    mini = header.copy()
+    mini = fits.Header([card for card in header.cards
+                        if card.keyword in _TABLE_KEYWORDS or card.keyword.startswith("Z")]).copy()
     mini["NAXIS2"] = n_rows
     mini["ZNAXIS2"] = n_rows
     mini["PCOUNT"] = len(heap)
-    mini.remove("THEAP", ignore_missing=True)
     body = desc.astype(">i4").tobytes() + heap
     body += b"\0" * (-len(body) % _BLOCK)
-    blob = (fits.PrimaryHDU().header.tostring().encode("ascii")
-            + mini.tostring().encode("ascii") + body)
+    blob = _PRIMARY_HEADER + mini.tostring().encode("ascii") + body
     try:
         with fits.open(io.BytesIO(blob)) as hdul:
             return np.array(hdul[1].data, dtype=np.int32)
@@ -339,7 +376,7 @@ def read_window(reader: RangeReader, url: str, target: WCS,
     """
     try:
         header, data_start = _read_image_header(reader, url)
-        wcs = WCS(header)
+        wcs = celestial_wcs(header)
         detector_shape = (header["NAXIS2"], header["NAXIS1"])
         box = footprint_window(wcs, detector_shape, target, target_shape)
         if box is None:

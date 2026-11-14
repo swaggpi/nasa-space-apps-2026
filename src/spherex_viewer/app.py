@@ -55,7 +55,8 @@ MAX_CONCURRENT_SEARCHES = 4
 # search normally waits a few seconds and gives up before an unresponsive archive frees a slot.
 SEARCH_WAIT_S = 30.0
 MAX_CONCURRENT_FRAMES = 4
-# A full frame takes ~3 s on the shared 4-thread pool, so 4 running builds clear in ~12 s.
+# A full frame takes about 1.5-3 s on the shared 8-thread pool, so 4 running builds clear
+# well within the wait.
 FRAME_WAIT_S = 15.0
 
 INVALID_REQUEST = "Invalid request."
@@ -222,8 +223,9 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cache = CutoutCache(cache_dir, max_bytes)
         client = httpx.Client(
-            timeout=httpx.Timeout(connect=10, read=30, write=10, pool=60),
-            limits=httpx.Limits(max_connections=8),
+            timeout=httpx.Timeout(connect=5, read=10, write=10, pool=60),
+            # 8 exposure reads plus 4 searches, so a search never queues behind range reads.
+            limits=httpx.Limits(max_connections=12),
         )
         try:
             builder = FrameBuilder(reader if reader is not None else HttpRangeReader(client),
