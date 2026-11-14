@@ -55,7 +55,7 @@ class HttpRangeReader:
         """Return bytes [start, stop) of ``url``.
 
         Transport errors, 429 and 5xx are retried after sleeping ``backoff_s``, then
-        ``3 * backoff_s``, ...; any other status other than 206 fails at once. A 200 is an error
+        ``3 * backoff_s``, ...; any other status except 206 fails at once. A 200 is an error
         because it means the server ignored the range and would send the whole file.
         """
         if stop <= start:
