@@ -1,4 +1,4 @@
-"""Tests of masking, background, reprojection and combine (DESIGN.md 5.4-5.8; test-plan rows 18-22)."""
+"""Tests of masking, background, reprojection and combine (DESIGN.md 5.4-5.8; rows 18-22)."""
 
 import io
 import warnings
@@ -184,9 +184,9 @@ ALIGN_CASES = [
     (37.0, (0.01, 0.02)),
     (201.0, (-0.03, 0.01)),
     (-80.0, (0.05, -0.04)),
-    (37.0, (0.16, 0.0)),
-    (201.0, (0.0, -0.16)),
-    (-80.0, (-0.11, 0.11)),
+    (37.0, (0.0, 0.24)),
+    (201.0, (-0.16, 0.24)),
+    (-80.0, (0.24, 0.16)),
 ]
 
 
@@ -204,7 +204,7 @@ def test_star_lands_on_target_pixel(rot_deg, offset, sip):
 
 
 def test_sip_is_honoured():
-    center = (TARGET_RA - 0.11, TARGET_DEC + 0.11)
+    center = (TARGET_RA + 0.24, TARGET_DEC + 0.16)
     image, flags, header = open_exposure(make_exposure(center, STAR, rot_deg=-80.0, seed=21))
     wcs_sip = make_wcs(header)
     wcs_tan = make_wcs(strip_sip(header))
@@ -213,7 +213,7 @@ def test_sip_is_honoured():
     det = wcs_sip.all_world2pix(*STAR, 0)
     expected_tan = np.array(TARGET.all_world2pix(*wcs_tan.all_pix2world(*det, 0), 0), dtype=float)
     predicted_shift = np.hypot(*(expected_tan - np.array(STAR_PIXEL)))
-    assert predicted_shift > 0.25
+    assert predicted_shift > 0.4
 
     with_sip = fit_centroid(cutout.align(window_for(image, flags, wcs_sip), TARGET, TARGET_SHAPE),
                             *STAR_PIXEL)
@@ -221,7 +221,8 @@ def test_sip_is_honoured():
         cutout.align(window_for(image, flags, wcs_tan), TARGET, TARGET_SHAPE), *STAR_PIXEL)
     assert np.hypot(with_sip[0] - STAR_PIXEL[0], with_sip[1] - STAR_PIXEL[1]) <= 0.1
     assert np.hypot(without_sip[0] - expected_tan[0], without_sip[1] - expected_tan[1]) <= 0.1
-    assert np.hypot(without_sip[0] - with_sip[0], without_sip[1] - with_sip[1]) > 0.2
+    moved = np.hypot(without_sip[0] - with_sip[0], without_sip[1] - with_sip[1])
+    assert moved > 0.5 * predicted_shift
 
 
 # Row 22

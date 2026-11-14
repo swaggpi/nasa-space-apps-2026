@@ -1,4 +1,4 @@
-"""Tests of byte-range reading of FITS windows (DESIGN.md 3 remote.py, 5.3; test-plan rows 13-17)."""
+"""Tests of byte-range reading of FITS windows (DESIGN.md 3, 5.3; test-plan rows 13-17)."""
 
 import io
 import struct
