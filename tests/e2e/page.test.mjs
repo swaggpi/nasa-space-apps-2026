@@ -9,20 +9,23 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  computeStretch, difference, toDifferenceRGBA, toRGBA,
+  computeStretch, difference, fieldTexts, formatPosition, offsetPosition, stageBox,
+  toDifferenceRGBA, toRGBA,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const { chromium } = createRequire(import.meta.url)("playwright");
 
 const REPO = resolve(fileURLToPath(import.meta.url), "../../..");
 const SIZE = 59;
+const WIDE = 3 * SIZE;
 // Every element of the body as parent>tag#id, in document order: the complete UI.
 const BODY = [
   "body>main#viewer",
   "main>section#player",
-  "section>div#frame", "div>canvas#image", "div>div#marker",
+  "section>div#frame", "div>div#stage", "div>canvas#image", "div>div#marker",
   "section>div#controls",
   "div>button#prev", "div>button#play", "div>button#next", "div>input#slider",
+  "div>button#zoom-out", "div>button#zoom-in",
   "section>p#date",
   "section>div#sky", "div>div#sky-view", "div>div#sky-map", "div>p#sky-credit",
   "div>div#sky-bar", "div>p#sky-selection", "div>button#sky-search", "div>button#sky-close",
@@ -223,24 +226,63 @@ function skyOk(url) {
   return { status: 404, raw: "Not Found" };
 }
 
+/** Base64 of little-endian float32 values; null becomes NaN (no data). */
+function float32Base64(values) {
+  return Buffer.from(new Float32Array(values.map((v) => v ?? NaN)).buffer).toString("base64");
+}
+
+/**
+ * Wide-grid pixels: `narrow` (59x59) at the centre and `around(x, y)` in the eight fields
+ * around it, x and y in wide-grid pixels.
+ */
+function widePixels(narrow, around) {
+  return Array.from({ length: WIDE * WIDE }, (_, i) => {
+    const x = i % WIDE;
+    const y = Math.floor(i / WIDE);
+    const inside = x >= SIZE && x < 2 * SIZE && y >= SIZE && y < 2 * SIZE;
+    return inside ? narrow[(y - SIZE) * SIZE + x - SIZE] : around(x, y);
+  });
+}
+
+/** A wide frame answer; `nFields` defaults to `nUsed` in every field. */
+function wideBody(values, nUsed, nFields = Array(9).fill(nUsed)) {
+  return {
+    status: 200,
+    body: { width: WIDE, height: WIDE, pixels_b64: float32Base64(values), n_used: nUsed,
+      n_fields: nFields },
+  };
+}
+
+/**
+ * The default wide answer: the narrow answer served for the same exposures at the centre and
+ * no data around it, so that the 6' field looks and compares exactly as before.
+ */
+function wideAsServed(n, payload, served) {
+  const narrow = served.get(payload.uris.join());
+  return wideBody(widePixels(narrow.pixels, () => null), narrow.n_used,
+    [0, 0, 0, 0, narrow.n_used, 0, 0, 0, 0]);
+}
+
 /**
  * Opens the page at `query` with `example.json`, `api/search`, `api/frame` and the sky survey
  * stubbed. `example()`, `search(url)`, `frame(n, body)` (n counts frame requests, body is the
- * parsed request) and `sky(url)` return {status, body, headers} (body JSON-encoded unless
- * `raw` or `jpeg` is given, headers optional) or {abort: true}; `search: null` sends searches
- * to the real server; any other foreign request is aborted and logged. `aladin` false fails
- * the request for the map script. Unless `wait` is false, returns once a frame, the example's
- * failure or a status is shown.
+ * parsed request), `wide(n, body, served)` (the same for requests with `fields: 3`, logged in
+ * `log.wides`; `served` maps the joined URIs to the last narrow answer body) and `sky(url)`
+ * return {status, body, headers} (body JSON-encoded unless `raw` or `jpeg` is given, headers
+ * optional) or {abort: true}; `search: null` sends searches to the real server; any other
+ * foreign request is aborted and logged. `aladin` false fails the request for the map script.
+ * Unless `wait` is false, returns once a frame, the example's failure or a status is shown.
  */
 async function openPage({
-  search = unusedSearch, frame = () => ({ status: 200, body: {} }), example = exampleOk,
-  sky = skyOk, aladin = true, wait = true, query = "",
+  search = unusedSearch, frame = () => ({ status: 200, body: {} }), wide = wideAsServed,
+  example = exampleOk, sky = skyOk, aladin = true, wait = true, query = "",
 }) {
   const origin = new URL(baseUrl).origin;
   const log = {
     requests: [], foreign: [], sky: [], scripts: [], searches: [], frames: [], unexpectedApi: [],
-    errors: [], examples: [], frameTimes: [], inFlight: 0, maxInFlight: 0,
+    errors: [], examples: [], frameTimes: [], inFlight: 0, maxInFlight: 0, wides: [],
   };
+  const served = new Map();
   const page = await context.newPage();
   page.on("request", (request) => log.requests.push(request.url()));
   page.on("pageerror", (error) => log.errors.push(String(error)));
@@ -284,6 +326,12 @@ async function openPage({
       if (search === null) return route.continue();
       return reply(route, await search(url));
     }
+    if (url.pathname === "/api/frame" && request.method() === "POST"
+      && JSON.parse(request.postData()).fields === 3) {
+      const payload = JSON.parse(request.postData());
+      log.wides.push(payload);
+      return reply(route, await wide(log.wides.length - 1, payload, served));
+    }
     if (url.pathname === "/api/frame" && request.method() === "POST") {
       const n = log.frames.length;
       const payload = JSON.parse(request.postData());
@@ -293,7 +341,11 @@ async function openPage({
       log.inFlight += 1;
       log.maxInFlight = Math.max(log.maxInFlight, log.inFlight);
       try {
-        return await reply(route, await frame(n, payload));
+        const answer = await frame(n, payload);
+        if (answer.status === 200 && Array.isArray(answer.body?.pixels)) {
+          served.set(payload.uris.join(), answer.body);
+        }
+        return await reply(route, answer);
       } finally {
         times.answered = Date.now();
         log.inFlight -= 1;
@@ -358,7 +410,7 @@ async function waitForStatus(page, predicate) {
 }
 
 const finished = (text) => !text.startsWith("Searching") && !text.startsWith("Loading")
-  && !text.startsWith("Waiting");
+  && !text.startsWith("Waiting") && !text.includes("Loading the surrounding area");
 
 async function finalStatus(page) {
   return waitForStatus(page, (text) => text !== "" && finished(text));
@@ -372,6 +424,12 @@ async function recordStatuses(page) {
       for (const r of records) window.statusHistory.push(r.addedNodes[0]?.textContent ?? "");
     }).observe(document.querySelector("#status"), { childList: true });
   });
+}
+
+/** Status texts after a search's `done`: the surround loads for its n frames, then `done`. */
+function surroundStatuses(done, n) {
+  return [done, ...Array.from({ length: n },
+    (_, i) => `${done} Loading the surrounding area: frame ${i + 1} of ${n}\u2026`), done];
 }
 
 /** Recorded status texts, consecutive repeats merged. */
@@ -394,14 +452,16 @@ async function selectFrame(page, value) {
   }, value);
 }
 
-/** RGBA bytes of the canvas backing store. */
+/** RGBA bytes of the canvas backing store's central 59x59 field (all of it on a 59 grid). */
 async function canvasPixels(page) {
-  return page.$eval("#image", (el) => Array.from(
-    el.getContext("2d").getImageData(0, 0, el.width, el.height).data));
+  return page.$eval("#image", (el, size) => {
+    const offset = (el.width - size) / 2;
+    return Array.from(el.getContext("2d").getImageData(offset, offset, size, size).data);
+  }, SIZE);
 }
 
 /** RGBA bytes of an element as rendered on screen, with its size in CSS pixels. */
-async function renderedCanvas(page, selector = "#image") {
+async function renderedCanvas(page, selector = "#frame") {
   const png = await page.locator(selector).screenshot();
   return page.evaluate(async (b64) => {
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
@@ -529,6 +589,8 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
       ["prev", "\u2039", "Previous frame"],
       ["play", "Play", null],
       ["next", "\u203a", "Next frame"],
+      ["zoom-out", "\u2212", "Zoom out"],
+      ["zoom-in", "+", "Zoom in"],
       ["sky-search", "Search here", null],
       ["sky-close", "Close map", null],
       ["pick", "Pick on sky map", null],
@@ -1660,7 +1722,7 @@ for (const { status, headers, seconds } of [
         `Waiting ${seconds} s before continuing.`,
         "Loading frame 2 of 3\u2026",
         "Loading frame 3 of 3\u2026",
-        done,
+        ...surroundStatuses(done, 3),
       ]);
       assert.deepEqual(requestedFrames(plan, log), [0, 1, 1, 2]);
       const gap = log.frameTimes[2].sent - log.frameTimes[1].answered;
@@ -1743,7 +1805,8 @@ test("a new search during a wait cancels the old retry and its result stays",
     await page.waitForTimeout(2500);
     assert.deepEqual(log.frames.map((f) => f.ra_deg), [first.ra_deg, second.ra_deg]);
     assert.deepEqual(await statusHistory(page),
-      ["Searching the SPHEREx archive\u2026", "Loading frame 1 of 1\u2026", done]);
+      ["Searching the SPHEREx archive\u2026", "Loading frame 1 of 1\u2026",
+        ...surroundStatuses(done, 1)]);
     assert.equal(await text(page, "#name"), "RA 10, Dec -7.245147");
     assert.equal(await dateText(page), "2026-05-01 \u00b7 5 exposures");
     assertCleanRun(log);
@@ -1768,7 +1831,7 @@ for (const nullFrame of [null, 2]) {
       "Loading frame 1 of 3\u2026",
       "Loading frame 2 of 3\u2026",
       "Loading frame 3 of 3\u2026",
-      done,
+      ...surroundStatuses(done, 3),
     ]);
     assertCleanRun(log);
   });
@@ -1987,7 +2050,7 @@ test("Search here follows the loading rules: a refused search waits once, a fram
     "Loading frame 1 of 3\u2026",
     "Loading frame 2 of 3\u2026",
     "Loading frame 3 of 3\u2026",
-    done,
+    ...surroundStatuses(done, 2),
   ]);
   assert.equal(log.searches.length, 2);
   for (const url of log.searches) assert.equal(url.searchParams.get("ra"), pick.text[1]);
@@ -2308,3 +2371,434 @@ test("with Difference ticked, the map opened during playback leaves both running
   assert.equal(await page.getAttribute("#image", "aria-label"), DIFFERENCE_LABEL);
   assertCleanMapRun(log);
 });
+
+// --- Zooming and moving ----------------------------------------------------------------------
+
+/** A wide answer with the narrow answer served for the same exposures at its centre. */
+function texturedWide(n, payload, served) {
+  const narrow = served.get(payload.uris.join());
+  return wideBody(widePixels(narrow.pixels, (x, y) => ((x * 5 + y * 3) % 40) / 100),
+    narrow.n_used);
+}
+
+/** Searches `plan` and waits until its surround has replaced the narrow frames. */
+async function openWithSurround({ plan = makePlan(THREE_FRAMES), ...options } = {}) {
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+    ...options,
+  });
+  await submit(page);
+  await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+  await finalStatus(page);
+  await page.evaluate(() => document.activeElement.blur());
+  return { page, log, plan };
+}
+
+/** The stage's size and offset in percent of the frame, as on screen. */
+async function stageGeometry(page) {
+  return page.evaluate(() => {
+    const frame = document.querySelector("#frame").getBoundingClientRect();
+    const stage = document.querySelector("#stage").getBoundingClientRect();
+    return {
+      size: (100 * stage.width) / frame.width,
+      left: (100 * (stage.left - frame.left)) / frame.width,
+      top: (100 * (stage.top - frame.top)) / frame.height,
+    };
+  });
+}
+
+async function assertStage(page, view, grid) {
+  const actual = await stageGeometry(page);
+  const expected = stageBox(view, grid);
+  for (const key of ["size", "left", "top"]) {
+    assert.ok(Math.abs(actual[key] - expected[key]) < 0.05,
+      `${key}: ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`);
+  }
+}
+
+const press = async (page, key, times = 1) => {
+  for (let i = 0; i < times; i++) await page.keyboard.press(key);
+};
+
+const apiRequests = (log) => log.requests.filter((u) => new URL(u).pathname.startsWith("/api/"));
+
+test("zooming during playback steps through every level without stopping playback",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround();
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    const centre = { cx: 88, cy: 88 };
+    await assertStage(page, { zoom: 1, ...centre }, WIDE);
+    for (const zoom of [2, 4]) {
+      await page.keyboard.type("+");
+      await assertStage(page, { zoom, ...centre }, WIDE);
+    }
+    assert.equal(await page.isDisabled("#zoom-in"), true);
+    await page.keyboard.type("+");
+    await assertStage(page, { zoom: 4, ...centre }, WIDE);
+    for (const zoom of [2, 1, 1 / 2]) {
+      await page.click("#zoom-out");
+      await assertStage(page, { zoom, ...centre }, WIDE);
+    }
+    await page.evaluate(() => document.activeElement.blur());
+    await page.keyboard.type("-");
+    await assertStage(page, { zoom: 1 / 3, ...centre }, WIDE);
+    assert.equal(await page.isDisabled("#zoom-out"), true);
+    await page.click("#zoom-in");
+    await assertStage(page, { zoom: 1 / 2, ...centre }, WIDE);
+    await page.evaluate(() => document.activeElement.blur());
+    await page.keyboard.press("Equal");
+    await assertStage(page, { zoom: 1, ...centre }, WIDE);
+
+    assert.equal(await text(page, "#play"), "Pause");
+    const before = (await sliderState(page)).value;
+    await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+      before, { timeout: 2000 });
+    assert.equal(await text(page, "#play"), "Pause");
+    assertCleanRun(log);
+  });
+
+test("the surround replaces the frames with the picture unchanged and enables zooming out",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      wide: async (n, payload, served) => {
+        await gate.promise;
+        return texturedWide(n, payload, served);
+      },
+    });
+    try {
+      await page.setViewportSize({ width: 1366, height: 768 });
+      await submit(page);
+      const done = `3 frames from 42 of 42 exposures. ${NO_DATA}`;
+      assert.equal(await waitForStatus(page, (t) => t.includes("surrounding")),
+        `${done} Loading the surrounding area: frame 1 of 3…`);
+      await selectFrame(page, 1);
+      assert.equal(await page.isDisabled("#zoom-out"), true);
+      assert.equal(await page.isDisabled("#zoom-in"), false);
+      assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [SIZE, SIZE]);
+      const before = await page.locator("#frame").screenshot();
+      gate.release();
+      await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+      assert.equal(await finalStatus(page), done);
+      assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [WIDE, WIDE]);
+      assert.ok(before.equals(await page.locator("#frame").screenshot()), "picture changed");
+      assert.equal((await sliderState(page)).value, 1);
+      assert.equal(await page.isDisabled("#zoom-out"), false);
+      assert.deepEqual(log.wides.map((p) => [p.fields, planIndex(plan, p), p.ra_deg, p.dec_deg]),
+        [0, 1, 2].map((i) => [3, i, plan.ra_deg, plan.dec_deg]));
+      assert.equal(log.frames.length, 3);
+      assert.equal(log.searches.length, 1);
+
+      await page.click("#zoom-out");
+      await assertStage(page, { zoom: 1 / 2, cx: 88, cy: 88 }, WIDE);
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("moving and zooming inside the loaded area sends no request", { timeout: TIMEOUT },
+  async () => {
+    const { page, log } = await openWithSurround();
+    const sent = apiRequests(log).length;
+    await page.keyboard.type("+");
+    await press(page, "ArrowLeft", 6);
+    await press(page, "ArrowUp", 6);
+    await assertStage(page, { zoom: 2, cx: 88 - 24, cy: 88 - 24 }, WIDE);
+    await page.keyboard.type("-");
+    await press(page, "ArrowRight", 8);
+    await press(page, "ArrowDown", 8);
+    await page.keyboard.type("-");
+    await assertStage(page, { zoom: 1 / 2, cx: 117.5, cy: 117.5 }, WIDE);
+    await page.waitForTimeout(800);
+    assert.equal(apiRequests(log).length, sent);
+    assert.deepEqual([log.searches.length, log.frames.length, log.wides.length], [1, 3, 3]);
+    assertCleanRun(log);
+  });
+
+test("a key held at the edge searches the next area once, only after it rests",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const { page, log } = await openWithSurround({
+      plan,
+      search: async (url) => {
+        if (url.searchParams.get("ra") === RA) return { status: 200, body: plan };
+        await gate.promise;
+        return { status: 500, body: { detail: "unused" } };
+      },
+    });
+    try {
+      await press(page, "ArrowLeft", 9);
+      await assertStage(page, { zoom: 1, cx: 29, cy: 88 }, WIDE);
+      for (let i = 0; i < 20; i++) await page.keyboard.down("ArrowLeft");
+      await page.keyboard.up("ArrowLeft");
+      await page.waitForTimeout(300);
+      assert.equal(log.searches.length, 1);
+      await waitForStatus(page, (t) => t === "Searching the next area…");
+      assert.equal(log.searches.length, 2);
+      const params = log.searches[1].searchParams;
+      const east = offsetPosition(plan.ra_deg, plan.dec_deg, -SIZE, 0);
+      assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
+        [fieldTexts(east.ra, east.dec).ra, fieldTexts(east.ra, east.dec).dec, "D2"]);
+
+      for (let i = 0; i < 10; i++) await page.keyboard.down("ArrowLeft");
+      await page.keyboard.up("ArrowLeft");
+      await press(page, "ArrowUp", 3);
+      await press(page, "ArrowLeft", 3);
+      await page.waitForTimeout(900);
+      assert.equal(log.searches.length, 2);
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("the next area replaces the frames with the view, zoom and playback kept and a new link",
+  { timeout: TIMEOUT }, async () => {
+    const first = makePlan(THREE_FRAMES);
+    const east = offsetPosition(first.ra_deg, first.dec_deg, -SIZE, 0);
+    const eastTexts = fieldTexts(east.ra, east.dec);
+    const second = {
+      ...makePlan([
+        { label: "2025-06-01", n_available: 9, n_used: 9 },
+        { label: "2025-12-01", n_available: 6, n_used: 6 },
+      ]),
+      ra_deg: east.ra, dec_deg: east.dec,
+    };
+    let searches = 0;
+    const { page, log } = await openWithSurround({
+      plan: first,
+      search: () => {
+        searches += 1;
+        if (searches === 1) return { status: 200, body: first };
+        if (searches === 2) return { status: 200, body: second };
+        return { status: 502, body: { detail: "The archive could not be reached." } };
+      },
+      wide: (n, payload, served) => (payload.ra_deg === first.ra_deg
+        ? texturedWide(n, payload, served)
+        : wideBody(widePixels(pixels(n), () => 0.3), payload.uris.length)),
+    });
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    await page.keyboard.type("+");
+    await press(page, "ArrowLeft", 25);
+    await page.waitForFunction((ra) => location.search.includes(ra), eastTexts.ra);
+    assert.equal(await finalStatus(page), `2 frames from 15 of 15 exposures. ${NO_DATA}`);
+    const link = `?ra=${eastTexts.ra}&dec=${eastTexts.dec}&detector=D2`;
+    assert.equal(await page.evaluate(() => location.search), link);
+    assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
+      [eastTexts.ra, eastTexts.dec]);
+    assert.equal(await text(page, "#name"), `RA ${eastTexts.ra}, Dec ${eastTexts.dec}`);
+    assert.equal(await text(page, "#position"), formatPosition(east.ra, east.dec, "D2"));
+    await assertStage(page, { zoom: 2, cx: 14.25 + SIZE, cy: 88 }, WIDE);
+    assert.equal((await sliderState(page)).max, 1);
+    assert.equal(log.wides.filter((p) => p.ra_deg === east.ra).length, 2);
+    assert.equal(log.frames.length, 3);
+    assert.equal(await text(page, "#play"), "Pause");
+    const value = (await sliderState(page)).value;
+    await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+      value, { timeout: 2000 });
+
+    await press(page, "ArrowLeft", 20);
+    assert.equal(await waitForStatus(page, (t) => t.startsWith("The next area")),
+      "The next area could not be loaded: The archive could not be reached.");
+    assert.equal(log.searches.length, 3);
+    assert.equal(await page.evaluate(() => location.search), link);
+    assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
+      [eastTexts.ra, eastTexts.dec]);
+    assert.equal((await sliderState(page)).max, 1);
+    assert.equal(await text(page, "#position"), formatPosition(east.ra, east.dec, "D2"));
+    await assertStage(page, { zoom: 2, cx: 14.25, cy: 88 }, WIDE);
+    assertCleanRun(log);
+  });
+
+test("zoom and arrow keys typed in a text field or the detector list leave the view alone",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround();
+    const view = { zoom: 1, cx: 88, cy: 88 };
+    await page.fill("#ra", "12");
+    await page.focus("#ra");
+    await page.keyboard.type("-+=");
+    await press(page, "ArrowLeft", 2);
+    await page.keyboard.type("3");
+    await press(page, "ArrowUp");
+    assert.equal(await page.inputValue("#ra"), "12-3+=");
+    await assertStage(page, view, WIDE);
+    await page.focus("#detector");
+    await press(page, "ArrowDown");
+    await page.keyboard.type("+");
+    await assertStage(page, view, WIDE);
+    await page.waitForTimeout(700);
+    assert.equal(log.searches.length, 1);
+    assertCleanRun(log);
+  });
+
+test("arrows on the focused timeline step frames; on the Difference box they move the view",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround();
+    const view = { zoom: 1, cx: 88, cy: 88 };
+    await page.focus("#slider");
+    await press(page, "ArrowRight");
+    assert.equal((await sliderState(page)).value, 1);
+    assert.equal(await dateText(page), "2025-11-07 – 2025-11-10 · 19 exposures");
+    await assertStage(page, view, WIDE);
+    await page.focus("#difference");
+    await press(page, "ArrowLeft");
+    await assertStage(page, { ...view, cx: 81 }, WIDE);
+    assert.equal(await page.isChecked("#difference"), false);
+    assert.equal(await page.evaluate(() => window.scrollX), 0);
+    assertCleanRun(log);
+  });
+
+test("the example zooms in and moves inside its field without any request; the marker stays",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    const assertMarker = async (view) => {
+      const g = await page.evaluate(() => {
+        const frame = document.querySelector("#frame").getBoundingClientRect();
+        const box = document.querySelector("#marker").getBoundingClientRect();
+        return { frame: { left: frame.left, top: frame.top, width: frame.width },
+          cx: box.left + box.width / 2, cy: box.top + box.height / 2, width: box.width };
+      });
+      const pixel = (g.frame.width * view.zoom) / SIZE;
+      const { left, top } = stageBox(view, SIZE);
+      const x = g.frame.left + (left / 100) * g.frame.width + (EXAMPLE_MARKERS[0].x + 0.5) * pixel;
+      const y = g.frame.top + (top / 100) * g.frame.width + (EXAMPLE_MARKERS[0].y + 0.5) * pixel;
+      assert.ok(Math.abs(g.cx - x) <= 1 && Math.abs(g.cy - y) <= 1,
+        `marker at ${g.cx},${g.cy}, expected ${x},${y}`);
+      assert.ok(Math.abs(g.width - 6 * pixel) <= 1, `marker ${g.width} px, pixel ${pixel} px`);
+    };
+    assert.equal(await page.isDisabled("#zoom-out"), true);
+    assert.equal(await page.isDisabled("#zoom-in"), false);
+    await assertMarker({ zoom: 1, cx: 29, cy: 29 });
+    await page.keyboard.type("-");
+    await press(page, "ArrowLeft", 3);
+    await press(page, "ArrowDown", 3);
+    await page.waitForTimeout(700);
+    await assertStage(page, { zoom: 1, cx: 29, cy: 29 }, SIZE);
+    assert.equal(await page.isDisabled("#zoom-out"), true);
+
+    await page.click("#zoom-in");
+    await page.click("#zoom-in");
+    assert.equal(await page.isDisabled("#zoom-out"), false);
+    await page.evaluate(() => document.activeElement.blur());
+    await assertMarker({ zoom: 4, cx: 29, cy: 29 });
+    await press(page, "ArrowLeft", 3);
+    await assertStage(page, { zoom: 4, cx: 23, cy: 29 }, SIZE);
+    await assertMarker({ zoom: 4, cx: 23, cy: 29 });
+    await press(page, "ArrowLeft", 15);
+    await press(page, "ArrowUp", 15);
+    await page.waitForTimeout(700);
+    await assertStage(page, { zoom: 4, cx: 6.875, cy: 6.875 }, SIZE);
+    assert.deepEqual(apiRequests(log), []);
+    assert.equal(await page.$eval("#image", (el) => el.width), SIZE);
+    assertCleanRun(log);
+  });
+
+test("a surround refused twice leaves the loop as it was and Zoom out tries again",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const busy = "The server is busy; try again shortly.";
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      wide: (n, payload, served) => (n < 2
+        ? { status: 503, body: { detail: busy }, headers: { "Retry-After": "1" } }
+        : texturedWide(n, payload, served)),
+    });
+    await submit(page);
+    const done = `3 frames from 42 of 42 exposures. ${NO_DATA}`;
+    assert.equal(await waitForStatus(page, (t) => t.includes("could not")),
+      `${done} The surrounding area could not be loaded: ${busy}`);
+    assert.equal(log.wides.length, 2);
+    assert.equal(await page.$eval("#image", (el) => el.width), SIZE);
+    assert.deepEqual(await canvasPixels(page),
+      Array.from(toRGBA(pixels(0), computeStretch([0, 1, 2].map((n) => pixels(n))))));
+    await page.click("#play");
+    const before = (await sliderState(page)).value;
+    await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+      before, { timeout: 2000 });
+    assert.equal(await page.isDisabled("#zoom-out"), false);
+    await page.click("#zoom-out");
+    await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+    assert.equal(await finalStatus(page), done);
+    assert.equal(log.wides.length, 5);
+    assert.equal(await text(page, "#play"), "Pause");
+    assertCleanRun(log);
+  });
+
+test("a search of more than 120 exposures loads its surround only at the first zoom-out",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan([
+      { label: "2025-05-06", n_available: 40, n_used: 40 },
+      { label: "2025-11-07", n_available: 40, n_used: 40 },
+      { label: "2026-04-20", n_available: 41, n_used: 41 },
+    ]);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+    });
+    await submit(page);
+    assert.equal(await finalStatus(page), `3 frames from 121 of 121 exposures. ${NO_DATA}`);
+    await page.waitForTimeout(800);
+    assert.equal(log.wides.length, 0);
+    await page.click("#zoom-in");
+    await page.click("#zoom-out");
+    await page.waitForTimeout(300);
+    assert.equal(log.wides.length, 0);
+    await page.click("#zoom-out");
+    await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+    assert.equal(log.wides.length, 3);
+    await assertStage(page, { zoom: 1, cx: 88, cy: 88 }, WIDE);
+    assertCleanRun(log);
+  });
+
+test("the date label gives the range of exposures over the fields in view",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan([
+      { label: "2025-05-06", n_available: 24, n_used: 24 },
+      { label: "2025-11-07", n_available: 24, n_used: 24 },
+    ]);
+    const counts = [23, 23, 23, 24, 24, 24, 23, 23, 23];
+    const { page, log } = await openWithSurround({
+      plan,
+      wide: (n, payload, served) => wideBody(
+        widePixels(served.get(payload.uris.join()).pixels, () => 0.2), 24, counts),
+    });
+    assert.equal(await dateText(page), "2025-05-06 · 24 exposures");
+    await press(page, "ArrowUp");
+    const range = "2025-05-06 · 23–24 exposures";
+    assert.equal(await dateText(page), range);
+    assert.equal(await page.getAttribute("#slider", "aria-valuetext"), range);
+    await page.click("#next");
+    assert.equal(await dateText(page), "2025-11-07 · 23–24 exposures");
+    await page.evaluate(() => document.activeElement.blur());
+    await press(page, "ArrowDown");
+    assert.equal(await dateText(page), "2025-11-07 · 24 exposures");
+    assert.equal(await statusText(page), `2 frames from 48 of 48 exposures. ${NO_DATA}`);
+    assertCleanRun(log);
+  });
+
+test("keys do nothing while the sky map is open; on a phone the timeline keeps its width",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround();
+    await openMap(page);
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.type("+-");
+    await press(page, "ArrowLeft", 12);
+    await page.waitForTimeout(700);
+    await page.click("#sky-close");
+    await assertStage(page, { zoom: 1, cx: 88, cy: 88 }, WIDE);
+    assert.equal(log.searches.length, 1);
+
+    await page.setViewportSize({ width: 360, height: 740 });
+    const { rects, width, scrollWidth } = await layout(page,
+      ["#slider", "#prev", "#zoom-in", "#frame"]);
+    const slider = rects["#slider"];
+    assert.ok(slider.right - slider.left >= 150, `slider ${slider.right - slider.left} px`);
+    assert.ok(rects["#zoom-in"].bottom <= slider.top, "zoom buttons not above the timeline");
+    assert.ok(rects["#zoom-in"].right <= width && scrollWidth <= width);
+    assertCleanMapRun(log);
+  });

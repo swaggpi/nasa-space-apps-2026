@@ -297,3 +297,23 @@ def test_combine_empty_raises():
 def test_combine_shape_mismatch_raises():
     with pytest.raises(ValueError):
         cutout.combine([np.zeros((59, 59), np.float32), np.zeros((58, 59), np.float32)])
+
+
+def test_align_with_core_takes_the_sky_level_from_the_core_only(plain_exposure):
+    image, flags, header = plain_exposure
+    wcs = make_wcs(header)
+    core_window = window_for(image, flags, wcs)
+    expected = cutout.align(core_window, TARGET, TARGET_SHAPE)
+    ny, nx = core_window.image.shape
+    core = (core_window.x0, core_window.x0 + nx, core_window.y0, core_window.y0 + ny)
+    brighter = image.copy()
+    outer = np.ones(image.shape, dtype=bool)
+    outer[core[2]:core[3], core[0]:core[1]] = False
+    brighter[outer] += 10.0
+    wide = window_for(brighter, flags, wcs, margin=40)
+    assert wide.image.shape[0] > ny + 50 and wide.image.shape[1] > nx + 50
+    out = cutout.align(Window(image=wide.image, flags=wide.flags, wcs=wcs, x0=wide.x0,
+                              y0=wide.y0, core=core), TARGET, TARGET_SHAPE)
+    np.testing.assert_array_equal(out, expected)
+    without_core = cutout.align(wide, TARGET, TARGET_SHAPE)
+    assert np.nanmedian(expected - without_core) > 1.0

@@ -12,6 +12,7 @@ from astropy.wcs import WCS, FITSFixedWarning
 
 from spherex_viewer import remote
 from spherex_viewer.cutout import UnsupportedLayoutError
+from spherex_viewer.grid import target_wcs
 from spherex_viewer.remote import RemoteReadError
 from synthetic import (
     FLAG_NAMES,
@@ -27,6 +28,7 @@ from synthetic import (
 URL = "https://example.invalid/exposure.fits"
 TARGET_RA, TARGET_DEC = 150.0, 20.0
 TARGET_SHAPE = (59, 59)
+WIDE_SHAPE = (177, 177)
 N = 300
 NAN_PIXEL = (150, 160)
 HEAD_READ = 21 * 2880
@@ -286,6 +288,62 @@ def test_footprint_window_refuses_a_diverged_inversion(target, monkeypatch):
 
     monkeypatch.setattr(wcs, "all_world2pix", scattered)
     assert remote.footprint_window(wcs, (2040, 2040), target, TARGET_SHAPE) is None
+
+
+def wide_reads(blob: bytes, ra: float = TARGET_RA, dec: float = TARGET_DEC):
+    reader = FakeRangeReader({URL: blob})
+    window = remote.read_window(reader, URL, target_wcs(ra, dec, 3), WIDE_SHAPE,
+                                (target_wcs(ra, dec), TARGET_SHAPE))
+    return window, reader.calls
+
+
+@pytest.mark.parametrize("blob_name", ["exposure", "edge_exposure"])
+def test_wide_window_core_is_the_narrow_window(request, blob_name, target):
+    blob = request.getfixturevalue(blob_name)
+    narrow, _ = window_reads(blob, target)
+    wide, calls = wide_reads(blob)
+    assert len(calls) == 4
+    ny, nx = narrow.image.shape
+    assert wide.core == (narrow.x0, narrow.x0 + nx, narrow.y0, narrow.y0 + ny)
+    assert wide.image.size > 2 * narrow.image.size
+    x0, x1, y0, y1 = wide.core
+    rows = slice(y0 - wide.y0, y1 - wide.y0)
+    cols = slice(x0 - wide.x0, x1 - wide.x0)
+    np.testing.assert_array_equal(wide.image[rows, cols], narrow.image)
+    np.testing.assert_array_equal(wide.flags[rows, cols], narrow.flags)
+    assert narrow.core is None
+
+
+def test_wide_window_missing_the_core_reads_only_the_headers(exposure):
+    _, _, wcs = full_read(exposure)
+    ra, dec = (float(v) for v in wcs.all_pix2world(N + 50.0, N / 2, 0))
+    assert remote.footprint_window(wcs, (N, N), target_wcs(ra, dec, 3), WIDE_SHAPE) is not None
+    window, calls = wide_reads(exposure, ra, dec)
+    assert window is None
+    assert [call[1:] for call in calls] == [(0, HEAD_READ)]
+
+
+def test_wide_image_read_is_bounded(exposure):
+    window, calls = wide_reads(exposure)
+    _, _, wcs = full_read(exposure)
+    start, stop = calls[1][1:]
+    rows = -(-(stop - start) // (4 * N))
+    assert rows == window.image.shape[0]
+    assert 177 < rows <= remote._max_window_side(wcs, target_wcs(TARGET_RA, TARGET_DEC, 3),
+                                                 WIDE_SHAPE)
+
+
+def test_footprint_window_refuses_a_diverged_inversion_on_the_wide_grid(monkeypatch):
+    wide = target_wcs(TARGET_RA, TARGET_DEC, 3)
+    wcs = exposure_wcs((TARGET_RA, TARGET_DEC), n=2040, rot_deg=0.0, sip=True)
+    assert remote.footprint_window(wcs, (2040, 2040), wide, WIDE_SHAPE) is not None
+
+    def scattered(ra, dec, origin, **kwargs):
+        spread = np.linspace(500.0, 1300.0, np.size(ra))
+        return spread, spread[::-1]
+
+    monkeypatch.setattr(wcs, "all_world2pix", scattered)
+    assert remote.footprint_window(wcs, (2040, 2040), wide, WIDE_SHAPE) is None
 
 
 def test_square_flag_tiles_are_unsupported(exposure, target):

@@ -1,7 +1,8 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
 // status, date and position texts, frame stepping, marker placement, validation of the
 // bundled example and of API answers, the sky-map selection, the retry delay, the difference
-// view and result links. No DOM access; imported by app.js and by Node tests.
+// view, result links, and zooming and moving the view over the loaded grid. No DOM access;
+// imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -80,13 +81,16 @@ export function joinStatus(...parts) {
 
 /**
  * Date-label text for a loaded frame: its date range and the exposures it was built from,
- * e.g. "2026-09-22 \u00b7 1 exposure".
+ * e.g. "2026-09-22 \u00b7 1 exposure", or a range such as "2026-09-22 \u00b7 23\u201324
+ * exposures" when the fields in view differ.
  * @param {string} label the frame's date range
- * @param {number} nUsed exposures that contributed, from the frame response
+ * @param {number} min fewest exposures that contributed to a field in view
+ * @param {number} [max] most exposures that contributed to a field in view
  * @returns {string}
  */
-export function frameLabel(label, nUsed) {
-  return `${label} \u00b7 ${plural(nUsed, "exposure")}`;
+export function frameLabel(label, min, max = min) {
+  const count = min === max ? plural(min, "exposure") : `${min}\u2013${max} exposures`;
+  return `${label} \u00b7 ${count}`;
 }
 
 /**
@@ -203,7 +207,32 @@ export const PIXEL_SCALE_ARCSEC = 6.15;
 /** Largest pointer movement, in CSS pixels, between press and release that is still a click. */
 export const CLICK_TOLERANCE_PX = 5;
 
+/** Pixels per side of the wide grid: the 3x3 fields around the searched one. */
+export const WIDE_PIXELS = 3 * FIELD_PIXELS;
+
+/** Zoom levels, in screen sizes of one field: views of 18', 12', 6', 3' and 1.5'. */
+export const ZOOM_LEVELS = [1 / 3, 1 / 2, 1, 2, 4];
+
+/** Most planned exposures for which the surrounding fields load ahead of their first use. */
+export const PRELOAD_MAX_EXPOSURES = 120;
+
 const RAD = Math.PI / 180;
+
+/**
+ * Sky position at tangent-plane offsets from a centre on the north-up gnomonic (TAN) plane.
+ * @param {number} raDeg
+ * @param {number} decDeg
+ * @param {number} xi offset towards east, radians
+ * @param {number} eta offset towards north, radians
+ * @returns {[number, number]} [ra, dec] in degrees, 0 <= ra < 360
+ */
+function fromTangent(raDeg, decDeg, xi, eta) {
+  const dec0 = decDeg * RAD;
+  const denom = Math.cos(dec0) - eta * Math.sin(dec0);
+  const ra = raDeg + Math.atan2(xi, denom) / RAD;
+  const dec = Math.atan2(Math.sin(dec0) + eta * Math.cos(dec0), Math.hypot(xi, denom)) / RAD;
+  return [((ra % 360) + 360) % 360, dec];
+}
 
 /**
  * Sky corners of the tool's field centred on a position: the outer edges of the 59x59 grid of
@@ -215,14 +244,154 @@ const RAD = Math.PI / 180;
  */
 export function fieldCorners(raDeg, decDeg) {
   const half = ((FIELD_PIXELS / 2) * PIXEL_SCALE_ARCSEC / 3600) * RAD;
-  const dec0 = decDeg * RAD;
-  // (xi, eta): tangent-plane offsets, xi towards east, eta towards north.
-  return [[half, half], [-half, half], [-half, -half], [half, -half]].map(([xi, eta]) => {
-    const denom = Math.cos(dec0) - eta * Math.sin(dec0);
-    const ra = raDeg + Math.atan2(xi, denom) / RAD;
-    const dec = Math.atan2(Math.sin(dec0) + eta * Math.cos(dec0), Math.hypot(xi, denom)) / RAD;
-    return [((ra % 360) + 360) % 360, dec];
+  return [[half, half], [-half, half], [-half, -half], [half, -half]]
+    .map(([xi, eta]) => fromTangent(raDeg, decDeg, xi, eta));
+}
+
+/**
+ * Sky position a number of grid pixels away from a centre, on the grid's tangent plane.
+ * @param {number} raDeg ICRS right ascension of the centre in degrees
+ * @param {number} decDeg ICRS declination of the centre in degrees
+ * @param {number} dxPixels pixels to the right (west)
+ * @param {number} dyPixels pixels down (south)
+ * @returns {{ra: number, dec: number}} degrees, 0 <= ra < 360
+ */
+export function offsetPosition(raDeg, decDeg, dxPixels, dyPixels) {
+  const scale = (PIXEL_SCALE_ARCSEC / 3600) * RAD;
+  const [ra, dec] = fromTangent(raDeg, decDeg, -dxPixels * scale, -dyPixels * scale);
+  return { ra, dec };
+}
+
+/**
+ * The view moved and zoomed into the loaded grid: zoom within [59 / grid, 4], centre such
+ * that the view never leaves the grid.
+ * @param {{zoom: number, cx: number, cy: number}} view zoom in screens per field; centre in
+ *   grid pixels (pixel centres at integers, x right = west, y down = south)
+ * @param {number} grid pixels per side of the loaded grid (59 or 177)
+ * @returns {{zoom: number, cx: number, cy: number}}
+ */
+export function clampView(view, grid) {
+  const zoom = Math.min(Math.max(view.zoom, FIELD_PIXELS / grid), ZOOM_LEVELS.at(-1));
+  const half = FIELD_PIXELS / zoom / 2;
+  const clamp = (c) => Math.min(Math.max(c, half - 0.5), grid - 0.5 - half);
+  return { zoom, cx: clamp(view.cx), cy: clamp(view.cy) };
+}
+
+/**
+ * The neighbouring zoom level in a direction, among those the loaded grid can fill.
+ * @param {number} zoom current level
+ * @param {number} direction +1 in, -1 out
+ * @param {number} grid pixels per side of the loaded grid
+ * @returns {number} the new level; the same at either end
+ */
+export function zoomStep(zoom, direction, grid) {
+  const levels = ZOOM_LEVELS.filter((z) => z >= FIELD_PIXELS / grid - 1e-9);
+  const i = levels.findIndex((z) => Math.abs(z - zoom) < 1e-9);
+  return levels[Math.min(Math.max(i + direction, 0), levels.length - 1)];
+}
+
+/**
+ * One movement step of the view: an eighth of the view's span, at least one pixel, clamped
+ * to the grid.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} dx -1, 0 or 1 (right = west)
+ * @param {number} dy -1, 0 or 1 (down = south)
+ * @param {number} grid pixels per side of the loaded grid
+ * @returns {{view: {zoom: number, cx: number, cy: number}, pushed: boolean}} pushed: the
+ *   view is at the grid's edge and did not move at all
+ */
+export function panStep(view, dx, dy, grid) {
+  const step = Math.max(1, Math.round(FIELD_PIXELS / view.zoom / 8));
+  const next = clampView({ zoom: view.zoom, cx: view.cx + dx * step, cy: view.cy + dy * step },
+    grid);
+  return { view: next, pushed: next.cx === view.cx && next.cy === view.cy };
+}
+
+/**
+ * Size and place of the image stage in percent of the frame that shows the view.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid
+ * @returns {{size: number, left: number, top: number}} percent of the frame's edge
+ */
+export function stageBox(view, grid) {
+  const span = FIELD_PIXELS / view.zoom;
+  return {
+    size: (100 * grid) / span,
+    left: (-100 * (view.cx + 0.5 - span / 2)) / span,
+    top: (-100 * (view.cy + 0.5 - span / 2)) / span,
+  };
+}
+
+/**
+ * Range of exposure counts over the fields a view overlaps.
+ * @param {Array<number>} nFields counts per field, row-major, north row first (one on a
+ *   59 grid, nine on a 177 grid)
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid
+ * @returns {[number, number]} [min, max]
+ */
+export function countRange(nFields, view, grid) {
+  if (grid === FIELD_PIXELS) return [nFields[0], nFields[0]];
+  const span = FIELD_PIXELS / view.zoom;
+  const eps = 1e-6;
+  const lo = (c) => Math.max(0, Math.floor((c + 0.5 - span / 2 + eps) / FIELD_PIXELS));
+  const hi = (c) => Math.min(2, Math.floor((c + 0.5 + span / 2 - eps) / FIELD_PIXELS));
+  let min = Infinity;
+  let max = -Infinity;
+  for (let row = lo(view.cy); row <= hi(view.cy); row++) {
+    for (let col = lo(view.cx); col <= hi(view.cx); col++) {
+      min = Math.min(min, nFields[3 * row + col]);
+      max = Math.max(max, nFields[3 * row + col]);
+    }
+  }
+  return [min, max];
+}
+
+/**
+ * Pixel values from base64 little-endian float32; non-finite values become null.
+ * @param {string} text
+ * @param {number} count expected number of values
+ * @returns {Array<number|null> | null} null if the text is not base64 of 4 * count bytes
+ */
+export function decodePixels(text, count) {
+  let binary;
+  try {
+    binary = atob(text);
+  } catch {
+    return null;
+  }
+  if (binary.length !== 4 * count) return null;
+  const data = new DataView(Uint8Array.from(binary, (c) => c.charCodeAt(0)).buffer);
+  return Array.from({ length: count }, (_, i) => {
+    const v = data.getFloat32(4 * i, true);
+    return Number.isFinite(v) ? v : null;
   });
+}
+
+/**
+ * The 59x59 field at the centre of a frame: its own pixels on a 59 grid, else the central
+ * 59x59 of its grid.
+ * @param {{pixels: Array<number|null>, width: number}} frame square frame
+ * @returns {Array<number|null>}
+ */
+export function centrePixels(frame) {
+  if (frame.width === FIELD_PIXELS) return frame.pixels;
+  const offset = (frame.width - FIELD_PIXELS) / 2;
+  const out = [];
+  for (let y = offset; y < offset + FIELD_PIXELS; y++) {
+    const start = y * frame.width + offset;
+    out.push(...frame.pixels.slice(start, start + FIELD_PIXELS));
+  }
+  return out;
+}
+
+/**
+ * Whether the surrounding fields of a search load ahead of their first use.
+ * @param {{frames: Array<{uris: Array<string>}>}} plan
+ * @returns {boolean} true unless the plan has more than PRELOAD_MAX_EXPOSURES exposures
+ */
+export function shouldPreload(plan) {
+  return plan.frames.reduce((sum, f) => sum + f.uris.length, 0) <= PRELOAD_MAX_EXPOSURES;
 }
 
 /**
@@ -290,6 +459,18 @@ export function validFrameBody(body) {
   return isObject(body) && isCount(body.width) && body.width > 0
     && isCount(body.height) && body.height > 0 && isCount(body.n_used)
     && isPixels(body.pixels, body.width * body.height);
+}
+
+/**
+ * Checks a parsed api/frame answer for the wide grid: width and height 177, an exposure
+ * count `n_used`, nine per-field counts `n_fields` and the pixels as a string `pixels_b64`.
+ * @param {unknown} body parsed JSON
+ * @returns {boolean}
+ */
+export function validWideBody(body) {
+  return isObject(body) && body.width === WIDE_PIXELS && body.height === WIDE_PIXELS
+    && isCount(body.n_used) && Array.isArray(body.n_fields) && body.n_fields.length === 9
+    && body.n_fields.every(isCount) && isString(body.pixels_b64);
 }
 
 /**
