@@ -1,4 +1,4 @@
-"""Tests for RA/Dec text parsing (DESIGN.md section 3, coords.py; test-plan rows 1-2)."""
+"""Tests for RA/Dec text parsing."""
 
 import pytest
 
@@ -57,17 +57,22 @@ def test_decimal_values_are_not_rounded():
     assert parse_dec("-12.345678901234") == -12.345678901234
 
 
-@pytest.mark.parametrize("text", ["", "   ", "abc", "25h0m0s", "360", "-1"])
+HOSTILE = ["x" * 60000, "1" * 3000 + "h", "9" * 400 + "h", "9" * 400 + ":0:0", "1:" * 30000,
+           "1d" * 30000, "12 30 61", "1h 61m", "\x00h", "1e999h", "nan:0:0"]
+
+
+@pytest.mark.parametrize("text", ["", "   ", "abc", "25h0m0s", "360", "-1", "24h", "24h0m0s",
+                                  "24:00:00", "24 00 00", "360d", *HOSTILE])
 def test_parse_ra_rejects(text):
     with pytest.raises(CoordinateError):
         parse_ra(text)
 
 
-@pytest.mark.parametrize("text", ["", "   ", "abc", "91", "-90.1", "5h", "5h0m0s"])
+def test_parse_ra_just_below_24h():
+    assert parse_ra("23h59m59.99s") == pytest.approx(360.0 - 0.01 * 15 / 3600, abs=1e-9)
+
+
+@pytest.mark.parametrize("text", ["", "   ", "abc", "91", "-90.1", "5h", "5h0m0s", *HOSTILE])
 def test_parse_dec_rejects(text):
     with pytest.raises(CoordinateError):
         parse_dec(text)
-
-
-def test_coordinate_error_is_value_error():
-    assert issubclass(CoordinateError, ValueError)

@@ -147,7 +147,7 @@ def fit_centroid(image: np.ndarray, x: float, y: float, half: int = 3) -> tuple[
 
 
 class FakeRangeReader:
-    """In-memory ``RangeReader``: serves byte slices of ``blobs`` and records every call in order."""
+    """In-memory ``RangeReader``: serves byte slices of ``blobs``, recording every call in order."""
 
     def __init__(self, blobs: dict[str, bytes]) -> None:
         self.blobs = blobs

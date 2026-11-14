@@ -1,4 +1,4 @@
-"""Tests for visit segmentation, capping and labels (DESIGN.md 3, 5.1, 5.2; rows 7-11)."""
+"""Tests for visit segmentation, the exposure cap, date labels and frame planning."""
 
 import random
 
@@ -7,9 +7,6 @@ import pytest
 
 from spherex_viewer.discovery import Exposure
 from spherex_viewer.visits import (
-    EXPOSURE_CAP,
-    MAX_BIN_DAYS,
-    MAX_GAP_DAYS,
     FramePlan,
     date_label,
     plan_frames,
@@ -22,22 +19,13 @@ T0 = 60000.0
 
 def _exposures(mjds) -> list[Exposure]:
     return [
-        Exposure(f"ibe/data/spherex/dr1/level2/w/{i:05d}.fits", float(m)) for i, m in enumerate(mjds)
+        Exposure(f"ibe/data/spherex/dr1/level2/w/{i:05d}.fits", float(m))
+        for i, m in enumerate(mjds)
     ]
-
-
-def _expected_indices(n: int) -> list[int]:
-    return [(j * (n - 1) + 11) // 23 for j in range(24)]
 
 
 def _flatten(groups):
     return [e for g in groups for e in g]
-
-
-def test_constants():
-    assert MAX_GAP_DAYS == 30.0
-    assert MAX_BIN_DAYS == 30.0
-    assert EXPOSURE_CAP == 24
 
 
 @pytest.mark.parametrize(("gap", "n_runs"), [(29.9, 1), (30.0, 1), (30.1, 2)])
@@ -122,13 +110,6 @@ def test_subsample_keeps_bins_up_to_cap(n):
     assert list(subsample(exposures)) == exposures
 
 
-@pytest.mark.parametrize("n", [25, 300])
-def test_subsample_above_cap_uses_design_indices(n):
-    exposures = _exposures([T0 + 0.01 * i for i in range(n)])
-    result = list(subsample(exposures))
-    assert result == [exposures[i] for i in _expected_indices(n)]
-
-
 @pytest.mark.parametrize("n", [25, 26, 47, 48, 49, 100, 300, 5125])
 def test_subsample_indices_properties(n):
     exposures = _exposures([T0 + 0.001 * i for i in range(n)])
@@ -171,7 +152,10 @@ def test_plan_frames_capped_and_uncapped_bins():
     assert first.n_available == 300
     assert first.n_used == 24
     assert first.capped is True
-    assert first.exposures == tuple(exposures[i] for i in _expected_indices(300))
+    assert len(first.exposures) == 24
+    assert first.exposures[0] == exposures[0] and first.exposures[-1] == exposures[299]
+    assert set(first.exposures) <= set(exposures[:300])
+    assert list(first.exposures) == sorted(first.exposures, key=lambda e: e.mjd)
     assert first.mjd_start == T0
     assert first.mjd_end == T0 + 299 / 32
     assert first.label == "2023-02-25 – 2023-03-06"

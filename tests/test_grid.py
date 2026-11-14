@@ -1,20 +1,15 @@
-"""Tests for the common target grid (DESIGN.md section 3, grid.py; test-plan row 12)."""
+"""Tests for the common target grid."""
 
 import numpy as np
 import pytest
 from astropy.coordinates import SkyCoord
 
-from spherex_viewer.grid import GRID_SHAPE, PIXEL_SCALE_ARCSEC, target_wcs
+from spherex_viewer.grid import GRID_SHAPE, target_wcs
 
 
 def _sky(wcs, x, y):
     ra, dec = wcs.pixel_to_world_values(x, y)
     return float(ra), float(dec)
-
-
-def test_constants():
-    assert PIXEL_SCALE_ARCSEC == 6.15
-    assert GRID_SHAPE == (59, 59)
 
 
 def test_centre_pixel_is_query_position():

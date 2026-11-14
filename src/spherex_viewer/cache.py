@@ -1,6 +1,7 @@
 """On-disk cache of aligned per-exposure cutouts, capped in total size."""
 
 import hashlib
+import io
 import logging
 import os
 import tempfile
@@ -14,6 +15,16 @@ from .grid import GRID_SHAPE
 
 _EVICT_TO_FRACTION = 0.9
 _CUTOUT_BYTES = 4 * GRID_SHAPE[0] * GRID_SHAPE[1]
+
+
+def _npy_header() -> bytes:
+    buf = io.BytesIO()
+    np.save(buf, np.zeros(GRID_SHAPE, dtype=np.float32), allow_pickle=False)
+    return buf.getvalue()[:-_CUTOUT_BYTES]
+
+
+# The exact header np.save writes for a C-ordered float32 grid-shaped array.
+_NPY_HEADER = _npy_header()
 
 logger = logging.getLogger(__name__)
 
@@ -41,20 +52,19 @@ class CutoutCache:
         return self.root / key[:2] / f"{key}.npy"
 
     def get(self, uri: str, ra_deg: float, dec_deg: float) -> np.ndarray | None:
-        """Return the cached cutout; None unless the file is a float32 grid-shaped ``.npy``."""
+        """Return the cached cutout; None unless the file is exactly what ``put`` writes.
+
+        The ``.npy`` header is compared byte for byte, never parsed, so nothing is unpickled.
+        """
         try:
             with open(self.path(uri, ra_deg, dec_deg), "rb") as f:
-                if np.lib.format.read_magic(f) != (1, 0):
-                    return None
-                shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(f)
-                if shape != GRID_SHAPE or fortran_order or dtype != np.float32:
-                    return None
-                raw = f.read(_CUTOUT_BYTES + 1)
-        except (OSError, ValueError, EOFError):
+                raw = f.read(len(_NPY_HEADER) + _CUTOUT_BYTES + 1)
+        except OSError:
             return None
-        if len(raw) != _CUTOUT_BYTES:
+        if len(raw) != len(_NPY_HEADER) + _CUTOUT_BYTES or not raw.startswith(_NPY_HEADER):
             return None
-        return np.frombuffer(raw, dtype=dtype).reshape(GRID_SHAPE).copy()
+        return np.frombuffer(raw, dtype=np.float32, offset=len(_NPY_HEADER)).reshape(
+            GRID_SHAPE).copy()
 
     def put(self, uri: str, ra_deg: float, dec_deg: float, cutout: np.ndarray) -> None:
         """Store a cutout as float32, atomically (temporary file, then ``os.replace``).

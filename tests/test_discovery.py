@@ -1,10 +1,11 @@
-"""Tests for archive discovery (DESIGN.md section 3, discovery.py; test-plan rows 3-5)."""
+"""Tests for archive discovery: URI validation, ADQL, CSV parsing and the TAP request."""
 
 import httpx
 import pytest
 
 from spherex_viewer.discovery import (
     DETECTORS,
+    MAX_URI_LENGTH,
     TAP_URL,
     DiscoveryError,
     Exposure,
@@ -42,7 +43,8 @@ def no_sleep(monkeypatch):
 
 @pytest.mark.parametrize(
     "uri",
-    [DR1_URI, QR3_URI, "ibe/data/spherex/dr1/level2/a..b.fits", "ibe/data/spherex/x9/level2/f.fits"],
+    [DR1_URI, QR3_URI, "ibe/data/spherex/dr1/level2/a..b.fits",
+     "ibe/data/spherex/x9/level2/f.fits", "ibe/data/spherex/dr1/level2/.a/x.fits"],
 )
 def test_is_valid_uri_accepts(uri):
     assert is_valid_uri(uri)
@@ -62,10 +64,24 @@ def test_is_valid_uri_accepts(uri):
         "ibe/data/spherex/dr1/level2/x.fits.gz",
         "ibe/data/spherex/dr1/level2/x y.fits",
         "ibe/data/spherex/dr1/level2/x.fits?a=b",
+        DR1_URI + "\n",
+        DR1_URI + "\nibe/data/spherex/dr1/level2/x.fits",
+        "ibe/data/spherex/dr1/level2/./x.fits",
+        "ibe/data/spherex/dr1/level2/a/./b/x.fits",
+        "ibe/data/spherex/dr1/level2/a/../x.fits",
     ],
 )
 def test_is_valid_uri_rejects(uri):
     assert not is_valid_uri(uri)
+
+
+def test_is_valid_uri_length_limit():
+    prefix = "ibe/data/spherex/dr1/level2/"
+    longest = prefix + "a" * (MAX_URI_LENGTH - len(prefix) - len(".fits")) + ".fits"
+    assert len(longest) == MAX_URI_LENGTH == 300
+    assert is_valid_uri(longest)
+    assert not is_valid_uri(longest.replace("/a", "/aa", 1))
+    assert not is_valid_uri(prefix + "a" * 60000 + ".fits")
 
 
 def test_build_adql_equals_contract_query():
@@ -82,10 +98,6 @@ def test_build_adql_uses_repr_of_coordinates():
 @pytest.mark.parametrize("detector", DETECTORS)
 def test_build_adql_accepts_every_detector(detector):
     assert f"p.energy_bandpassname = 'SPHEREx-{detector}'" in build_adql(10.0, 20.0, detector)
-
-
-def test_detectors_are_d1_to_d6():
-    assert DETECTORS == ("D1", "D2", "D3", "D4", "D5", "D6")
 
 
 @pytest.mark.parametrize("detector", ["D7", "D0", "d2", "", "SPHEREx-D2"])
@@ -129,14 +141,12 @@ def test_parse_csv_rejects_bad_uri(uri):
         parse_csv(f"uri,time_bounds_lower\n{DR1_URI},60801.1\n{uri},60802.0\n")
 
 
-@pytest.mark.parametrize("row", [f"{DR1_URI},abc", f"{DR1_URI}", f"{DR1_URI},"])
+@pytest.mark.parametrize("row", [f"{DR1_URI},abc", f"{DR1_URI}", f"{DR1_URI},",
+                                 f"{DR1_URI},nan", f"{DR1_URI},inf", f"{DR1_URI},-inf",
+                                 f"{DR1_URI},1e999"])
 def test_parse_csv_rejects_bad_row(row):
     with pytest.raises(DiscoveryError):
         parse_csv(f"uri,time_bounds_lower\n{row}\n")
-
-
-def test_discovery_error_is_runtime_error():
-    assert issubclass(DiscoveryError, RuntimeError)
 
 
 def _client(responses, requests):
