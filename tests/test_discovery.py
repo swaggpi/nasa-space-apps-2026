@@ -241,6 +241,7 @@ class Chunks(httpx.SyncByteStream):
             yield chunk
 
 
+PROXY_ERROR = "<html><head><title>502 Proxy Error</title></head><body>Proxy Error</body></html>"
 BODY = tsv(row(PREFIX + QR3_URI, 61200.0), row(PREFIX + DR1_URI.replace("1D3", "1D2"), 60801.1066))
 EXPECTED = [Exposure(DR1_URI.replace("1D3", "1D2"), 60801.1066), Exposure(QR3_URI, 61200.0)]
 
@@ -298,26 +299,35 @@ def test_discover_stops_reading_past_the_cap(no_sleep):
     assert stream.sent <= discovery.MAX_RESPONSE_BYTES + 2**20
 
 
-def test_discover_retries_once_after_503(no_sleep):
+def test_discover_retries_after_503(no_sleep):
     requests = []
     with _client([(503, "busy"), (200, BODY)], requests) as client:
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
     assert len(requests) == 2
-    assert no_sleep == [2]
+    assert no_sleep == [1]
 
 
-def test_discover_retries_once_after_transport_error(no_sleep):
+def test_discover_survives_four_gateway_errors(no_sleep):
+    requests = []
+    with _client([(502, PROXY_ERROR)] * 4 + [(200, BODY)], requests) as client:
+        result = discover(client, 133.795129, -7.245147, "D2")
+    assert result == EXPECTED
+    assert len(requests) == 5
+    assert no_sleep == [1, 2, 3, 4]
+
+
+def test_discover_retries_after_transport_error(no_sleep):
     requests = []
     responses = [httpx.ConnectError("refused"), (200, BODY)]
     with _client(responses, requests) as client:
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
     assert len(requests) == 2
-    assert no_sleep == [2]
+    assert no_sleep == [1]
 
 
-def test_discover_retries_once_after_error_mid_body(no_sleep):
+def test_discover_retries_after_error_mid_body(no_sleep):
     requests = []
     broken = Chunks(BODY.encode()[:100], httpx.ReadError("reset"))
     with _client([(200, broken), (200, BODY)], requests) as client:
@@ -326,12 +336,24 @@ def test_discover_retries_once_after_error_mid_body(no_sleep):
     assert len(requests) == 2
 
 
-def test_discover_fails_after_two_500s(no_sleep):
+def test_discover_fails_after_five_gateway_errors(no_sleep):
     requests = []
-    with _client([(500, "error"), (500, "error"), (200, BODY)], requests) as client:
-        with pytest.raises(DiscoveryError):
+    with _client([(502, PROXY_ERROR)] * 5 + [(200, BODY)], requests) as client:
+        with pytest.raises(DiscoveryError, match="HTTP 502"):
+            discover(client, 133.795129, -7.245147, "D2")
+    assert len(requests) == 5
+
+
+def test_discover_does_not_retry_after_the_window(no_sleep, monkeypatch):
+    clock = iter([0.0, 29.0, 29.5])
+    monkeypatch.setattr("time.monotonic", lambda: next(clock))
+    requests = []
+    responses = [httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"), (200, BODY)]
+    with _client(responses, requests) as client:
+        with pytest.raises(DiscoveryError, match="could not be reached"):
             discover(client, 133.795129, -7.245147, "D2")
     assert len(requests) == 2
+    assert no_sleep == [1]
 
 
 def test_discover_fails_at_once_on_400(no_sleep):

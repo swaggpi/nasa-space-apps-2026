@@ -21,8 +21,11 @@ MAX_RESPONSE_BYTES = 64 * 2**20
 _BAND_M = {"D1": 0.92e-6, "D2": 1.37e-6, "D3": 2.02e-6, "D4": 3.12e-6, "D5": 4.13e-6,
            "D6": 4.72e-6}
 _COLUMNS = ("access_url", "energy_bandpassname", "t_min")
-_ATTEMPTS = 2
-_RETRY_DELAY_S = 2.0
+# IRSA's gateway answers a share of requests (up to 40 % measured) with an immediate HTTP 502,
+# independently from one request to the next; a retry is only started within the window, so a
+# stalled connection is not waited for repeatedly.
+_RETRY_DELAYS_S = (1.0, 2.0, 3.0, 4.0)
+_RETRY_WINDOW_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -118,21 +121,28 @@ def parse_tsv(lines: Iterable[bytes], detector: str) -> list[Exposure]:
 
 
 def discover(client: httpx.Client, ra_deg: float, dec_deg: float, detector: str) -> list[Exposure]:
-    """Query the archive for all exposures of ``detector`` covering (ra, dec); never cached."""
+    """Query the archive for all exposures of ``detector`` covering (ra, dec); never cached.
+
+    A 5xx answer or a transport error is retried after 1, 2, 3 and 4 s while the retry would
+    start within 30 s of the first request; any other failure raises ``DiscoveryError`` at once.
+    """
     params = sia_params(ra_deg, dec_deg, detector)
     timeout = httpx.Timeout(
         connect=10.0, read=60.0, write=client.timeout.write, pool=client.timeout.pool
     )
-    for attempt in range(_ATTEMPTS):
-        last = attempt == _ATTEMPTS - 1
+    deadline = time.monotonic() + _RETRY_WINDOW_S
+    for delay in (*_RETRY_DELAYS_S, None):
         try:
             with client.stream("GET", SIA_URL, params=params, timeout=timeout) as response:
                 if response.status_code == 200:
                     return parse_tsv(_lines(response.iter_bytes()), detector)
-                if response.status_code < 500 or last:
-                    raise DiscoveryError(f"The archive answered HTTP {response.status_code}.")
+                failure = DiscoveryError(f"The archive answered HTTP {response.status_code}.")
+                if response.status_code < 500:
+                    raise failure
         except httpx.TransportError as exc:
-            if last:
-                raise DiscoveryError(f"The archive could not be reached: {exc}.") from exc
-        time.sleep(_RETRY_DELAY_S)
+            failure = DiscoveryError(f"The archive could not be reached: {exc}.")
+            failure.__cause__ = exc
+        if delay is None or time.monotonic() + delay > deadline:
+            raise failure
+        time.sleep(delay)
     raise AssertionError("unreachable")
