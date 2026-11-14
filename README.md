@@ -9,6 +9,18 @@ north-up grid centred on the position, and co-adds them into one frame per visit
 days). The page plays the frames like a short video with one common brightness stretch, so
 moving or changing objects stand out.
 
+The homepage opens on a precomputed example, `src/spherex_viewer/static/example.json`:
+Barnard's Star in detector D6, three real SPHEREx frames from August 2025 to August 2026, so it
+plays without an archive search. It is built by `.venv/bin/python scripts/build_example.py` with
+the server's own pipeline. The marker is the star's position predicted from Gaia DR3 proper
+motion and parallax; it agrees with the star's measured centre to within 0.15 pixel.
+
+The page shows the sky image with Play/Pause, previous and next frame and a timeline below it,
+and the date (or date range) and exposure count of the shown frame. The target panel beside it
+(below it on narrow screens) names what is shown, gives a short hint for the example, toggles
+the marker, and holds "Enter coordinates", which opens the RA/Dec search; the detector is under
+"Advanced settings" (D2 by default).
+
 ## Run locally
 
 Requires Python 3.12 or newer.
