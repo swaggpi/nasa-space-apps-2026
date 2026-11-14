@@ -8,23 +8,34 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { computeStretch, toRGBA } from "../../src/spherex_viewer/static/lib.js";
+
 const { chromium } = createRequire(import.meta.url)("playwright");
 
 const REPO = resolve(fileURLToPath(import.meta.url), "../../..");
 const SIZE = 59;
 // Every element of the body as parent>tag#id, in document order: the complete UI.
 const BODY = [
-  "body>form#search",
+  "body>main#viewer",
+  "main>section#player",
+  "section>div#frame", "div>canvas#image", "div>div#marker",
+  "section>div#controls",
+  "div>button#prev", "div>button#play", "div>button#next", "div>input#slider",
+  "section>p#date",
+  "main>aside#panel",
+  "aside>h1#name",
+  "aside>p#position",
+  "aside>p#hint",
+  "aside>label#marker-control", "label>input#show-marker",
+  "aside>details#enter", "details>summary",
+  "details>form#search",
   "form>label", "label>input#ra",
   "form>label", "label>input#dec",
-  "form>select#detector",
-  ...Array(6).fill("select>option"),
   "form>button#submit",
-  "body>p#status",
-  "body>canvas#image",
-  "body>button#play",
-  "body>input#slider",
-  "body>span#date",
+  "aside>details#advanced", "details>summary",
+  "details>label", "label>select#detector",
+  ...Array(6).fill("select>option"),
+  "aside>p#status",
   "body>footer#ack",
 ];
 const ACK = "This publication makes use of data products from the Spectro-Photometer for the "
@@ -114,15 +125,64 @@ const THREE_FRAMES = [
   { label: "2026-04-20", n_available: 15, n_used: 15 },
 ];
 
+// The stub example: a bright 3x3 star moving across a textured background, with markers.
+const EXAMPLE_MARKERS = [{ x: 20, y: 30 }, { x: 26.4, y: 27 }, { x: 33, y: 24.5 }];
+const EXAMPLE_DATES = ["2025-04-28 \u2013 2025-05-02", "2025-10-20", "2026-04-27 \u2013 2026-04-30"];
+const EXAMPLE_USED = [12, 1, 7];
+const EXAMPLE_LABELS = [
+  "2025-04-28 \u2013 2025-05-02 \u00b7 12 exposures",
+  "2025-10-20 \u00b7 1 exposure",
+  "2026-04-27 \u2013 2026-04-30 \u00b7 7 exposures",
+];
+const EXAMPLE_FAILED = "The example could not be loaded; enter coordinates to search.";
+
+function starPixels(marker, seed) {
+  const cx = Math.round(marker.x);
+  const cy = Math.round(marker.y);
+  return Array.from({ length: SIZE * SIZE }, (_, i) => {
+    const x = i % SIZE;
+    const y = Math.floor(i / SIZE);
+    if (i === 100 + seed) return null;
+    if (Math.abs(x - cx) <= 1 && Math.abs(y - cy) <= 1) return 8;
+    return ((i * 7 + seed * 13) % 50) / 100;
+  });
+}
+
+const EXAMPLE = {
+  name: "Test Star",
+  hint: "Watch the ringed star move to the upper right.",
+  ra_deg: 269.4462683,
+  dec_deg: 4.7682045,
+  detector: "D6",
+  width: SIZE,
+  height: SIZE,
+  frames: EXAMPLE_MARKERS.map((marker, i) => ({
+    label: EXAMPLE_DATES[i], n_used: EXAMPLE_USED[i], pixels: starPixels(marker, i), marker,
+  })),
+};
+
+/** RGBA bytes the page must draw for example frame n (one stretch over all example frames). */
+function exampleRGBA(n) {
+  const stretch = computeStretch(EXAMPLE.frames.map((f) => f.pixels));
+  return Array.from(toRGBA(EXAMPLE.frames[n].pixels, stretch));
+}
+
+const exampleOk = () => ({ status: 200, body: EXAMPLE });
+
 /**
- * Opens the page with `api/search` and `api/frame` stubbed. `search(url)` and `frame(n)`
- * return {status, body} (body JSON-encoded unless `raw` is given) or {abort: true}.
+ * Opens the page with `example.json`, `api/search` and `api/frame` stubbed. `example()`,
+ * `search(url)` and `frame(n)` return {status, body} (body JSON-encoded unless `raw` is
+ * given) or {abort: true}. Unless `wait` is false, returns once the example is shown or
+ * its failure is reported.
  */
-async function openPage({ search, frame = () => ({ status: 200, body: {} }) }) {
+async function openPage({
+  search = unusedSearch, frame = () => ({ status: 200, body: {} }), example = exampleOk,
+  wait = true,
+}) {
   const origin = new URL(baseUrl).origin;
   const log = {
     requests: [], foreign: [], searches: [], frames: [], unexpectedApi: [], errors: [],
-    inFlight: 0, maxInFlight: 0,
+    examples: [], inFlight: 0, maxInFlight: 0,
   };
   const page = await context.newPage();
   page.on("request", (request) => log.requests.push(request.url()));
@@ -140,6 +200,11 @@ async function openPage({ search, frame = () => ({ status: 200, body: {} }) }) {
     if (url.origin !== origin) {
       log.foreign.push(request.url());
       return route.abort();
+    }
+    if (url.pathname === "/example.json" && request.method() === "GET") {
+      log.examples.push(request.url());
+      // A search may abort the example request while the stub is still waiting.
+      return reply(route, await example()).catch(() => {});
     }
     if (url.pathname === "/api/search" && request.method() === "GET") {
       log.searches.push(url);
@@ -163,6 +228,10 @@ async function openPage({ search, frame = () => ({ status: 200, body: {} }) }) {
     return route.continue();
   });
   await page.goto(baseUrl);
+  if (wait) {
+    await page.waitForFunction(() => document.querySelector("#date").textContent !== ""
+      || document.querySelector("#status").textContent !== "");
+  }
   return { page, log };
 }
 
@@ -174,15 +243,23 @@ function frameOk(plan) {
   return (n) => frameBody(pixels(n), plan.frames[n].n_used);
 }
 
+/** Opens a disclosure through its summary, as a visitor would, unless it is open already. */
+async function openDisclosure(page, id) {
+  if (!(await page.$eval(`#${id}`, (el) => el.open))) await page.click(`#${id} > summary`);
+}
+
 async function submit(page, { ra = RA, dec = DEC, detector = "D2" } = {}) {
+  await openDisclosure(page, "enter");
   await page.fill("#ra", ra);
   await page.fill("#dec", dec);
+  await openDisclosure(page, "advanced");
   await page.selectOption("#detector", detector);
   await page.click("#submit");
 }
 
 const statusText = (page) => page.$eval("#status", (el) => el.textContent);
 const dateText = (page) => page.$eval("#date", (el) => el.textContent.trim());
+const text = (page, selector) => page.$eval(selector, (el) => el.textContent.trim());
 
 async function waitForStatus(page, predicate) {
   const deadline = Date.now() + 15_000;
@@ -286,21 +363,36 @@ const unusedSearch = () => ({ status: 500, body: { detail: "unused" } });
 
 test("the body holds exactly the agreed elements, in order, and nothing else", { timeout: TIMEOUT },
   async () => {
-    const { page, log } = await openPage({ search: unusedSearch });
+    const { page, log } = await openPage({});
     const body = await page.$$eval("body *", (els) => els.map((el) => {
       const id = el.id ? `#${el.id}` : "";
       return `${el.parentElement.tagName.toLowerCase()}>${el.tagName.toLowerCase()}${id}`;
     }));
     assert.deepEqual(body, BODY);
 
-    const labels = await page.$$eval("label", (els) => els.map((el) => el.textContent.trim()));
-    assert.deepEqual(labels, ["RA", "Dec"]);
+    // A label's text includes its control's; the detector label also lists the options.
+    const labels = await page.$$eval("label",
+      (els) => els.map((el) => el.textContent.replace(/\s+/g, " ").trim()));
+    assert.deepEqual(labels,
+      ["Show target marker", "RA", "Dec", "Detector D1 D2 D3 D4 D5 D6"]);
+    assert.deepEqual(await page.$$eval("summary", (els) => els.map((el) => el.textContent)),
+      ["Enter coordinates", "Advanced settings"]);
+    assert.deepEqual(await page.$$eval("button", (els) => els.map((el) => [
+      el.id, el.textContent.trim(), el.getAttribute("aria-label")])), [
+      ["prev", "\u2039", "Previous frame"],
+      ["play", "Play", null],
+      ["next", "\u203a", "Next frame"],
+      ["submit", "Show", null],
+    ]);
     assert.equal(await page.getAttribute("#ra", "type"), "text");
     assert.equal(await page.getAttribute("#dec", "type"), "text");
+    assert.equal(await page.getAttribute("#show-marker", "type"), "checkbox");
     assert.equal(await page.getAttribute("#slider", "type"), "range");
+    assert.ok((await page.getAttribute("#slider", "aria-label")).length > 0);
     assert.equal(await page.getAttribute("#status", "aria-live"), "polite");
     assert.equal(await page.getAttribute("#image", "role"), "img");
     assert.ok((await page.getAttribute("#image", "aria-label")).length > 0);
+    assert.equal(await page.getAttribute("#marker", "aria-hidden"), "true");
     assert.deepEqual(await page.$$eval("#detector option", (els) => els.map((el) => el.value)),
       ["D1", "D2", "D3", "D4", "D5", "D6"]);
     assert.equal(await page.inputValue("#detector"), "D2");
@@ -310,12 +402,322 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
     assertCleanRun(log);
   });
 
-test("play and slider are disabled before any frame is loaded", { timeout: TIMEOUT }, async () => {
-  const { page, log } = await openPage({ search: unusedSearch });
-  assert.equal(await page.isDisabled("#play"), true);
-  assert.equal(await page.isDisabled("#slider"), true);
+test("the detector selector sits inside the closed Advanced settings disclosure",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.equal(await page.$eval("#detector", (el) => el.closest("details")?.id), "advanced");
+    assert.equal(await page.$eval("#advanced", (el) => el.open), false);
+    assert.equal(await page.isVisible("#detector"), false);
+    assert.equal(await page.isVisible("#advanced > summary"), true);
+    await page.click("#advanced > summary");
+    assert.equal(await page.isVisible("#detector"), true);
+    assertCleanRun(log);
+  });
+
+test("Enter coordinates is visible on load and reveals the RA/Dec search with RA focused",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.equal(await page.isVisible("#enter > summary"), true);
+    for (const id of ["#ra", "#dec", "#submit"]) assert.equal(await page.isVisible(id), false, id);
+    await page.click("#enter > summary");
+    for (const id of ["#ra", "#dec", "#submit"]) assert.equal(await page.isVisible(id), true, id);
+    await page.waitForFunction(() => document.activeElement?.id === "ra");
+    assertCleanRun(log);
+  });
+
+test("a fresh load shows the example's first frame, name, position and hint without playing",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.deepEqual(log.examples, [new URL("example.json", baseUrl).href]);
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+    assert.equal(await text(page, "#name"), "Test Star");
+    assert.equal(await text(page, "#position"), "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6");
+    assert.equal(await text(page, "#hint"), EXAMPLE.hint);
+    assert.equal(await page.isVisible("#hint"), true);
+    assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
+    assert.equal(await statusText(page), "");
+    assert.deepEqual(await sliderState(page), { disabled: false, min: 0, max: 2, value: 0 });
+    for (const id of ["#prev", "#play", "#next"]) assert.equal(await page.isDisabled(id), false);
+
+    await page.waitForTimeout(1500);
+    assert.equal(await text(page, "#play"), "Play");
+    assert.equal((await sliderState(page)).value, 0);
+    assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+    assert.deepEqual(log.searches, []);
+    assert.deepEqual(log.frames, []);
+    assert.equal(log.requests.filter((u) => new URL(u).pathname.startsWith("/api/")).length, 0);
+    assertCleanRun(log);
+  });
+
+test("Play plays the example in a loop, the date label follows, Pause stops it",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await page.click("#play");
+    assert.equal(await text(page, "#play"), "Pause");
+    const seen = [0];
+    for (let t = 0; t < 25; t++) {
+      const { value, label } = await page.evaluate(() => ({
+        value: Number(document.querySelector("#slider").value),
+        label: document.querySelector("#date").textContent.trim(),
+      }));
+      assert.equal(label, EXAMPLE_LABELS[value]);
+      if (seen.at(-1) !== value) seen.push(value);
+      await page.waitForTimeout(100);
+    }
+    assert.ok(seen.length >= 4, `playback sequence ${seen}`);
+    for (let i = 1; i < seen.length; i++) {
+      assert.equal(seen[i], (seen[i - 1] + 1) % 3, `playback sequence ${seen}`);
+    }
+    await page.click("#play");
+    assert.equal(await text(page, "#play"), "Play");
+    const stopped = (await sliderState(page)).value;
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(stopped));
+    await page.waitForTimeout(1200);
+    assert.equal((await sliderState(page)).value, stopped);
+    assert.deepEqual(log.searches, []);
+    assertCleanRun(log);
+  });
+
+test("previous and next step exactly one frame, wrap at both ends and pause playback",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    const expectFrame = async (n) => {
+      assert.equal((await sliderState(page)).value, n);
+      assert.equal(await dateText(page), EXAMPLE_LABELS[n]);
+      assert.deepEqual(await canvasPixels(page), exampleRGBA(n));
+    };
+    for (const n of [1, 2, 0]) {
+      await page.click("#next");
+      await expectFrame(n);
+    }
+    for (const n of [2, 1, 0]) {
+      await page.click("#prev");
+      await expectFrame(n);
+    }
+    await page.click("#play");
+    await page.waitForFunction(() => document.querySelector("#slider").value !== "0");
+    await page.click("#next");
+    assert.equal(await text(page, "#play"), "Play");
+    const value = (await sliderState(page)).value;
+    await page.waitForTimeout(1200);
+    await expectFrame(value);
+    assertCleanRun(log);
+  });
+
+test("the timeline scrubs to any frame and updates image and date", { timeout: TIMEOUT },
+  async () => {
+    const { page, log } = await openPage({});
+    for (const n of [2, 0, 1]) {
+      await selectFrame(page, n);
+      assert.equal(await dateText(page), EXAMPLE_LABELS[n]);
+      assert.deepEqual(await canvasPixels(page), exampleRGBA(n));
+    }
+    // The real control, by keyboard.
+    await page.focus("#slider");
+    await page.keyboard.press("ArrowRight");
+    assert.equal(await dateText(page), EXAMPLE_LABELS[2]);
+    assertCleanRun(log);
+  });
+
+/** The marker's centre and the canvas rectangle, in CSS pixels of the viewport. */
+async function markerGeometry(page) {
+  return page.evaluate(() => {
+    const image = document.querySelector("#image").getBoundingClientRect();
+    const marker = document.querySelector("#marker");
+    const box = marker.getBoundingClientRect();
+    return {
+      visible: !marker.hidden && box.width > 0 && getComputedStyle(marker).display !== "none",
+      cx: box.left + box.width / 2,
+      cy: box.top + box.height / 2,
+      image: { left: image.left, top: image.top, width: image.width, height: image.height },
+    };
+  });
+}
+
+async function assertMarkerAt(page, marker) {
+  const g = await markerGeometry(page);
+  assert.equal(g.visible, true, "marker hidden");
+  const x = g.image.left + ((marker.x + 0.5) / SIZE) * g.image.width;
+  const y = g.image.top + ((marker.y + 0.5) / SIZE) * g.image.height;
+  assert.ok(Math.abs(g.cx - x) <= 1 && Math.abs(g.cy - y) <= 1,
+    `marker at ${g.cx},${g.cy}, expected ${x},${y}`);
+}
+
+test("the marker toggle shows and hides a marker that follows the target from frame to frame",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.equal(await page.isVisible("#marker-control"), true);
+    assert.equal(await page.isChecked("#show-marker"), true);
+    await assertMarkerAt(page, EXAMPLE_MARKERS[0]);
+    await page.click("#next");
+    await assertMarkerAt(page, EXAMPLE_MARKERS[1]);
+    await selectFrame(page, 2);
+    await assertMarkerAt(page, EXAMPLE_MARKERS[2]);
+
+    await page.click("#marker-control");
+    assert.equal(await page.isChecked("#show-marker"), false);
+    assert.equal((await markerGeometry(page)).visible, false);
+    await page.click("#prev");
+    assert.equal((await markerGeometry(page)).visible, false);
+    await page.click("#marker-control");
+    await assertMarkerAt(page, EXAMPLE_MARKERS[1]);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await assertMarkerAt(page, EXAMPLE_MARKERS[1]);
+    assertCleanRun(log);
+  });
+
+test("an example without markers has no marker toggle", { timeout: TIMEOUT }, async () => {
+  const frames = EXAMPLE.frames.map(({ marker, ...rest }) => rest);
+  const { page, log } = await openPage({
+    example: () => ({ status: 200, body: { ...EXAMPLE, frames } }),
+  });
+  assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
+  assert.equal(await page.isVisible("#marker-control"), false);
+  assert.equal((await markerGeometry(page)).visible, false);
   assertCleanRun(log);
 });
+
+for (const [name, reply] of [
+  ["a missing file", () => ({ status: 404, raw: "Not Found" })],
+  ["a file that is not JSON", () => ({ status: 200, raw: "{\"name\": " })],
+  ["a file without frames", () => ({ status: 200, body: { ...EXAMPLE, frames: [] } })],
+  ["an unreachable server", () => ({ abort: true })],
+]) {
+  test(`${name} for the example is reported once and manual search still works`,
+    { timeout: TIMEOUT }, async () => {
+      const plan = makePlan(THREE_FRAMES);
+      const { page, log } = await openPage({
+        example: reply, search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      });
+      assert.equal(await statusText(page), EXAMPLE_FAILED);
+      for (const id of ["#prev", "#play", "#next", "#slider"]) {
+        assert.equal(await page.isDisabled(id), true, id);
+      }
+      assert.equal(await text(page, "#name"), "");
+      assert.equal(await page.isVisible("#marker-control"), false);
+      assert.equal(await page.isVisible("#enter > summary"), true);
+      await submit(page);
+      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await page.isDisabled("#play"), false);
+      assert.equal(log.examples.length, 1);
+      assertCleanRun(log);
+    });
+}
+
+test("a search started while the example plays stops playback and replaces the example",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: async (n) => {
+        await gate.promise;
+        return reply(n);
+      },
+    });
+    try {
+      await page.click("#play");
+      await page.waitForFunction(() => document.querySelector("#slider").value !== "0");
+      await submit(page);
+      await waitForStatus(page, (t) => t.startsWith("Loading frame 1"));
+      assert.equal(await text(page, "#play"), "Play");
+      assert.equal(await page.isDisabled("#play"), true);
+      assert.equal(await dateText(page), "");
+      assert.ok((await canvasPixels(page)).every((v) => v === 0), "canvas not cleared");
+      assert.equal(await page.isVisible("#marker-control"), false);
+      assert.equal((await markerGeometry(page)).visible, false);
+      gate.release();
+      await finalStatus(page);
+      await page.waitForTimeout(1200);
+      assert.equal((await sliderState(page)).value, 0);
+      assert.equal(await text(page, "#play"), "Play");
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("a search started before the example has loaded wins over the late example",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const { page, log } = await openPage({
+      wait: false,
+      example: async () => {
+        await gate.promise;
+        return exampleOk();
+      },
+      search: () => ({ status: 200, body: plan }),
+      frame: frameOk(plan),
+    });
+    try {
+      await page.waitForFunction(() => document.querySelector("#search") !== null);
+      await submit(page);
+      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      gate.release();
+      await page.waitForTimeout(500);
+      assert.equal(await text(page, "#name"), `RA ${RA}, Dec ${DEC}`);
+      assert.equal(await dateText(page), "2025-05-06 \u00b7 8 exposures");
+      assert.equal(await statusText(page), "3 frames from 42 of 42 exposures.");
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+/** Bounding rectangles of the given elements and the viewport size. */
+async function layout(page, selectors) {
+  return page.evaluate((list) => ({
+    rects: Object.fromEntries(list.map((s) => {
+      const r = document.querySelector(s).getBoundingClientRect();
+      return [s, { left: r.left, top: r.top, right: r.right, bottom: r.bottom }];
+    })),
+    width: document.documentElement.clientWidth,
+    height: document.documentElement.clientHeight,
+    scrollWidth: document.documentElement.scrollWidth,
+  }), selectors);
+}
+
+const PLAYER = ["#image", "#prev", "#play", "#next", "#slider", "#date"];
+
+test("at 1366x768 the image and all player controls fit in the initial view, panel beside",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const { rects, width, height } = await layout(page, [...PLAYER, "#panel", "#enter"]);
+    for (const s of PLAYER) {
+      const r = rects[s];
+      assert.ok(r.left >= 0 && r.top >= 0 && r.right <= width && r.bottom <= height,
+        `${s} at ${JSON.stringify(r)} outside ${width}x${height}`);
+    }
+    const image = rects["#image"];
+    assert.ok(image.right - image.left >= 500, `image only ${image.right - image.left} px wide`);
+    for (const s of ["#prev", "#play", "#next", "#slider"]) {
+      assert.ok(rects[s].top >= image.bottom, `${s} not below the image`);
+    }
+    assert.ok(rects["#panel"].left >= image.right, "panel not beside the image");
+    assert.ok(rects["#enter"].bottom <= height, "Enter coordinates not in view");
+    assertCleanRun(log);
+  });
+
+test("at 390 px width the target panel is below the player and nothing scrolls sideways",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openDisclosure(page, "enter");
+    await openDisclosure(page, "advanced");
+    const { rects, width, scrollWidth } = await layout(page, [...PLAYER, "#panel", "#submit"]);
+    for (const s of PLAYER) {
+      assert.ok(rects["#panel"].top >= rects[s].bottom, `panel not below ${s}`);
+      assert.ok(rects[s].left >= 0 && rects[s].right <= width, `${s} wider than the screen`);
+    }
+    assert.ok(rects["#panel"].right <= width && rects["#submit"].right <= width);
+    assert.ok(scrollWidth <= width, `page scrolls to ${scrollWidth} of ${width}`);
+    assertCleanRun(log);
+  });
 
 test("frames are requested one at a time and the slider grows as each arrives",
   { timeout: TIMEOUT }, async () => {
@@ -335,8 +737,18 @@ test("frames are requested one at a time and the slider grows as each arrives",
         "Loading frame 1 of 3\u2026");
       await page.waitForTimeout(300);
       assert.equal(log.frames.length, 1);
-      assert.equal(await page.isDisabled("#play"), true);
-      assert.equal(await page.isDisabled("#slider"), true);
+      for (const id of ["#prev", "#play", "#next", "#slider"]) {
+        assert.equal(await page.isDisabled(id), true, id);
+      }
+      // The example is gone: blank image, no date, no hint, no marker, the search as name.
+      assert.ok((await canvasPixels(page)).every((v) => v === 0), "example still drawn");
+      assert.equal(await dateText(page), "");
+      assert.equal(await text(page, "#name"), `RA ${RA}, Dec ${DEC}`);
+      assert.equal(await text(page, "#position"),
+        "RA 133.7951°, Dec −7.2451° · D2");
+      assert.equal(await page.isVisible("#hint"), false);
+      assert.equal(await page.isVisible("#marker-control"), false);
+      assert.equal(await page.isVisible("#marker"), false);
 
       const sizes = [];
       for (let n = 0; n < 3; n++) {
@@ -355,6 +767,10 @@ test("frames are requested one at a time and the slider grows as each arrives",
       assert.ok(sizes[0] < sizes[1] && sizes[1] < sizes[2], `slider.max sequence ${sizes}`);
       assert.equal(log.maxInFlight, 1);
       assert.equal(await page.isDisabled("#play"), false);
+      const loaded = [0, 1, 2].map((n) => pixels(n));
+      assert.deepEqual(await canvasPixels(page),
+        Array.from(toRGBA(loaded[0], computeStretch(loaded))));
+      assert.equal(await page.isVisible("#marker"), false);
 
       const search = log.searches[0].searchParams;
       assert.deepEqual([search.get("ra"), search.get("dec"), search.get("detector")],
@@ -571,8 +987,10 @@ test("an empty plan reports that no exposures cover the position in the chosen d
     assertCleanRun(log);
   });
 
-test("one stretch for all frames: equal values match, a brighter source stays brighter",
-  { timeout: TIMEOUT }, async () => {
+// Both orders: a stretch frozen at the first loaded frame fails the dim-first order.
+for (const brightFirst of [true, false]) {
+  test(`one stretch for all frames: equal values match, a brighter source stays brighter `
+    + `(${brightFirst ? "bright" : "dim"} frame first)`, { timeout: TIMEOUT }, async () => {
     const equal = 100;
     const blank = 101;
     const source = new Set();
@@ -587,20 +1005,22 @@ test("one stretch for all frames: equal values match, a brighter source stays br
       return ((i * 7) % 50) / 100;
     });
     const sourcePixel = 21 * SIZE + 21;
+    const amplitudes = brightFirst ? [6, 3] : [3, 6];
     const plan = makePlan([
       { label: "2025-05-06", n_available: 8, n_used: 8 },
       { label: "2025-11-07", n_available: 8, n_used: 8 },
     ]);
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }),
-      frame: (n) => frameBody(frame(n === 0 ? 6 : 3), 8),
+      frame: (n) => frameBody(frame(amplitudes[n]), 8),
     });
     await submit(page);
     await finalStatus(page);
     const { min } = await sliderState(page);
-    await selectFrame(page, min);
+    const brightIndex = amplitudes.indexOf(6);
+    await selectFrame(page, min + brightIndex);
     const bright = await canvasPixels(page);
-    await selectFrame(page, min + 1);
+    await selectFrame(page, min + 1 - brightIndex);
     const dim = await canvasPixels(page);
 
     assert.equal(bright[4 * equal + 3], 255);
@@ -612,6 +1032,7 @@ test("one stretch for all frames: equal values match, a brighter source stays br
     assert.equal(dim[4 * blank + 3], 0);
     assertCleanRun(log);
   });
+}
 
 test("the first pixel value (north-east) is drawn at the canvas's top-left corner",
   { timeout: TIMEOUT }, async () => {

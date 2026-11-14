@@ -1,4 +1,4 @@
-"""Live validation of the SPHEREx viewer on the five challenge targets (CONTRACT.md item 9).
+"""Live validation of the SPHEREx viewer on the five targets named by the NASA Space Apps challenge.
 
 For each target and detector D1-D6 this script runs the package's own pipeline against the real
 archive (``discovery.discover`` -> ``visits.plan_frames`` -> ``frames.FrameBuilder.build``), then
@@ -39,7 +39,8 @@ from spherex_viewer.coords import parse_dec, parse_ra
 from spherex_viewer.frames import FrameBuilder, FrameError
 from spherex_viewer.grid import GRID_SHAPE, PIXEL_SCALE_ARCSEC, target_wcs
 from spherex_viewer.remote import HttpRangeReader
-from spherex_viewer.visits import EXPOSURE_CAP, FramePlan, plan_frames
+from spherex_viewer.visits import (EXPOSURE_CAP, MAX_BIN_DAYS, MAX_GAP_DAYS, FramePlan,
+                                   plan_frames)
 
 REPORT_PATH = Path(__file__).with_name("REPORT.md")
 CORE_RADIUS_PX = 3.0          # no-data count, peak and aperture radius around the expected position
@@ -353,6 +354,16 @@ def detector_span(dets: list[str]) -> str:
     return ", ".join(dets) if dets else "none"
 
 
+def plural(n: int, noun: str) -> str:
+    """``n`` followed by ``noun``, with an "s" unless ``n`` is 1."""
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def detectors(dets: list[str]) -> str:
+    """"detector D1" or "detectors D1, D2"."""
+    return ("detector " if len(dets) == 1 else "detectors ") + detector_span(dets)
+
+
 def summary_line(target: Target, results: list[DetectorResult]) -> str:
     frames = [(d.detector, f) for d in results for f in d.frames]
     failed = [d.detector for d in results if d.error]
@@ -366,22 +377,22 @@ def summary_line(target: Target, results: list[DetectorResult]) -> str:
                   for v in ("visible", "saturated core", "not detected")}
     counts = {v: sum(f.verdict == v for _, f in frames) for v in by_verdict}
     labels = [f.plan.label for _, f in frames]
-    text = (f"- **{target.name}** ({len(frames)} frames, {min(labels)[:10]} to "
+    text = (f"- **{target.name}** ({plural(len(frames), 'frame')}, {min(labels)[:10]} to "
             f"{max(labels)[-10:]}): ")
     if counts["visible"] + counts["saturated core"] == 0:
         return text + ("the tool shows nothing at the expected position in any frame of any "
                        "detector (not detected in all frames)." + note)
     parts = []
     if counts["visible"]:
-        parts.append(f"a source at the expected position in {counts['visible']} frames "
-                     f"(detectors {detector_span(by_verdict['visible'])})")
+        parts.append(f"a source at the expected position in {plural(counts['visible'], 'frame')} "
+                     f"({detectors(by_verdict['visible'])})")
     if counts["saturated core"]:
         parts.append(f"a bright star with an empty (no-data) centre in "
-                     f"{counts['saturated core']} frames "
-                     f"(detectors {detector_span(by_verdict['saturated core'])})")
+                     f"{plural(counts['saturated core'], 'frame')} "
+                     f"({detectors(by_verdict['saturated core'])})")
     if counts["not detected"]:
-        parts.append(f"nothing above the threshold in {counts['not detected']} frames "
-                     f"(detectors {detector_span(by_verdict['not detected'])})")
+        parts.append(f"nothing above the threshold in {plural(counts['not detected'], 'frame')} "
+                     f"({detectors(by_verdict['not detected'])})")
     text += "; ".join(parts) + "."
     if target.astrometry is not None:
         tests = {d.detector: motion_verdict(*found[2:]) for d in results
@@ -407,14 +418,14 @@ def variability(det: DetectorResult) -> tuple[str, str]:
     """('yes'/'no'/'n/a', explanation) for max-min aperture difference against the noise."""
     good = [f for f in det.frames if np.isfinite(f.aperture_mjy) and f.aperture_err_mjy > 0]
     if len(good) < 2:
-        return "n/a", f"{len(good)} frame(s) with a complete aperture"
+        return "n/a", f"{plural(len(good), 'frame')} with a complete aperture"
     hi = max(good, key=lambda f: f.aperture_mjy)
     lo = min(good, key=lambda f: f.aperture_mjy)
     sig = (hi.aperture_mjy - lo.aperture_mjy) / math.hypot(hi.aperture_err_mjy,
                                                           lo.aperture_err_mjy)
     return ("yes" if sig > VARIABILITY_SIGMA else "no",
             f"max−min = {hi.aperture_mjy - lo.aperture_mjy:.2f} mJy = {sig:.1f}σ "
-            f"over {len(good)} frames")
+            f"over {plural(len(good), 'frame')}")
 
 
 def frame_table(target: Target, det: DetectorResult) -> list[str]:
@@ -452,8 +463,9 @@ def astrometry_section() -> list[str]:
         "## Astrometric inputs",
         "",
         "Expected positions are computed for each frame's mean epoch (mean start time of the "
-        "exposures used). Method: astropy `SkyCoord.apply_space_motion` (rigorous space motion, "
-        "radial velocity taken as 0) from the reference epoch, then annual parallax "
+        "exposures planned for the frame). Method: astropy `SkyCoord.apply_space_motion` "
+        "(rigorous space motion, radial velocity taken as 0) from the reference epoch, then annual "
+        "parallax "
         "Δα cosδ = π(X sinα − Y cosα), Δδ = π(X cosα sinδ + Y sinα sinδ − Z cosδ) with Earth's "
         "barycentric X, Y, Z (AU) from `get_body_barycentric('earth')`. SPHEREx's own offset from "
         "Earth's centre (low Earth orbit) changes this by < 0.05 mas and is ignored.",
@@ -491,9 +503,14 @@ def method_section() -> list[str]:
         "## Method and rules",
         "",
         "Each frame is produced exactly as the web tool produces it: `discovery.discover` (live "
-        "TAP), `visits.plan_frames` (visits, 30-day bins, cap of "
-        f"{EXPOSURE_CAP} exposures), `FrameBuilder.build` (byte-range reads, background "
-        "subtraction, flag masking, reprojection onto `grid.target_wcs`, per-pixel median). "
+        "search of IRSA's Simple Image Access service), `visits.plan_frames` (exposures split "
+        f"into visits at gaps of more than {MAX_GAP_DAYS:g} days, visits longer than "
+        f"{MAX_BIN_DAYS:g} days cut into equal bins of at most {MAX_BIN_DAYS:g} days, at most "
+        f"{EXPOSURE_CAP} exposures per frame picked evenly spaced in time order with first and "
+        "last kept), `FrameBuilder.build` (byte-range reads from the public S3 bucket, "
+        "sigma-clipped median background subtracted per exposure, pixels with the SPHEREx Mosaic "
+        "Tool's bad flags set to NaN, bilinear reprojection onto `grid.target_wcs`, per-pixel "
+        "NaN-ignoring median). "
         "Measurements are on that 59×59 frame (6.15″ pixels, MJy/sr, background-subtracted). "
         "r is the distance in pixels from the expected position.",
         "",
@@ -527,12 +544,14 @@ def method_section() -> list[str]:
 
 def render(results: dict[str, list[DetectorResult]], info: dict[str, str]) -> str:
     lines = ["# Live validation on the five challenge targets", "",
-             "Generated by `validation/run_validation.py` (CONTRACT.md item 9). " + info["run"],
+             "Generated by `validation/run_validation.py` for the five targets named by the NASA "
+             "Space Apps challenge. " + info["run"],
              "", "## What a user of the tool sees", ""]
     lines += [summary_line(t, results[t.name]) for t in TARGETS]
     lines += ["", "Caveat for brightness: each frame averages over the detector's wavelength "
               "range and visits sample that range differently, so part of any frame-to-frame "
-              "brightness change is not intrinsic (CONTRACT.md, known limitations).", ""]
+              "brightness change is not intrinsic (one of the limitations listed in the "
+              "README).", ""]
     lines += method_section() + astrometry_section()
     lines += ["## Motion: measured versus predicted first-to-last shift", "",
               "Offsets in arcsec as (ΔRA cosδ, ΔDec), between the first and last frame of each "
@@ -547,7 +566,7 @@ def render(results: dict[str, list[DetectorResult]], info: dict[str, str]) -> st
     anomalies = [f"- {t.name} {d.detector}: {d.error}" for t in TARGETS for d in results[t.name]
                  if d.error]
     anomalies += [f"- {t.name} {d.detector} frame {f.plan.index} ({f.plan.label}): "
-                  + (f.error or f"{f.n_failed} exposure(s) failed to load")
+                  + (f.error or f"{plural(f.n_failed, 'exposure')} failed to load")
                   for t in TARGETS for d in results[t.name] for f in d.frames
                   if f.error or f.n_failed]
     anomalies += [f"- {t.name} {d.detector} frame {f.plan.index} ({f.plan.label}): frame has no "
@@ -561,8 +580,8 @@ def render(results: dict[str, list[DetectorResult]], info: dict[str, str]) -> st
                 lines += [f"**{det.detector}**: discovery failed: {det.error}", ""]
                 continue
             cap = "yes" if det.capped else "no"
-            lines += [f"**{det.detector}**: {det.n_exposures} exposures, {len(det.frames)} frames, "
-                      f"cap applied: {cap}."
+            lines += [f"**{det.detector}**: {plural(det.n_exposures, 'exposure')}, "
+                      f"{plural(len(det.frames), 'frame')}, cap applied: {cap}."
                       + (f" Variability: {' – '.join(variability(det))}." if t.variable else ""),
                       ""]
             if det.frames:
@@ -598,9 +617,11 @@ def run(cache_dir: Path) -> tuple[dict[str, list[DetectorResult]], dict[str, str
     n_used = sum(len(f.plan.exposures) for r in results.values() for d in r for f in d.frames)
     info = {"run": (
         f"Run {datetime.now(UTC):%Y-%m-%d %H:%M} UTC in {elapsed / 60:.1f} min: "
-        f"{n_exposures} exposures discovered, {n_used} planned for frames, "
-        f"{count_cutouts(cache_dir) - before} read from S3 in this run (the rest came from the "
-        f"validation cache), {reader.requests} range requests, {reader.bytes / 1e6:.0f} MB.")}
+        f"{plural(n_exposures, 'exposure')} discovered, {n_used} planned for frames, "
+        f"{plural(count_cutouts(cache_dir) - before, 'new cutout')} read from S3 and cached in "
+        "this run (the other planned exposures came from the validation cache, or missed the "
+        f"grid or failed to load), {plural(reader.requests, 'range request')}, "
+        f"{reader.bytes / 1e6:.0f} MB.")}
     return results, info
 
 

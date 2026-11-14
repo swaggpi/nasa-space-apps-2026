@@ -8,25 +8,52 @@
   <script type="module" src="./app.js"></script>
 </head>
 <body>
-  <form id="search">
-    <label>RA <input id="ra" type="text" autocomplete="off" spellcheck="false"></label>
-    <label>Dec <input id="dec" type="text" autocomplete="off" spellcheck="false"></label>
-    <select id="detector" aria-label="Detector">
-      <option>D1</option>
-      <option selected>D2</option>
-      <option>D3</option>
-      <option>D4</option>
-      <option>D5</option>
-      <option>D6</option>
-    </select>
-    <button id="submit" type="submit">Show</button>
-  </form>
-  <p id="status" aria-live="polite"></p>
-  <canvas id="image" width="59" height="59" role="img"
-    aria-label="SPHEREx image of the selected frame, north up, east left"></canvas>
-  <button id="play" type="button" disabled>Play</button>
-  <input id="slider" type="range" min="0" max="0" step="1" value="0" disabled aria-label="Frame">
-  <span id="date"></span>
+  <main id="viewer">
+    <section id="player" aria-label="Player">
+      <div id="frame">
+        <canvas id="image" width="59" height="59" role="img"
+          aria-label="SPHEREx image of the selected frame, north up, east left"></canvas>
+        <div id="marker" aria-hidden="true" hidden></div>
+      </div>
+      <div id="controls">
+        <button id="prev" type="button" aria-label="Previous frame" disabled>&lsaquo;</button>
+        <button id="play" type="button" disabled>Play</button>
+        <button id="next" type="button" aria-label="Next frame" disabled>&rsaquo;</button>
+        <input id="slider" type="range" min="0" max="0" step="1" value="0" disabled
+          aria-label="Timeline">
+      </div>
+      <p id="date"></p>
+    </section>
+    <aside id="panel" aria-label="Target">
+      <h1 id="name"></h1>
+      <p id="position"></p>
+      <p id="hint" hidden></p>
+      <label id="marker-control" hidden><input id="show-marker" type="checkbox" checked>
+        Show target marker</label>
+      <details id="enter">
+        <summary>Enter coordinates</summary>
+        <form id="search">
+          <label>RA <input id="ra" type="text" autocomplete="off" spellcheck="false"></label>
+          <label>Dec <input id="dec" type="text" autocomplete="off" spellcheck="false"></label>
+          <button id="submit" type="submit">Show</button>
+        </form>
+      </details>
+      <details id="advanced">
+        <summary>Advanced settings</summary>
+        <label>Detector
+          <select id="detector" form="search">
+            <option>D1</option>
+            <option selected>D2</option>
+            <option>D3</option>
+            <option>D4</option>
+            <option>D5</option>
+            <option>D6</option>
+          </select>
+        </label>
+      </details>
+      <p id="status" aria-live="polite"></p>
+    </aside>
+  </main>
   <footer id="ack">This publication makes use of data products from the Spectro-Photometer for
     the History of the Universe, Epoch of Reionization and Ices Explorer (SPHEREx), which is a
     joint project of the Jet Propulsion Laboratory and the California Institute of Technology,
