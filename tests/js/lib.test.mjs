@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  capNotice, computeStretch, frameLabel, joinStatus, nextIndex, plural, toRGBA,
+  capNotice, computeStretch, formatPosition, frameLabel, joinStatus, markerPercent, nextIndex,
+  parseExample, plural, previousIndex, toRGBA,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -168,4 +169,94 @@ test("nextIndex advances and wraps to the first frame", () => {
   assert.equal(nextIndex(1, 3), 2);
   assert.equal(nextIndex(2, 3), 0);
   assert.equal(nextIndex(0, 1), 0);
+});
+
+test("previousIndex steps back and wraps to the last frame", () => {
+  assert.equal(previousIndex(2, 3), 1);
+  assert.equal(previousIndex(1, 3), 0);
+  assert.equal(previousIndex(0, 3), 2);
+  assert.equal(previousIndex(0, 1), 0);
+});
+
+test("formatPosition gives four decimals in degrees, a signed Dec and the detector", () => {
+  assert.equal(formatPosition(269.4462683, 4.7682045, "D6"),
+    "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6");
+  assert.equal(formatPosition(133.795129, -7.245147, "D2"),
+    "RA 133.7951\u00b0, Dec \u22127.2451\u00b0 \u00b7 D2");
+});
+
+test("markerPercent puts pixel centres at integer coordinates", () => {
+  assert.deepEqual(markerPercent({ x: 0, y: 0 }, 59, 59),
+    { left: 50 / 59, top: 50 / 59 });
+  assert.deepEqual(markerPercent({ x: 29, y: 29 }, 59, 59), { left: 50, top: 50 });
+  assert.deepEqual(markerPercent({ x: -0.5, y: 58.5 }, 59, 59), { left: 0, top: 100 });
+  assert.deepEqual(markerPercent({ x: 1.5, y: 0.5 }, 4, 2), { left: 50, top: 50 });
+});
+
+function example({ marker = true, frames = 2 } = {}) {
+  return {
+    name: "Barnard's Star",
+    hint: "Watch the bright star move.",
+    ra_deg: 269.4462683,
+    dec_deg: 4.7682045,
+    detector: "D6",
+    width: 2,
+    height: 2,
+    frames: Array.from({ length: frames }, (_, i) => ({
+      label: `2025-0${i + 1}-01`,
+      n_used: i + 1,
+      pixels: [0.1, null, 0.3, i],
+      ...(marker ? { marker: { x: 0.5 + i, y: 1 } } : {}),
+    })),
+  };
+}
+
+test("parseExample converts a valid example to page frames with labels and markers", () => {
+  const parsed = parseExample(example());
+  assert.deepEqual(parsed, {
+    name: "Barnard's Star",
+    hint: "Watch the bright star move.",
+    position: "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6",
+    frames: [
+      { pixels: [0.1, null, 0.3, 0], width: 2, height: 2,
+        label: "2025-01-01 \u00b7 1 exposure", marker: { x: 0.5, y: 1 } },
+      { pixels: [0.1, null, 0.3, 1], width: 2, height: 2,
+        label: "2025-02-01 \u00b7 2 exposures", marker: { x: 1.5, y: 1 } },
+    ],
+  });
+});
+
+test("parseExample accepts an example without markers and leaves the key out", () => {
+  const parsed = parseExample(example({ marker: false }));
+  assert.ok(parsed !== null);
+  for (const frame of parsed.frames) assert.equal("marker" in frame, false);
+});
+
+test("parseExample rejects content that does not match the schema", () => {
+  const broken = [
+    null, [], "x", {},
+    { ...example(), name: 3 },
+    { ...example(), hint: undefined },
+    { ...example(), ra_deg: "269.4" },
+    { ...example(), dec_deg: Number.NaN },
+    { ...example(), detector: null },
+    { ...example(), width: 0 },
+    { ...example(), height: 2.5 },
+    { ...example(), frames: [] },
+    { ...example(), frames: "none" },
+  ];
+  const withFrame = (change) => {
+    const data = example();
+    data.frames[1] = { ...data.frames[1], ...change };
+    return data;
+  };
+  broken.push(
+    withFrame({ pixels: [0.1, null, 0.3] }),
+    withFrame({ pixels: [0.1, null, 0.3, "1"] }),
+    withFrame({ label: 5 }),
+    withFrame({ n_used: -1 }),
+    withFrame({ marker: { x: 1 } }),
+    withFrame({ marker: undefined }),
+  );
+  broken.forEach((data, i) => assert.equal(parseExample(data), null, `case ${i}`));
 });

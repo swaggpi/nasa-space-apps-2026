@@ -2,6 +2,7 @@
 
 import csv
 import io
+import time
 
 import httpx
 import numpy as np
@@ -62,13 +63,20 @@ def test_wise_0855_discovery_returns_sorted_rows(wise_exposures):
 
 
 def tap_exposures(client, ra_deg: float, dec_deg: float, detector: str) -> list[tuple[str, float]]:
-    """Run the reference TAP query (slow: a full scan, 15-70 s) and return (uri, mjd) rows."""
+    """Run the reference TAP query (a full table scan: 15 s to minutes) and return its rows.
+
+    IRSA intermittently answers with a quick HTTP 502, so a 5xx is retried once.
+    """
     query = (
         "SELECT a.uri, p.time_bounds_lower FROM spherex.artifact a JOIN spherex.plane p "
         f"ON a.planeid = p.planeid WHERE 1 = CONTAINS(POINT('ICRS', {ra_deg!r}, {dec_deg!r}), "
         f"p.poly) AND p.energy_bandpassname = 'SPHEREx-{detector}' ORDER BY p.time_bounds_lower"
     )
-    response = client.get(TAP_URL, params={"QUERY": query, "FORMAT": "CSV"}, timeout=300.0)
+    for _ in range(2):
+        response = client.get(TAP_URL, params={"QUERY": query, "FORMAT": "CSV"}, timeout=300.0)
+        if response.status_code < 500:
+            break
+        time.sleep(5.0)
     assert response.status_code == 200
     rows = list(csv.reader(io.StringIO(response.text)))
     assert rows[0] == ["uri", "time_bounds_lower"]

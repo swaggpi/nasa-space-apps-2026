@@ -1,5 +1,6 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
-// status and date texts and playback index. No DOM access; imported by app.js and by Node tests.
+// status, date and position texts, frame stepping, marker placement and validation of the
+// bundled example. No DOM access; imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -103,11 +104,90 @@ export function capNotice(plan) {
 }
 
 /**
- * Next frame index during playback, wrapping to 0.
+ * Next frame index during playback and for the next-frame button, wrapping to 0.
  * @param {number} current
  * @param {number} count number of loaded frames (> 0)
  * @returns {number}
  */
 export function nextIndex(current, count) {
   return (current + 1) % count;
+}
+
+
+/**
+ * Previous frame index for the previous-frame button, wrapping to the last frame.
+ * @param {number} current
+ * @param {number} count number of loaded frames (> 0)
+ * @returns {number}
+ */
+export function previousIndex(current, count) {
+  return (current - 1 + count) % count;
+}
+
+/**
+ * Position text for the target panel, e.g. "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6".
+ * @param {number} raDeg ICRS right ascension in degrees
+ * @param {number} decDeg ICRS declination in degrees
+ * @param {string} detector
+ * @returns {string}
+ */
+export function formatPosition(raDeg, decDeg, detector) {
+  const dec = `${decDeg < 0 ? "\u2212" : "+"}${Math.abs(decDeg).toFixed(4)}`;
+  return `RA ${raDeg.toFixed(4)}\u00b0, Dec ${dec}\u00b0 \u00b7 ${detector}`;
+}
+
+/**
+ * Where a marker sits on the displayed image, as percentages of its width and height.
+ * Marker coordinates are image pixels with pixel centres at integers (x right, y down).
+ * @param {{x: number, y: number}} marker
+ * @param {number} width image width in pixels
+ * @param {number} height image height in pixels
+ * @returns {{left: number, top: number}} percent from the left and top edges
+ */
+export function markerPercent(marker, width, height) {
+  return { left: (100 * (marker.x + 0.5)) / width, top: (100 * (marker.y + 0.5)) / height };
+}
+
+const isString = (v) => typeof v === "string";
+const isNumber = (v) => typeof v === "number" && Number.isFinite(v);
+const isCount = (v) => Number.isInteger(v) && v >= 0;
+const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+
+function validFrame(frame, size) {
+  return isObject(frame) && isString(frame.label) && isCount(frame.n_used)
+    && Array.isArray(frame.pixels) && frame.pixels.length === size
+    && frame.pixels.every((v) => v === null || isNumber(v))
+    && (frame.marker === undefined
+      || (isObject(frame.marker) && isNumber(frame.marker.x) && isNumber(frame.marker.y)));
+}
+
+/**
+ * Checks the parsed content of example.json and converts it to the page's frame form.
+ * Markers must be present in every frame or in none.
+ * @param {unknown} data parsed JSON
+ * @returns {{name: string, hint: string, position: string,
+ *   frames: Array<{pixels: Array<number|null>, width: number, height: number, label: string,
+ *   marker?: {x: number, y: number}}>} | null} null if the content does not match the schema
+ */
+export function parseExample(data) {
+  if (!isObject(data) || !isString(data.name) || !isString(data.hint) || !isNumber(data.ra_deg)
+    || !isNumber(data.dec_deg) || !isString(data.detector)) return null;
+  const { width, height, frames } = data;
+  if (!(isCount(width) && width > 0 && isCount(height) && height > 0)) return null;
+  if (!Array.isArray(frames) || frames.length === 0) return null;
+  if (!frames.every((f) => validFrame(f, width * height))) return null;
+  const withMarker = frames.filter((f) => f.marker !== undefined).length;
+  if (withMarker !== 0 && withMarker !== frames.length) return null;
+  return {
+    name: data.name,
+    hint: data.hint,
+    position: formatPosition(data.ra_deg, data.dec_deg, data.detector),
+    frames: frames.map((f) => ({
+      pixels: f.pixels,
+      width,
+      height,
+      label: frameLabel(f.label, f.n_used),
+      ...(f.marker === undefined ? {} : { marker: { x: f.marker.x, y: f.marker.y } }),
+    })),
+  };
 }
