@@ -20,10 +20,12 @@ MAX_RESPONSE_BYTES = 64 * 2**20
 # filter only saves transfer: rows are still selected by energy_bandpassname.
 _BAND_M = {"D1": 0.92e-6, "D2": 1.37e-6, "D3": 2.02e-6, "D4": 3.12e-6, "D5": 4.13e-6,
            "D6": 4.72e-6}
-_COLUMNS = ("access_url", "energy_bandpassname", "t_min")
-# IRSA's gateway answers a share of requests (up to 40 % measured) with an immediate HTTP 502,
-# largely independently from one request to the next, so retries are cheap and effective.
-_RETRY_DELAYS_S = (1.0, 2.0, 3.0, 4.0)
+_COLUMNS = ("access_url", "energy_bandpassname", "t_min", "calib_level", "dataproduct_type")
+# IRSA's gateway has answered 63-94 % of requests with an immediate HTTP 502 (measured on
+# 2026-11-14); the share drifts within an hour and two requests in the same second can get
+# different answers, so retries are cheap and effective. About 11 attempts fit the 20 s start
+# window (_LAST_START_S).
+_RETRY_DELAYS_S = (0.5, 1.0, 1.5) + (2.0,) * 9
 # One discover() call ends within _BUDGET_S: an attempt starts only if its pool wait, connect,
 # send and header read all fit in the budget, and no body read starts after _STREAM_END_S.
 # The deepest field (5,125 rows) answers in 2 s and streams 4.7 MB with gaps below 0.1 s.
@@ -96,7 +98,11 @@ def _lines(chunks: Iterable[bytes], end: float) -> Iterator[bytes]:
 
 
 def parse_tsv(lines: Iterable[bytes], detector: str) -> list[Exposure]:
-    """Parse the SIA TSV response into the exposures of ``detector``, sorted by MJD."""
+    """Parse the SIA TSV response into the exposures of ``detector``, sorted by MJD.
+
+    Rows of ``detector`` that are not level-2 images are skipped, unless their URI is a level-2
+    URI: then the labels contradict the file and ``DiscoveryError`` is raised.
+    """
     band = f"SPHEREx-{detector}"
     exposures = []
     header = None
@@ -116,8 +122,14 @@ def parse_tsv(lines: Iterable[bytes], detector: str) -> list[Exposure]:
             continue
         if len(fields) != len(header):
             raise DiscoveryError("Malformed row in the archive response.")
-        url, bandpass, mjd_text = (fields[i] for i in index)
+        url, bandpass, mjd_text, level, kind = (fields[i] for i in index)
         if bandpass != band:
+            continue
+        uri = url.removeprefix(ARCHIVE_PREFIX)
+        valid = uri != url and is_valid_uri(uri)
+        if (level, kind) != ("2", "image"):
+            if valid:
+                raise DiscoveryError(f"Unexpected product type in the archive response: {url!r}.")
             continue
         try:
             mjd = float(mjd_text)
@@ -125,8 +137,7 @@ def parse_tsv(lines: Iterable[bytes], detector: str) -> list[Exposure]:
             raise DiscoveryError("Malformed time in the archive response.") from exc
         if not math.isfinite(mjd):
             raise DiscoveryError("Malformed time in the archive response.")
-        uri = url.removeprefix(ARCHIVE_PREFIX)
-        if uri == url or not is_valid_uri(uri):
+        if not valid:
             raise DiscoveryError(f"Unexpected URI in the archive response: {url!r}.")
         exposures.append(Exposure(uri=uri, mjd=mjd))
     if header is None:
@@ -138,9 +149,10 @@ def parse_tsv(lines: Iterable[bytes], detector: str) -> list[Exposure]:
 def discover(client: httpx.Client, ra_deg: float, dec_deg: float, detector: str) -> list[Exposure]:
     """Query the archive for all exposures of ``detector`` covering (ra, dec); never cached.
 
-    A 5xx answer or a transport error is retried after 1, 2, 3 and 4 s as long as the attempt
-    fits in the 45 s budget; any other failure raises ``DiscoveryError`` at once. The call
-    returns or raises within 45 s plus the parsing time of one received chunk.
+    A 5xx answer or a transport error is retried after 0.5, 1 and 1.5 s, then every 2 s, as
+    long as the attempt starts within 20 s and fits in the 45 s budget; any other failure
+    raises ``DiscoveryError`` at once. The call returns or raises within 45 s plus the parsing
+    time of one received chunk.
     """
     params = sia_params(ra_deg, dec_deg, detector)
     start = time.monotonic()

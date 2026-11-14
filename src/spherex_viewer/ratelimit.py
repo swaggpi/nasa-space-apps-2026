@@ -7,7 +7,8 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 
-# Each search is one archive query of 2.7-32 s: a few positions at once, then one per 30 s.
+# Each search is one archive query of about 1 s, up to 20 s while the gateway rejects
+# requests: a few positions at once, then one per 30 s.
 SEARCH_BURST = 10
 SEARCH_PER_MINUTE = 2.0
 # Each frame reads up to 24 exposures (~1.2 MB each): a few searches' frames, then one per 10 s.

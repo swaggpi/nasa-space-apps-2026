@@ -2,11 +2,14 @@
 
 import errno
 import logging
+import threading
+import time
 
 import numpy as np
 import pytest
 
 import synthetic
+from spherex_viewer import frames
 from spherex_viewer.cache import CutoutCache
 from spherex_viewer.frames import FrameBuilder, FrameError
 from spherex_viewer.grid import GRID_SHAPE
@@ -38,6 +41,30 @@ def blobs() -> dict[str, bytes]:
     blobs[s3_url(make_uri(ALL_BAD))] = synthetic.make_exposure(
         (RA, DEC), STAR, n=100, rot_deg=0.0, bad=every_pixel, seed=ALL_BAD)
     return blobs
+
+
+@pytest.fixture(scope="module")
+def twelve_blobs() -> dict[str, bytes]:
+    return {
+        s3_url(make_uri(i)): synthetic.make_exposure((RA, DEC), STAR, n=100, rot_deg=0.0, seed=i)
+        for i in range(12)
+    }
+
+
+class BlockingReader:
+    """Serves ``blobs``, holding every read until ``release`` is set; records entered URLs."""
+
+    def __init__(self, blobs: dict[str, bytes]) -> None:
+        self._inner = synthetic.FakeRangeReader(blobs)
+        self.release = threading.Event()
+        self.entered: set[str] = set()
+        self._lock = threading.Lock()
+
+    def read(self, url: str, start: int, stop: int) -> bytes:
+        with self._lock:
+            self.entered.add(url)
+        self.release.wait(10)
+        return self._inner.read(url, start, stop)
 
 
 @pytest.fixture
@@ -132,3 +159,82 @@ def test_failed_cache_write_does_not_fail_the_frame(builder_and_reader, cache, m
     assert np.isfinite(result.data).any()
     assert "No space left on device" in caplog.text
     assert all(len(record.getMessage()) < 100 for record in caplog.records)
+
+
+def test_stalled_reads_fail_the_frame_at_the_deadline(cache, twelve_blobs, monkeypatch):
+    reader = BlockingReader(twelve_blobs)
+    builder = FrameBuilder(reader, cache)
+    uris = [make_uri(i) for i in range(12)]
+    try:
+        monkeypatch.setattr(frames, "FRAME_BUILD_S", 0.3)
+        started = time.monotonic()
+        with pytest.raises(FrameError):
+            builder.build(uris, RA, DEC)
+        assert time.monotonic() - started < 1.0
+        assert len(reader.entered) <= frames.MAX_WORKERS
+        reader.release.set()
+        monkeypatch.setattr(frames, "FRAME_BUILD_S", 30.0)
+        result = builder.build(uris, RA, DEC)
+    finally:
+        reader.release.set()
+        builder.close()
+    assert (result.n_used, result.n_failed) == (12, 0)
+
+
+def test_exposure_started_after_the_deadline_fails_the_frame(tmp_path, monkeypatch):
+    monkeypatch.setattr(frames, "MAX_WORKERS", 2)
+    uris = [make_uri(i) for i in range(3)]
+    inner = synthetic.FakeRangeReader(
+        {s3_url(uri): synthetic.make_exposure((RA, DEC), STAR, n=100, rot_deg=0.0, seed=i)
+         for i, uri in enumerate(uris)})
+    real_clock = time.monotonic
+    offset = [0.0]
+    monkeypatch.setattr(frames.time, "monotonic", lambda: real_clock() + offset[0])
+    first_may_finish = threading.Event()
+
+    class Reader:
+        def read(self, url, start, stop):
+            if url == s3_url(uris[0]) and start == 0:
+                first_may_finish.wait(10)      # begun before the deadline, finishes after it
+            return inner.read(url, start, stop)
+
+    cache = CutoutCache(tmp_path, 10**8)
+    put = cache.put
+
+    def put_then_pass_the_deadline(uri, *args):
+        put(uri, *args)
+        if uri == uris[1]:                     # the third exposure starts next, and is refused
+            offset[0] = 1000.0
+            threading.Timer(0.3, first_may_finish.set).start()
+
+    monkeypatch.setattr(cache, "put", put_then_pass_the_deadline)
+    builder = FrameBuilder(Reader(), cache)
+    try:
+        with pytest.raises(FrameError):
+            builder.build(uris, RA, DEC)
+    finally:
+        builder.close()
+    assert cache.get(uris[0], RA, DEC) is not None
+    assert cache.get(uris[1], RA, DEC) is not None
+    assert cache.get(uris[2], RA, DEC) is None
+
+
+def test_pool_reads_eight_exposures_at_once(cache, twelve_blobs):
+    reader = BlockingReader(twelve_blobs)
+    builder = FrameBuilder(reader, cache)
+    outcome = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(builder.build([make_uri(i) for i in range(12)], RA, DEC)))
+    try:
+        worker.start()
+        waited_until = time.monotonic() + 5.0
+        while len(reader.entered) < 8 and time.monotonic() < waited_until:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        entered = len(reader.entered)
+    finally:
+        reader.release.set()
+        worker.join()
+        builder.close()
+    assert entered == 8
+    assert (outcome[0].n_used, outcome[0].n_failed) == (12, 0)

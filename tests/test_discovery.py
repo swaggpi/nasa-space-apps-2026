@@ -42,10 +42,12 @@ EM_RANGES = {"D1": (7.455e-07, 1.1167e-06), "D2": (1.1033e-06, 1.6499e-06),
              "D5": (3.8113e-06, 4.43e-06), "D6": (4.4115e-06, 5.0096e-06)}
 
 
-def row(url: str, mjd: object, band: str = "SPHEREx-D2", collection: str = "spherex_dr1") -> str:
+def row(url: str, mjd: object, band: str = "SPHEREx-D2", collection: str = "spherex_dr1",
+        level: str = "2", kind: str = "image") -> str:
     values = dict.fromkeys(COLUMNS, "")
     values.update(access_url=url, t_min=str(mjd), energy_bandpassname=band,
-                  obs_collection=collection, s_region="POLYGON ICRS 1 2 3 4 5 6 1 2",
+                  obs_collection=collection, calib_level=level, dataproduct_type=kind,
+                  s_region="POLYGON ICRS 1 2 3 4 5 6 1 2",
                   cloud_access='{"aws": {"bucket_name": "nasa-irsa-spherex", "key":"x"}}')
     return "\t".join(values[c] for c in COLUMNS)
 
@@ -160,6 +162,22 @@ def test_parse_keeps_only_the_requested_detector():
     assert parse(text, "D4") == []
 
 
+def test_parse_skips_other_products_of_the_detector():
+    cube = (PREFIX + "ibe/data/spherex/dr1/hips5_cube/hips_20261026/Norder5/Dir0/"
+            "Npix7945_cube.fits")
+    text = tsv(row(PREFIX + _uri("dr1", 0), 60801.0),
+               row(cube, "", collection="spherex_dr1_cube", level="3", kind="cube"),
+               row(PREFIX + _uri("dr1", 1), 60802.0))
+    assert parse(text, "D2") == [Exposure(_uri("dr1", 0), 60801.0),
+                                 Exposure(_uri("dr1", 1), 60802.0)]
+
+
+@pytest.mark.parametrize(("level", "kind"), [("3", "image"), ("2", "cube"), ("", "")])
+def test_parse_rejects_level2_file_with_other_labels(level, kind):
+    with pytest.raises(DiscoveryError):
+        parse(tsv(row(PREFIX + DR1_URI, 60801.1, level=level, kind=kind)))
+
+
 def test_parse_header_only_is_empty():
     assert parse(tsv()) == []
 
@@ -167,7 +185,8 @@ def test_parse_header_only_is_empty():
 @pytest.mark.parametrize(
     "header",
     ["", HEADER.replace("t_min", "t_max_"), HEADER.replace("access_url", "uri"),
-     HEADER.replace("energy_bandpassname", "band"), HEADER.replace("\t", ",")],
+     HEADER.replace("energy_bandpassname", "band"), HEADER.replace("\t", ","),
+     HEADER.replace("calib_level", "level"), HEADER.replace("dataproduct_type", "type")],
 )
 def test_parse_rejects_wrong_header(header):
     with pytest.raises(DiscoveryError):
@@ -304,16 +323,16 @@ def test_discover_retries_after_503(no_sleep):
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
     assert len(requests) == 2
-    assert no_sleep == [1]
+    assert no_sleep == [0.5]
 
 
-def test_discover_survives_four_gateway_errors(no_sleep):
+def test_discover_survives_eight_gateway_errors(no_sleep):
     requests = []
-    with _client([(502, PROXY_ERROR)] * 4 + [(200, BODY)], requests) as client:
+    with _client([(502, PROXY_ERROR)] * 8 + [(200, BODY)], requests) as client:
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
-    assert len(requests) == 5
-    assert no_sleep == [1, 2, 3, 4]
+    assert len(requests) == 9
+    assert no_sleep == [0.5, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0]
 
 
 def test_discover_retries_after_transport_error(no_sleep):
@@ -323,7 +342,7 @@ def test_discover_retries_after_transport_error(no_sleep):
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
     assert len(requests) == 2
-    assert no_sleep == [1]
+    assert no_sleep == [0.5]
 
 
 def test_discover_retries_after_error_mid_body(no_sleep):
@@ -333,14 +352,6 @@ def test_discover_retries_after_error_mid_body(no_sleep):
         result = discover(client, 133.795129, -7.245147, "D2")
     assert result == EXPECTED
     assert len(requests) == 2
-
-
-def test_discover_fails_after_five_gateway_errors(no_sleep):
-    requests = []
-    with _client([(502, PROXY_ERROR)] * 5 + [(200, BODY)], requests) as client:
-        with pytest.raises(DiscoveryError, match="HTTP 502"):
-            discover(client, 133.795129, -7.245147, "D2")
-    assert len(requests) == 5
 
 
 class Clock:
@@ -393,8 +404,19 @@ def test_discover_does_not_retry_after_the_last_start(clock):
     with _stalling_client(clock, 9.0, httpx.ReadTimeout("stalled"), requests) as client:
         with pytest.raises(DiscoveryError, match="could not be reached"):
             discover(client, 133.795129, -7.245147, "D2")
-    assert len(requests) == 2
-    assert clock.sleeps == [1]
+    assert len(requests) == 3
+    assert clock.sleeps == [0.5, 1.0]
+
+
+def test_discover_gives_up_within_the_start_window(clock):
+    requests = []
+    start = clock.now
+    with _stalling_client(clock, 0.0, 502, requests) as client:
+        with pytest.raises(DiscoveryError, match="HTTP 502"):
+            discover(client, 133.795129, -7.245147, "D2")
+    assert len(requests) == 12
+    assert all(t - requests[0] <= 20 for t in requests)
+    assert clock.now - start <= 21
 
 
 def test_discover_stops_a_trickling_response_within_the_budget(clock):

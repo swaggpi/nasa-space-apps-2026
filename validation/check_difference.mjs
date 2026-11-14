@@ -9,7 +9,10 @@
 // and at least twice the strongest pixel beyond 9 px, and no frame of any loop built from
 // more than 5 exposures has a pixel beyond 9 px at half scale or more (a must-show loop with no
 // such frame fails); 2 if a loop is missing. The HD 2811 loops are a control: a constant
-// flux standard, reported so that the residual of a bright unchanging star is on record.
+// flux standard. A bright unchanging star also leaves a residual at the centre, so the check
+// further fails unless every control frame from more than 5 exposures stays below 85 at the
+// centre (a control loop with no such frame fails) and the strongest such frame of each
+// must-show loop reaches 100. A server answering 429 is asked again after its Retry-After.
 
 import { readFileSync } from "node:fs";
 
@@ -34,9 +37,18 @@ const TARGET_RADIUS = 5;
 const FIELD_RADIUS = 9;
 const HALF_SCALE = 64;
 const SPARSE_EXPOSURES = 5; // frames from this many exposures or fewer are not judged
+const CONTROL_LIMIT = 85; // every judged control frame: C below this (measured at most 75.5)
+const MUST_PEAK = 100; // strongest judged frame of each must-show loop (measured 105.5-121.5)
+const MAX_RETRIES = 10;
 
 async function request(url, options) {
-  const response = await fetch(url, options);
+  let response = await fetch(url, options);
+  for (let retry = 1; response.status === 429 && retry <= MAX_RETRIES; retry++) {
+    const wait = Number(response.headers.get("Retry-After")) || 30;
+    console.error(`${url}: HTTP 429, waiting ${wait} s (retry ${retry} of ${MAX_RETRIES})`);
+    await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+    response = await fetch(url, options);
+  }
   if (!response.ok) throw new Error(`${options?.method ?? "GET"} ${url}: HTTP ${response.status}`);
   return response.json();
 }
@@ -132,18 +144,27 @@ for (const loop of loops) {
       failures.push(`${where}: C ${row.centre}, F ${row.field}`);
     }
     if (row.half > 0) failures.push(`${where}: H ${row.half}`);
+    if (loop.control && row.centre >= CONTROL_LIMIT) {
+      failures.push(`${where}: control C ${row.centre}, not below ${CONTROL_LIMIT}`);
+    }
   }
-  if (loop.must && !rows.some((row) => row.nUsed > SPARSE_EXPOSURES)) {
+  const judged = rows.filter((row) => row.nUsed > SPARSE_EXPOSURES);
+  if ((loop.must || loop.control) && judged.length === 0) {
     failures.push(`${loop.name} ${loop.detector}: no frame from more than `
       + `${SPARSE_EXPOSURES} exposures`);
+  } else if (loop.must && Math.max(...judged.map((row) => row.centre)) < MUST_PEAK) {
+    failures.push(`${loop.name} ${loop.detector}: strongest frame C `
+      + `${Math.max(...judged.map((row) => row.centre))}, below ${MUST_PEAK}`);
   }
 }
 lines.push("", "## Verdict", "");
 if (failures.length === 0) {
   lines.push("Pass: every must-show loop has a frame from more than 5 exposures, every such "
-    + "frame has C ≥ 50 and C ≥ 2 F, and no frame from more than 5 exposures has H > 0. "
-    + "C measures how strongly the centre is drawn, not whether it changed: compare the "
-    + "control.");
+    + `frame has C ≥ 50 and C ≥ 2 F, and its strongest such frame has C ≥ ${MUST_PEAK}; `
+    + `every control frame from more than 5 exposures has C < ${CONTROL_LIMIT}; and no frame `
+    + "from more than 5 exposures has H > 0. C measures how strongly the centre is drawn, "
+    + "not whether it changed: a single target frame can be no stronger than the control; "
+    + "only the strongest frame of each target loop clearly exceeds it.");
 } else {
   lines.push("Fail:", "", ...failures.map((f) => `- ${f}`));
 }

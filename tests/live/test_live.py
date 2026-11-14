@@ -3,14 +3,18 @@
 import csv
 import io
 import time
+import warnings
 
 import httpx
 import numpy as np
 import pytest
+from astropy.wcs import WCS, FITSFixedWarning
 
+from spherex_viewer import remote
 from spherex_viewer.discovery import discover
 from spherex_viewer.grid import GRID_SHAPE, target_wcs
 from spherex_viewer.remote import S3_BASE, HttpRangeReader, read_window, s3_url
+from synthetic import TIME_KEYS, assert_same_wcs
 
 pytestmark = pytest.mark.live
 
@@ -109,3 +113,23 @@ def test_dr1_window_read(client, statuses, wise_exposures):
 def test_qr3_window_read(client, statuses, deep_field_exposures):
     uri = next(e.uri for e in deep_field_exposures if e.uri.startswith("ibe/data/spherex/qr3/"))
     check_window(client, statuses, uri, DEEP_FIELD)
+
+
+@pytest.mark.parametrize("release", ["dr1", "qr3"])
+def test_celestial_wcs_matches_full_wcs_on_real_headers(request, monkeypatch, client, release):
+    exposures = request.getfixturevalue("wise_exposures" if release == "dr1"
+                                        else "deep_field_exposures")
+    uri = next(e.uri for e in exposures if e.uri.startswith(f"ibe/data/spherex/{release}/"))
+    header, _ = remote._read_image_header(HttpRangeReader(client), s3_url(uri))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        full = WCS(header)
+        received = []
+        monkeypatch.setattr(remote, "WCS", lambda given: received.append(given) or WCS(given))
+        reduced = remote.celestial_wcs(header)
+    assert received and received[0] is not header
+    assert all(remote._WCS_KEYWORD.fullmatch(card.keyword) for card in received[0].cards)
+    assert_same_wcs(reduced, full, size=2040, step=40)
+    written = full.to_header(relax=True)
+    assert [key for key in written
+            if key not in TIME_KEYS and not remote._WCS_KEYWORD.fullmatch(key)] == []

@@ -15,7 +15,9 @@ from spherex_viewer.cutout import UnsupportedLayoutError
 from spherex_viewer.remote import RemoteReadError
 from synthetic import (
     FLAG_NAMES,
+    TIME_KEYS,
     FakeRangeReader,
+    assert_same_wcs,
     corrupt_flags_heap,
     exposure_wcs,
     make_exposure,
@@ -480,3 +482,118 @@ def test_s3_url_qr3():
 def test_s3_url_rejects_invalid_uri(uri):
     with pytest.raises(ValueError):
         remote.s3_url(uri)
+
+
+def parsed_header(sip: bool, extra: tuple[str, ...] = ()) -> fits.Header:
+    """A detector header as ``remote`` parses it from file bytes, plus ``extra`` raw cards."""
+    header = exposure_wcs((269.45, 4.69), n=100, rot_deg=20.0, sip=sip).to_header(relax=True)
+    cards = [fits.Card("NAXIS", 2), fits.Card("NAXIS1", 100), fits.Card("NAXIS2", 100),
+             *header.cards, *(fits.Card.fromstring(card) for card in extra)]
+    return fits.Header.fromstring("".join(card.image for card in cards) + "END".ljust(80))
+
+
+def alternate_wcs_cards(key: str) -> tuple[str, ...]:
+    alternate = exposure_wcs((269.5, 4.7), n=100, rot_deg=5.0, sip=False)
+    return tuple(card.image for card in alternate.to_header(key=key).cards)
+
+
+INVERSE_SIP = ("AP_ORDER=                    2", "AP_2_0  =               -2E-05",
+               "AP_0_2  =                1E-05", "BP_ORDER=                    2",
+               "BP_1_1  =             -1.5E-05", "BP_0_2  =               -2E-05")
+EXTRA_CARDS = (
+    *INVERSE_SIP,
+    *(f"HISTORY step {i}" for i in range(3)), "COMMENT a comment",
+    *(f"INST{i:04d}= {i * 0.5!r} / instrument value" for i in range(30)),
+    *alternate_wcs_cards("A"), *alternate_wcs_cards("W"),
+)
+
+
+def full_wcs(header: fits.Header) -> WCS:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        return WCS(header)
+
+
+def test_celestial_wcs_equals_full_wcs_with_extra_cards(monkeypatch):
+    header = parsed_header(sip=True, extra=EXTRA_CARDS)
+    full = full_wcs(header)
+    received = []
+    monkeypatch.setattr(remote, "WCS", lambda given: received.append(given) or full_wcs(given))
+    reduced = remote.celestial_wcs(header)
+    assert len(received) == 1
+    keys = [card.keyword for card in received[0].cards]
+    assert keys and all(remote._WCS_KEYWORD.fullmatch(key) for key in keys)
+    assert_same_wcs(reduced, full, size=100, step=9)
+    assert full.pixel_shape == (100, 100)
+
+
+def test_celestial_wcs_keyword_list_is_complete():
+    written = full_wcs(parsed_header(sip=True, extra=EXTRA_CARDS)).to_header(relax=True)
+    assert [key for key in written
+            if key not in TIME_KEYS and not remote._WCS_KEYWORD.fullmatch(key)] == []
+
+
+FOREIGN = {
+    "CPDIS1": "CPDIS1  = 'LOOKUP  '",
+    "D2IMDIS1": "D2IMDIS1= 'LOOKUP  '",
+    "DP1 record": "DP1     = 'EXTVER: 1'",
+    "DQ2 record": "DQ2     = 'NAXES: 2'",
+    "CRVAL3": "CRVAL3  = 1.0",
+    "PC3_3": "PC3_3   = 1.0",
+    "PC001002": "PC001002= 0.5",
+    "PC01_01": "PC01_01 = 0.5",
+    "PC1_02": "PC1_02  = 0.5",
+    "CRPIX12": "CRPIX12 = 1.0",
+    "PV3_1": "PV3_1   = 1.0",
+    "PV12_1": "PV12_1  = 1.0",
+    "NAXIS3": "NAXIS3  = 5",
+}
+
+
+@pytest.mark.parametrize("name", [None, *FOREIGN])
+def test_celestial_wcs_falls_back_to_the_full_header(monkeypatch, name):
+    header = parsed_header(sip=False) if name is None else parsed_header(True, (FOREIGN[name],))
+    received = []
+    monkeypatch.setattr(remote, "WCS", lambda given: received.append(given) or "full")
+    assert remote.celestial_wcs(header) == "full"
+    assert received[0] is header
+
+
+def test_read_window_builds_the_wcs_from_the_reduced_header(exposure, target, monkeypatch):
+    received = []
+    monkeypatch.setattr(remote, "WCS", lambda given: received.append(given) or full_wcs(given))
+    assert remote.read_window(FakeRangeReader({URL: exposure}), URL, target,
+                              TARGET_SHAPE) is not None
+    assert len(received) == 1
+    keys = [card.keyword for card in received[0].cards]
+    assert keys and all(remote._WCS_KEYWORD.fullmatch(key) for key in keys)
+
+
+def flag_rows(blob: bytes, y0: int, y1: int) -> tuple[fits.Header, np.ndarray, bytes, int]:
+    """Raw FLAGS header, descriptors of rows [y0, y1), the whole heap and its start offset 0."""
+    info = hdu_spans(blob)[2]
+    header = raw_header(blob, info)
+    table_len = header["NAXIS1"] * header["NAXIS2"]
+    start = info["datLoc"]
+    descriptors = np.frombuffer(blob[start:start + table_len], dtype=">i4").reshape(-1, 2)
+    heap = blob[start + table_len:start + table_len + header["PCOUNT"]]
+    return header, descriptors[y0:y1], heap, 0
+
+
+def test_decode_flag_rows_ignores_other_header_cards(exposure):
+    header, descriptors, heap, heap_start = flag_rows(exposure, 40, 52)
+    busy = header.copy()
+    for card in full_wcs(header).to_header(relax=True).cards:
+        busy.append(card)
+    busy["MSKN0031"] = ("EXTRA", "Name for mask plane 31")
+    busy["MSKM0031"] = (1 << 31, "Bitmask for plane n=31; always 1<<n")
+    busy.add_history("processed")
+    busy["THEAP"] = header["NAXIS1"] * header["NAXIS2"]
+    before = busy.tostring()
+    decoded = remote.decode_flag_rows(busy, descriptors, heap, heap_start)
+    assert busy.tostring() == before
+    assert decoded.dtype == np.int32
+    np.testing.assert_array_equal(decoded, remote.decode_flag_rows(header, descriptors, heap,
+                                                                   heap_start))
+    _, flags, _ = full_read(exposure)
+    np.testing.assert_array_equal(decoded, flags[40:52])

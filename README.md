@@ -11,7 +11,7 @@ moving or changing objects stand out.
 
 Searches use IRSA's Simple Image Access service across all SPHEREx collections, so new releases
 appear automatically; a search normally answers in about a second. IRSA's gateway sometimes
-rejects requests briefly; the tool retries for up to about 10 s and then reports the archive as
+rejects requests briefly; the tool retries for up to about 20 s and then reports the archive as
 unavailable — try again a moment later.
 
 The homepage opens on a precomputed example, `src/spherex_viewer/static/example.json`:
@@ -49,7 +49,8 @@ image's brightness scale. Mid-grey means no difference, white brighter, black fa
 without a difference stay transparent.
 
 A result can be linked: `?ra=…&dec=…&detector=…` after the page's address opens that search
-without a click, also inside an `<iframe>`. Every submitted search leaves such a link in the
+without a click, also inside an `<iframe>` (a sandboxed one needs `allow-scripts` and
+`allow-same-origin`). Every submitted search leaves such a link in the
 address bar, so a reload repeats the search; without these parameters the page opens on the
 example. The five challenge targets, each with a detector that suits it, to append to the
 page's address (e.g. http://localhost:8000/):
@@ -129,9 +130,12 @@ node validation/check_difference.mjs http://localhost:8000 > /tmp/DIFFERENCE.md 
 The last command checks the difference view on real loops of the five targets and a constant
 control star through a running server (a JSON file of recorded loops works too). It exits with
 status 1 if a must-show target (Barnard's Star, Epsilon Indi B, RW Aurigae) has no frame from
-more than five exposures or is not drawn strongly at the centre in each such frame, or if a field
-pixel reaches half scale; a strong centre is not by itself a change (see the control in
-`validation/DIFFERENCE.md`). On a failed check or an unreachable server the committed
+more than five exposures or is not drawn strongly at the centre in each such frame (at least
+50 and twice the field), if the strongest such frame of each of these loops does not reach 100,
+if a frame of the constant control star from more than five exposures reaches 85 at the centre,
+or if a field pixel reaches half scale. A strong centre in one frame is not by itself a change
+(see the control in `validation/DIFFERENCE.md`). A server that answers "too many requests" is
+asked again after the wait it names. On a failed check or an unreachable server the committed
 `validation/DIFFERENCE.md` is left in place.
 
 ## Limitations
@@ -164,8 +168,11 @@ pixel reaches half scale; a strong centre is not by itself a change (see the con
   few-per-cent flux and pixel-phase scatter described under Brightness. The constant flux
   standard HD 2811 is drawn at 57.5–75.5 in D5 and D6, often as a black-and-white pair, against
   76.5–121.5 for Barnard's Star (D6), Epsilon Indi B (D5) and RW Aurigae (D5), in frames from
-  more than five exposures. A pair or patch at a bright star is therefore not by itself proof of
-  motion or variability; compare its strength with the control. A patch of one sign means the
+  more than five exposures. The two ranges touch: the weakest target frames are no stronger than
+  the control, and only the strongest frame of each target loop (105.5–121.5) clearly exceeds
+  it, so a pair or patch in a single frame at a bright star proves nothing. Look instead for a
+  pair that reverses between the first and the last frame (motion) or a patch that changes sign
+  (brightness). A patch of one sign means the
   frame is brighter or fainter there than the others (RW Aurigae); a cool object can show one
   from wavelength sampling alone in D1–D4, as Epsilon Indi B, a constant source, does in D2.
   Pixels next to the no-data hole of a saturated star are unreliable (R Draconis). Frames from
