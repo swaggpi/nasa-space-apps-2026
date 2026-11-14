@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spherex-viewer"
+dynamic = ["version"]
+description = "Web viewer for sky changes across SPHEREx visits of a sky position."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162,<1.0",
+    "uvicorn>=0.54,<1.0",
+    "astropy>=8.0,<9",
+    "reproject>=0.21,<1.0",
+    "numpy>=2.5,<3",
+    "httpx>=0.28,<1.0",
+    "pydantic>=2.14,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.hatch.version]
+path = "src/spherex_viewer/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spherex_viewer"]
+artifacts = ["src/spherex_viewer/static/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = '-m "not live"'
+markers = [
+    "live: needs network access to the real archive",
+]
