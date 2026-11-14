@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  capNotice, computeStretch, formatPosition, frameLabel, joinStatus, markerPercent, nextIndex,
-  parseExample, plural, previousIndex, toRGBA,
+  capNotice, computeStretch, fieldCorners, fieldTexts, formatPosition, frameLabel, isClick,
+  joinStatus, markerPercent, nextIndex, parseExample, plural, previousIndex, toRGBA,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -259,4 +259,77 @@ test("parseExample rejects content that does not match the schema", () => {
     withFrame({ marker: undefined }),
   );
   broken.forEach((data, i) => assert.equal(parseExample(data), null, `case ${i}`));
+});
+
+// Outer corners (pixel edges -0.5 and 58.5) of the server's grid, from
+// spherex_viewer.grid.target_wcs(ra, dec).wcs_pix2world(..., 0) with astropy:
+// north-east, north-west, south-west, south-east.
+const GRID_CORNERS = [
+  [269.4462683, 4.7682045, [[269.4968428493, 4.818598452], [269.3956937507, 4.818598452],
+    [269.3957011713, 4.7178068506], [269.4968354287, 4.7178068506]]],
+  [10.0, -89.95, [[36.655346388, -89.8876654333], [343.344653612, -89.8876654333],
+    [279.5499949955, -89.9496026447], [100.4500050045, -89.9496026447]]],
+  [359.99, 30.0, [[0.0482216421, 30.0503829983], [359.9317783579, 30.0503829983],
+    [359.9318374603, 29.9495914096], [0.0481625397, 29.9495914096]]],
+];
+
+test("fieldCorners matches the corners of the server's 59 x 6.15 arcsec north-up grid", () => {
+  for (const [ra, dec, expected] of GRID_CORNERS) {
+    const corners = fieldCorners(ra, dec);
+    assert.equal(corners.length, 4);
+    corners.forEach(([cRa, cDec], i) => {
+      const [eRa, eDec] = expected[i];
+      const dRa = (((cRa - eRa + 540) % 360) - 180) * Math.cos((eDec * Math.PI) / 180);
+      assert.ok(Math.abs(dRa) < 1e-8 && Math.abs(cDec - eDec) < 1e-8,
+        `(${ra}, ${dec}) corner ${i}: ${cRa}, ${cDec} vs ${eRa}, ${eDec}`);
+      assert.ok(cRa >= 0 && cRa < 360, `RA ${cRa} not in [0, 360)`);
+    });
+  }
+});
+
+test("the field is 362.85 arcsec (6.05 arcmin) on a side", () => {
+  // Angular distance between the two northern and the two eastern corners at the equator.
+  const [ne, nw, , se] = fieldCorners(180, 0);
+  const sep = ([ra1, dec1], [ra2, dec2]) => {
+    const r = Math.PI / 180;
+    const c = Math.sin(dec1 * r) * Math.sin(dec2 * r)
+      + Math.cos(dec1 * r) * Math.cos(dec2 * r) * Math.cos((ra1 - ra2) * r);
+    return (Math.acos(Math.min(1, c)) / r) * 3600;
+  };
+  assert.ok(Math.abs(sep(ne, nw) - 362.85) < 0.01, `top edge ${sep(ne, nw)}`);
+  assert.ok(Math.abs(sep(ne, se) - 362.85) < 0.01, `east edge ${sep(ne, se)}`);
+  assert.ok(ne[0] > nw[0] && ne[1] > se[1], "east must be at larger RA, north at larger Dec");
+});
+
+test("fieldTexts gives six-decimal degrees the server reads as decimal degrees", () => {
+  const decimal = /^[+-]?(\d+\.?\d*|\.\d+)$/;
+  const cases = [
+    [[269.44626834, 4.76820449], { ra: "269.446268", dec: "4.768204" }],
+    [[133.7951294, -7.2451471], { ra: "133.795129", dec: "-7.245147" }],
+    [[359.9999996, 0], { ra: "0.000000", dec: "0.000000" }],
+    [[-0.5, -0.0000001], { ra: "359.500000", dec: "0.000000" }],
+    [[361.25, 90.0000001], { ra: "1.250000", dec: "90.000000" }],
+    [[0, -90], { ra: "0.000000", dec: "-90.000000" }],
+  ];
+  for (const [[ra, dec], expected] of cases) {
+    const texts = fieldTexts(ra, dec);
+    assert.deepEqual(texts, expected, `${ra}, ${dec}`);
+    assert.match(texts.ra, decimal);
+    assert.match(texts.dec, decimal);
+    assert.ok(Number(texts.ra) >= 0 && Number(texts.ra) < 360);
+  }
+  // Rounding to six decimals keeps the position to within 0.5e-6 degrees.
+  const { ra, dec } = fieldTexts(12.3456789, -45.6789012);
+  assert.ok(Math.abs(Number(ra) - 12.3456789) <= 5e-7);
+  assert.ok(Math.abs(Number(dec) + 45.6789012) <= 5e-7);
+});
+
+test("isClick accepts a release within 5 px of the press and treats more as a drag", () => {
+  const press = { x: 100, y: 200 };
+  assert.equal(isClick(press, press), true);
+  assert.equal(isClick(press, { x: 103, y: 204 }), true);
+  assert.equal(isClick(press, { x: 105, y: 200 }), true);
+  assert.equal(isClick(press, { x: 104, y: 204 }), false);
+  assert.equal(isClick(press, { x: 100, y: 194 }), false);
+  assert.equal(isClick(press, { x: 160, y: 230 }), false);
 });

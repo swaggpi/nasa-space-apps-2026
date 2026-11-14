@@ -274,9 +274,12 @@ function createMap(A, view) {
     showContextMenu: false,
   });
   aladin.setFoVRange(MAP_MIN_FOV_DEG, MAP_MAX_FOV_DEG);
-  const field = A.graphicOverlay({ color: SELECTION_COLOR, lineWidth: 2 });
+  // Aladin recolours objects it considers clicked or hovered; keep the selection one colour.
+  const colors = { color: SELECTION_COLOR, selectionColor: SELECTION_COLOR,
+    hoverColor: SELECTION_COLOR };
+  const field = A.graphicOverlay({ ...colors, lineWidth: 2 });
   aladin.addOverlay(field);
-  const centre = A.catalog({ shape: "cross", sourceSize: 14, color: SELECTION_COLOR });
+  const centre = A.catalog({ ...colors, shape: "cross", sourceSize: 14 });
   aladin.addCatalog(centre);
   return { A, aladin, field, centre };
 }
@@ -326,6 +329,7 @@ async function openMap() {
       return;
     }
     if (sky.hidden) return;
+    if (statusLine.textContent === MAP_FAILED) setStatus("");
     map ??= createMap(A, view);
   } else {
     map.aladin.gotoRaDec(view.ra, view.dec);
@@ -355,8 +359,18 @@ skyMap.addEventListener("pointerup", (event) => {
   const release = { x: event.clientX, y: event.clientY };
   if (!isClick(start, release)) return;
   const rect = skyMap.getBoundingClientRect();
-  const [ra, dec] = map.aladin.pix2world(release.x - rect.left, release.y - rect.top, "ICRS")
-    ?? [NaN, NaN];
+  const x = release.x - rect.left;
+  const y = release.y - rect.top;
+  const { aladin } = map;
+  let position;
+  try {
+    position = aladin.pix2world(x, y, "ICRS");
+  } catch (err) {
+    // Aladin 3.8.2 throws this TypeError for a point off the sky (outside the projection).
+    if (err instanceof TypeError) return;
+    throw err;
+  }
+  const [ra, dec] = position;
   if (Number.isFinite(ra) && Number.isFinite(dec)) select(ra, dec);
 }, true);
 

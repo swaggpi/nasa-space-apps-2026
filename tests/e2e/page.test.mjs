@@ -1346,6 +1346,28 @@ test("dragging the map pans it and does not select", { timeout: TIMEOUT }, async
   assertCleanMapRun(log);
 });
 
+test("zoomed out to the whole sky, a click off the sky selects nothing and a click on it does",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await openMap(page);
+    const rect = await mapRect(page);
+    await page.mouse.move(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, 400);
+      await page.waitForTimeout(50);
+    }
+    await page.waitForTimeout(1000);
+    await page.mouse.click(rect.left + 5, rect.top + 5);
+    await page.waitForTimeout(300);
+    assert.equal(await text(page, "#sky-selection"), MAP_HINT);
+    assert.equal(await page.isDisabled("#sky-search"), true);
+    const centre = await clickMap(page, 0, 0);
+    assert.ok(Math.abs(centre.dec - EXAMPLE.dec_deg) < 1, `centre ${centre.ra}, ${centre.dec}`);
+    await waitForSelectionBox(page);
+    assert.deepEqual(log.searches, []);
+    assertCleanMapRun(log);
+  });
+
 test("Search here searches the selection with the current detector, closes the map and loads "
   + "the frames", { timeout: TIMEOUT }, async () => {
   const plan = makePlan(THREE_FRAMES, { detector: "D4" });

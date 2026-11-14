@@ -18,6 +18,10 @@ ACKNOWLEDGEMENT = (
     "the Jet Propulsion Laboratory and the California Institute of Technology, and is funded by "
     "the National Aeronautics and Space Administration."
 )
+# The one absolute URL the page's own code may hold: the sky map's survey, fetched by the
+# visitor's browser only when the map is opened.
+SKY_SURVEY_URL = '"https://irsa.ipac.caltech.edu/data/hips/CDS/2MASS/Color"'
+VENDOR_FILES = ["aladin.js", "LICENSE", "COPYING", "README.md"]
 ROOT_ABSOLUTE_TARGETS = [
     re.compile(r"""\b(?:src|href)\s*=\s*["']?\s*/"""),
     re.compile(r"""\bfetch\(\s*["'`]\s*/"""),
@@ -62,15 +66,34 @@ def test_static_assets_are_served(client, name):
 
 
 def test_frontend_has_no_absolute_urls():
+    # Only the page's own files: the vendored library under vendor/ is not scanned.
     paths = sorted(STATIC_DIR.glob("*.html")) + sorted(STATIC_DIR.glob("*.js"))
     assert paths
     for path in paths:
         text = path.read_text(encoding="utf-8")
+        if path.name == "app.js":
+            assert text.count(SKY_SURVEY_URL) == 1, "app.js must name the sky survey once"
+            text = text.replace(SKY_SURVEY_URL, "")
         for forbidden in ("http://", "https://", "localhost"):
             assert forbidden not in text, f"{path.name} contains {forbidden!r}"
         for pattern in ROOT_ABSOLUTE_TARGETS:
             match = pattern.search(text)
             assert match is None, f"{path.name} has a root-absolute URL: {match.group(0)!r}"
+
+
+@pytest.mark.parametrize("name", VENDOR_FILES)
+def test_vendored_map_library_is_served(client, name):
+    response = client.get(f"/vendor/{name}")
+    assert response.status_code == 200
+    assert response.content == (STATIC_DIR / "vendor" / name).read_bytes()
+    if name == "aladin.js":
+        assert response.headers["content-type"].startswith("text/javascript")
+
+
+def test_index_html_does_not_load_the_map_library():
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8").lower()
+    assert "vendor" not in html
+    assert "aladin" not in html
 
 
 def test_acknowledgement_in_page_footer():
