@@ -438,7 +438,9 @@ def astrometry_section() -> list[str]:
         "last HST position (MJD 57484.38, ±0.02″) instead differs on 2025-11-01 by "
         f"{wise_diff:.2f}″ ({wise_diff / PIXEL_SCALE_ARCSEC:.2f} px).",
         "- RW Aurigae 76.95608120, +30.40120459 and R Draconis 248.16737837, +66.75500675: "
-        "fixed (their motion over the mission is < 0.5″).",
+        "Gaia DR3 positions (2016.0) held fixed; their proper motions (≤ 28 mas/yr, Gaia DR3 at "
+        "IRSA) move them < 0.3″ by 2026. RW Aur A and its companion 1.5″ away (Gaia G 12.2 and "
+        "13.0) are one unresolved source at 6.15″ pixels.",
         "",
     ]
 
@@ -568,6 +570,7 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s",
                         stream=sys.stderr)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     if args.cache_dir is None:
         with tempfile.TemporaryDirectory(prefix="spherex-validation-") as tmp:
             results, info = run(Path(tmp))
