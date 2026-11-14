@@ -1,5 +1,5 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
-// cap notice text and playback index. No DOM access; imported by app.js and by Node tests.
+// status texts and playback index. No DOM access; imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -8,7 +8,8 @@ function median(sorted) {
 }
 
 /**
- * One asinh stretch shared by all frames (DESIGN.md 5.12).
+ * One asinh stretch shared by all frames: lo = median - 2 sigma (sigma = 1.4826 MAD),
+ * hi = nearest-rank 99.9th percentile, soft = max(5 sigma, (hi - lo) / 1000).
  * @param {Array<Array<number|null>>} frames pixel arrays; null = no data
  * @returns {{lo: number, hi: number, soft: number}} in the pixels' unit (MJy/sr)
  */
@@ -57,6 +58,25 @@ export function toRGBA(pixels, stretch) {
 }
 
 /**
+ * A count followed by its noun, singular for exactly 1: plural(1, "frame") -> "1 frame".
+ * @param {number} count
+ * @param {string} noun singular form; the plural adds "s"
+ * @returns {string}
+ */
+export function plural(count, noun) {
+  return `${count} ${count === 1 ? noun : noun + "s"}`;
+}
+
+/**
+ * Status-line text from parts joined by single spaces; empty parts are left out.
+ * @param {...string} parts
+ * @returns {string}
+ */
+export function joinStatus(...parts) {
+  return parts.filter((part) => part !== "").join(" ");
+}
+
+/**
  * Status-line notice for a search plan whose exposure cap applied, else "".
  * @param {{capped: boolean, cap: number, frames: Array<{capped: boolean}>}} plan
  * @returns {string}
@@ -64,8 +84,11 @@ export function toRGBA(pixels, stretch) {
 export function capNotice(plan) {
   if (!plan.capped) return "";
   const k = plan.frames.filter((f) => f.capped).length;
-  const n = plan.frames.length;
-  return `Cap applied: ${k} of ${n} frames use ${plan.cap} of their exposures, evenly sampled in time.`;
+  const noun = plan.frames.length === 1 ? "frame" : "frames";
+  const uses = k === 1 ? "uses" : "use";
+  const their = k === 1 ? "its" : "their";
+  return `Cap applied: ${k} of ${plan.frames.length} ${noun} ${uses} ${plan.cap} of ${their} `
+    + "exposures, evenly sampled in time.";
 }
 
 /**

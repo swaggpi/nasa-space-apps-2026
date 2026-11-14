@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { capNotice, computeStretch, nextIndex, toRGBA } from "../../src/spherex_viewer/static/lib.js";
+import {
+  capNotice, computeStretch, joinStatus, nextIndex, plural, toRGBA,
+} from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
 const BACKGROUND = [
@@ -23,11 +25,6 @@ function greys(pixels, stretch) {
   return Array.from({ length: pixels.length }, (_, i) => rgba[4 * i]);
 }
 
-function expectedGrey(v, { lo, hi, soft }) {
-  const t = Math.asinh((v - lo) / soft) / Math.asinh((hi - lo) / soft);
-  return Math.round(255 * Math.min(Math.max(t, 0), 1));
-}
-
 function assertClose(actual, expected, label) {
   assert.ok(Math.abs(actual - expected) <= 1e-9 * Math.max(1, Math.abs(expected)),
     `${label}: expected ${expected}, got ${actual}`);
@@ -35,19 +32,23 @@ function assertClose(actual, expected, label) {
 
 function plan(frames, cap = 24) {
   return {
-    ra_deg: 133.795129, dec_deg: -7.245147, detector: "D2", width: 59, height: 59,
+    ra_deg: 133.795129, dec_deg: -7.245147, detector: "D2",
     n_exposures: frames.reduce((sum, f) => sum + f.n_available, 0),
     cap,
     capped: frames.some((f) => f.capped),
     frames: frames.map((f, index) => ({
-      index, label: `2025-05-0${index + 1}`, mjd_start: 60801 + index, mjd_end: 60801.3 + index,
+      label: `2025-05-0${index + 1}`,
       n_available: f.n_available, n_used: f.n_used, capped: f.capped,
-      uris: Array.from({ length: f.n_used }, (_, j) => `ibe/data/spherex/dr1/level2/x/${index}_${j}.fits`),
+      uris: Array.from({ length: f.n_used },
+        (_, j) => `ibe/data/spherex/dr1/level2/x/${index}_${j}.fits`),
     })),
   };
 }
 
-test("one stretch for all frames: equal values give equal grey, the doubled source is brighter in frame B", () => {
+const UNCAPPED = { n_available: 8, n_used: 8, capped: false };
+const CAPPED = { n_available: 300, n_used: 24, capped: true };
+
+test("a shared stretch keeps equal values equal and a brighter source brighter", () => {
   const a = frameWithSource(3.0);
   const b = frameWithSource(6.0);
   const stretch = computeStretch([a, b]);
@@ -64,7 +65,7 @@ test("one stretch for all frames: equal values give equal grey, the doubled sour
   assert.equal(perFrameA[SOURCE], perFrameB[SOURCE]);
 });
 
-test("computeStretch follows section 5.12 on a hand-computed pool, ignoring nulls", () => {
+test("computeStretch on a hand-computed pool, ignoring nulls", () => {
   // pool 0,1,2,3,4,5,100: med 3; |v-med| sorted 0,1,1,2,2,3,97 -> MAD 2; sigma 2.9652
   // lo = 3 - 5.9304; hi = rank ceil(0.999*7) = 7 -> 100; soft = max(14.826, 102.9304/1000)
   const stretch = computeStretch([[0, 1, 2, null], [null, 3, 4, 5, 100]]);
@@ -82,15 +83,10 @@ test("computeStretch uses the nearest-rank 99.9th percentile for hi", () => {
   assertClose(stretch.soft, 5 * 370.65, "soft");
 });
 
-test("toRGBA maps values with the asinh grey formula of section 5.12", () => {
-  const stretch = { lo: -2.9304, hi: 100, soft: 14.826 };
-  const values = [-10, -2.9304, 0, 2, 5, 50, 100, 250];
-  const actual = greys(values, stretch);
-  assert.deepEqual(actual, values.map((v) => expectedGrey(v, stretch)));
-  assert.equal(actual[0], 0);
-  assert.equal(actual[1], 0);
-  assert.equal(actual[6], 255);
-  assert.equal(actual[7], 255);
+test("toRGBA maps lo and below to black, hi and above to white, asinh in between", () => {
+  // grey = round(255 * asinh(v) / asinh(1)) for lo 0, hi 1, soft 1
+  const actual = greys([-1, 0, 0.25, 0.5, 0.75, 1, 3], { lo: 0, hi: 1, soft: 1 });
+  assert.deepEqual(actual, [0, 0, 72, 139, 201, 255, 255]);
 });
 
 test("an empty pool gives the default stretch", () => {
@@ -132,22 +128,33 @@ test("toRGBA returns 4 bytes per pixel, R=G=B with alpha 255, and 0,0,0,0 for nu
   assert.equal(rgba[12], 255);
 });
 
-test("capNotice names how many frames were capped and the cap", () => {
-  const capped = plan([
-    { n_available: 8, n_used: 8, capped: false },
-    { n_available: 300, n_used: 24, capped: true },
-    { n_available: 40, n_used: 24, capped: true },
-  ]);
-  assert.equal(capNotice(capped),
+test("capNotice names how many frames were capped and the cap, in plural", () => {
+  assert.equal(capNotice(plan([UNCAPPED, CAPPED, CAPPED])),
     "Cap applied: 2 of 3 frames use 24 of their exposures, evenly sampled in time.");
 });
 
+test("capNotice uses the singular for one capped frame", () => {
+  assert.equal(capNotice(plan([UNCAPPED, CAPPED, UNCAPPED])),
+    "Cap applied: 1 of 3 frames uses 24 of its exposures, evenly sampled in time.");
+  assert.equal(capNotice(plan([CAPPED])),
+    "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly sampled in time.");
+});
+
 test("capNotice is empty for a plan without a cap and for an empty plan", () => {
-  assert.equal(capNotice(plan([
-    { n_available: 8, n_used: 8, capped: false },
-    { n_available: 24, n_used: 24, capped: false },
-  ])), "");
+  assert.equal(capNotice(plan([UNCAPPED, { n_available: 24, n_used: 24, capped: false }])), "");
   assert.equal(capNotice(plan([])), "");
+});
+
+test("plural uses the singular only for exactly one", () => {
+  assert.equal(plural(1, "frame"), "1 frame");
+  assert.equal(plural(0, "frame"), "0 frames");
+  assert.equal(plural(2, "exposure"), "2 exposures");
+});
+
+test("joinStatus joins non-empty parts with single spaces and no trailing space", () => {
+  assert.equal(joinStatus("Loading frame 1 of 2\u2026", ""), "Loading frame 1 of 2\u2026");
+  assert.equal(joinStatus("a.", "", "b.", ""), "a. b.");
+  assert.equal(joinStatus("", ""), "");
 });
 
 test("nextIndex advances and wraps to the first frame", () => {

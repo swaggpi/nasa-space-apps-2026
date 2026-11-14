@@ -1,8 +1,9 @@
 // Page logic for the SPHEREx viewer: search, progressive frame loading and playback.
 
-import { capNotice, computeStretch, nextIndex, toRGBA } from "./lib.js";
+import { capNotice, computeStretch, joinStatus, nextIndex, plural, toRGBA } from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
+const UNREACHABLE = "the server could not be reached";
 
 const form = document.getElementById("search");
 const raInput = document.getElementById("ra");
@@ -63,47 +64,72 @@ async function errorDetail(response) {
   return `${response.status} ${response.statusText}`.trim();
 }
 
+/**
+ * Sends one request and reads its JSON body.
+ * Returns {body} on success, {reason} on a network or HTTP failure, null once aborted;
+ * any other error propagates.
+ */
+async function request(url, options, signal) {
+  try {
+    const response = await fetch(url, { ...options, signal });
+    if (!response.ok) return { reason: await errorDetail(response) };
+    return { body: await response.json() };
+  } catch (err) {
+    if (signal.aborted) return null;
+    // fetch and body reads reject with TypeError when the network fails.
+    if (err instanceof TypeError) return { reason: UNREACHABLE };
+    throw err;
+  }
+}
+
+function sentence(text) {
+  return text.endsWith(".") ? text : `${text}.`;
+}
+
 async function loadFrames(plan, signal) {
   const notice = capNotice(plan);
   const n = plan.frames.length;
   let used = 0;
   let failed = 0;
+  let reason = "";
   for (const [i, planned] of plan.frames.entries()) {
-    setStatus(`Loading frame ${i + 1} of ${n}… ` + notice);
-    try {
-      const response = await fetch("api/frame", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ra_deg: plan.ra_deg, dec_deg: plan.dec_deg, uris: planned.uris }),
-        signal,
-      });
-      if (!response.ok) throw new Error(await errorDetail(response));
-      const result = await response.json();
-      if (signal.aborted) return;
-      frames.push({
-        pixels: result.pixels,
-        width: result.width,
-        height: result.height,
-        label: planned.label,
-      });
-      used += result.n_used;
-      stretch = computeStretch(frames.map((f) => f.pixels));
-      slider.max = String(frames.length - 1);
-      if (frames.length === 1) {
-        playButton.disabled = false;
-        slider.disabled = false;
-      }
-      show(frames.length === 1 ? 0 : current);
-    } catch {
-      if (signal.aborted) return;
+    setStatus(joinStatus(`Loading frame ${i + 1} of ${n}…`, notice));
+    const outcome = await request("api/frame", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ra_deg: plan.ra_deg, dec_deg: plan.dec_deg, uris: planned.uris }),
+    }, signal);
+    if (outcome === null || signal.aborted) return;
+    if (outcome.reason !== undefined) {
       failed += 1;
+      reason = outcome.reason;
+      continue;
     }
+    const result = outcome.body;
+    frames.push({
+      pixels: result.pixels,
+      width: result.width,
+      height: result.height,
+      label: planned.label,
+    });
+    used += result.n_used;
+    stretch = computeStretch(frames.map((f) => f.pixels));
+    slider.max = String(frames.length - 1);
+    if (frames.length === 1) {
+      playButton.disabled = false;
+      slider.disabled = false;
+    }
+    show(frames.length === 1 ? 0 : current);
   }
-  setStatus(
-    `${frames.length} frames from ${used} of ${plan.n_exposures} exposures. ` +
-      notice +
-      (failed > 0 ? ` ${failed} frames could not be loaded.` : ""),
-  );
+  if (frames.length === 0) {
+    setStatus(sentence(`No frame could be loaded: ${reason}`));
+    return;
+  }
+  setStatus(joinStatus(
+    `${plural(frames.length, "frame")} from ${used} of ${plural(plan.n_exposures, "exposure")}.`,
+    notice,
+    failed > 0 ? sentence(`${plural(failed, "frame")} could not be loaded: ${reason}`) : "",
+  ));
 }
 
 async function search(ra, dec, detector) {
@@ -112,22 +138,14 @@ async function search(ra, dec, detector) {
   const { signal } = controller;
   reset();
   setStatus("Searching the SPHEREx archive…");
-  let plan;
-  try {
-    const response = await fetch("api/search?" + new URLSearchParams({ ra, dec, detector }), {
-      signal,
-    });
-    if (!response.ok) {
-      const detail = await errorDetail(response);
-      if (!signal.aborted) setStatus(`Error: ${detail}`);
-      return;
-    }
-    plan = await response.json();
-  } catch (err) {
-    if (!signal.aborted) setStatus(`Error: ${err.message}`);
+  const outcome = await request("api/search?" + new URLSearchParams({ ra, dec, detector }), {},
+    signal);
+  if (outcome === null || signal.aborted) return;
+  if (outcome.reason !== undefined) {
+    setStatus(`Error: ${outcome.reason}`);
     return;
   }
-  if (signal.aborted) return;
+  const plan = outcome.body;
   if (plan.frames.length === 0) {
     setStatus(`No SPHEREx exposures cover this position in ${plan.detector}.`);
     return;
