@@ -83,12 +83,14 @@ export function joinStatus(...parts) {
  * Date-label text for a loaded frame: its date range and the exposures it was built from,
  * e.g. "2026-09-22 \u00b7 1 exposure", or a range such as "2026-09-22 \u00b7 23\u201324
  * exposures" when the fields in view differ.
+ * The label alone when no field in view is loaded yet (min null).
  * @param {string} label the frame's date range
- * @param {number} min fewest exposures that contributed to a field in view
- * @param {number} [max] most exposures that contributed to a field in view
+ * @param {number|null} min fewest exposures that contributed to a field in view
+ * @param {number|null} [max] most exposures that contributed to a field in view
  * @returns {string}
  */
 export function frameLabel(label, min, max = min) {
+  if (min === null) return label;
   const count = min === max ? plural(min, "exposure") : `${min}\u2013${max} exposures`;
   return `${label} \u00b7 ${count}`;
 }
@@ -323,12 +325,13 @@ export function stageBox(view, grid) {
 }
 
 /**
- * Range of exposure counts over the fields a view overlaps.
- * @param {Array<number>} nFields counts per field, row-major, north row first (one on a
- *   59 grid, nine on a 177 grid)
+ * Range of exposure counts over the loaded fields a view overlaps.
+ * @param {Array<number|null>} nFields counts per field, row-major, north row first (one on a
+ *   59 grid, nine on a 177 grid); null for a field not loaded yet
  * @param {{zoom: number, cx: number, cy: number}} view
  * @param {number} grid pixels per side of the loaded grid
- * @returns {[number, number]} [min, max]
+ * @returns {[number|null, number|null]} [min, max]; [null, null] when no field in view is
+ *   loaded
  */
 export function countRange(nFields, view, grid) {
   if (grid === FIELD_PIXELS) return [nFields[0], nFields[0]];
@@ -340,11 +343,36 @@ export function countRange(nFields, view, grid) {
   let max = -Infinity;
   for (let row = lo(view.cy); row <= hi(view.cy); row++) {
     for (let col = lo(view.cx); col <= hi(view.cx); col++) {
-      min = Math.min(min, nFields[3 * row + col]);
-      max = Math.max(max, nFields[3 * row + col]);
+      const n = nFields[3 * row + col];
+      if (n === null) continue;
+      min = Math.min(min, n);
+      max = Math.max(max, n);
     }
   }
-  return [min, max];
+  return min === Infinity ? [null, null] : [min, max];
+}
+
+/**
+ * A 59x59 frame placed at the centre of the wide grid before its surround has loaded: the
+ * eight fields around it hold no pixels (null) and no counts (null), its marker moves with it.
+ * @param {{pixels: Array<number|null>, width: number, height: number, nUsed: number,
+ *   marker?: {x: number, y: number}}} frame
+ * @returns {object} the same frame with width and height WIDE_PIXELS
+ */
+export function widenFrame(frame) {
+  const pixels = new Array(WIDE_PIXELS * WIDE_PIXELS).fill(null);
+  for (let y = 0; y < FIELD_PIXELS; y++) {
+    for (let x = 0; x < FIELD_PIXELS; x++) {
+      const value = frame.pixels[y * FIELD_PIXELS + x];
+      pixels[(y + FIELD_PIXELS) * WIDE_PIXELS + x + FIELD_PIXELS] = value;
+    }
+  }
+  const nFields = [null, null, null, null, frame.nUsed, null, null, null, null];
+  const widened = { ...frame, pixels, width: WIDE_PIXELS, height: WIDE_PIXELS, nFields };
+  if (frame.marker !== undefined) {
+    widened.marker = { x: frame.marker.x + FIELD_PIXELS, y: frame.marker.y + FIELD_PIXELS };
+  }
+  return widened;
 }
 
 /**

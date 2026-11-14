@@ -15,7 +15,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 from starlette.concurrency import run_in_threadpool
@@ -92,6 +92,18 @@ class FrameRequest(BaseModel):
     dec_deg: Annotated[float, Field(ge=-90.0, le=90.0, allow_inf_nan=False)]
     uris: Annotated[list[Uri], Field(min_length=1, max_length=EXPOSURE_CAP)]
     fields: Literal[1, 3] = 1
+
+
+class RevalidatedStaticFiles(StaticFiles):
+    """The page's static files, marked `Cache-Control: no-cache`: a browser may store them but
+    revalidates each one (a cheap 304 while unchanged) before use, so after a redeployment it
+    never combines a new `index.html` with an old script or stylesheet."""
+
+    def file_response(self, full_path: str | os.PathLike[str], stat_result: os.stat_result,
+                      scope: Scope, status_code: int = 200) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class BodyLimit:
@@ -344,5 +356,5 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
             "n_used": result.n_used,
         }
 
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", RevalidatedStaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app

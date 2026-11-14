@@ -540,6 +540,21 @@ def test_healthz_after_startup(tmp_path):
     assert response.json() == {"status": "ok"}
 
 
+def test_api_responses_carry_no_cache_header(tmp_path, blobs):
+    client, _ = make_client(tmp_path, blobs, discover=CountingDiscover(SMALL_BIN))
+    with client:
+        responses = [
+            client.get("/healthz"),
+            client.get("/api/search", params=SEARCH),
+            client.get("/api/search", params={**SEARCH, "ra": "x"}),
+            client.post("/api/frame", json=frame_payload([make_uri(0)])),
+        ]
+    assert [r.status_code for r in responses] == [200, 200, 422, 200]
+    for response in responses:
+        assert "cache-control" not in response.headers
+        assert "etag" not in response.headers
+
+
 def run_while_busy(gate: Gate, held: list, extra) -> tuple[bool, int, object, list]:
     """With `held` requests blocked in `gate`, send `extra`; return whether it answered within
     a second, the gate count at that moment, its response and the held responses."""
