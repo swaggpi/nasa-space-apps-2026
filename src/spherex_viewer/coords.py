@@ -2,6 +2,7 @@
 
 import re
 
+import astropy.units as u
 from astropy.coordinates import Angle
 
 _DECIMAL = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)$")
@@ -14,9 +15,12 @@ class CoordinateError(ValueError):
 def _to_degrees(name: str, text: str, unit: str | None) -> float:
     try:
         angle = Angle(text) if unit is None else Angle(text, unit=unit)
-        return float(angle.degree)
-    except Exception as exc:
-        raise CoordinateError(f"Cannot parse {name} {text!r}.") from exc
+    except (ValueError, OverflowError, u.UnitsError) as exc:
+        raise CoordinateError(f"Cannot parse {name}.") from exc
+    # 24h converts to 359.99999999999994 degrees, so hours are range-checked as hours.
+    if angle.unit == u.hourangle and not angle.hour < 24.0:
+        raise CoordinateError(f"{name} is outside 0 to 24 hours.")
+    return float(angle.degree)
 
 
 def parse_ra(text: str) -> float:
@@ -35,7 +39,7 @@ def parse_ra(text: str) -> float:
     else:
         ra = _to_degrees("RA", text, "hourangle")
     if not 0.0 <= ra < 360.0:
-        raise CoordinateError(f"RA {text!r} is outside 0 to 360 degrees.")
+        raise CoordinateError("RA is outside 0 to 360 degrees.")
     return ra
 
 
@@ -51,11 +55,11 @@ def parse_dec(text: str) -> float:
     if _DECIMAL.match(text):
         dec = float(text)
     elif "h" in text:
-        raise CoordinateError(f"Dec {text!r} must not be given in hours.")
+        raise CoordinateError("Dec must not be given in hours.")
     elif "d" in text or "°" in text:
         dec = _to_degrees("Dec", text, None)
     else:
         dec = _to_degrees("Dec", text, "deg")
     if not -90.0 <= dec <= 90.0:
-        raise CoordinateError(f"Dec {text!r} is outside -90 to +90 degrees.")
+        raise CoordinateError("Dec is outside -90 to +90 degrees.")
     return dec

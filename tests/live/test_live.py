@@ -1,4 +1,4 @@
-"""Live checks against the IRSA TAP service and the public S3 bucket (row 34, opt-in)."""
+"""Live checks against the IRSA TAP service and the public S3 bucket (opt-in: `pytest -m live`)."""
 
 import httpx
 import numpy as np

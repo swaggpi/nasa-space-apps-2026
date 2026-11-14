@@ -11,7 +11,8 @@ import httpx
 
 TAP_URL = "https://irsa.ipac.caltech.edu/TAP/sync"
 DETECTORS = ("D1", "D2", "D3", "D4", "D5", "D6")
-URI_PATTERN = re.compile(r"^ibe/data/spherex/[a-z0-9]+/level2/[A-Za-z0-9_./-]+\.fits$")
+URI_PATTERN = re.compile(r"ibe/data/spherex/[a-z0-9]+/level2/[A-Za-z0-9_./-]+\.fits")
+MAX_URI_LENGTH = 300
 
 _HEADER = ["uri", "time_bounds_lower"]
 _ATTEMPTS = 2
@@ -31,8 +32,13 @@ class DiscoveryError(RuntimeError):
 
 
 def is_valid_uri(uri: str) -> bool:
-    """Return True if ``uri`` is a SPHEREx level-2 archive URI without a ``..`` segment."""
-    return bool(URI_PATTERN.match(uri)) and ".." not in uri.split("/")
+    """Return True if ``uri`` is a SPHEREx level-2 archive URI.
+
+    The whole string must match ``URI_PATTERN``, be at most ``MAX_URI_LENGTH`` characters long
+    and contain no ``.`` or ``..`` path segment.
+    """
+    return (len(uri) <= MAX_URI_LENGTH and URI_PATTERN.fullmatch(uri) is not None
+            and not {".", ".."} & set(uri.split("/")))
 
 
 def build_adql(ra_deg: float, dec_deg: float, detector: str) -> str:

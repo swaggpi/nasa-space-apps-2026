@@ -27,12 +27,14 @@ Open http://localhost:8000/.
 ```sh
 docker build --platform linux/amd64 -t hack-demo .
 cp .env.example .env
-docker run --rm -p 8000:8000 --memory 512m --env-file .env -v hack-demo-data:/data hack-demo
+docker run --rm -p 127.0.0.1:8000:8000 --memory 512m --env-file .env -v hack-demo-data:/data hack-demo
 ```
 
 The container serves plain HTTP on `0.0.0.0:8000` (one uvicorn worker) and is meant to sit
 behind a TLS-terminating reverse proxy such as Caddy (e.g. `reverse_proxy localhost:8000` for
-the subdomain); it trusts the proxy's `X-Forwarded-Proto` and `X-Forwarded-For` headers.
+the subdomain). It trusts `X-Forwarded-For` and `X-Forwarded-Proto` from any peer, and the rate
+limits are keyed by that forwarded address, so the container port must be reachable only
+through the proxy (publish it on `127.0.0.1` as above, never on a public interface).
 `GET /healthz` returns 200 `{"status":"ok"}` once the app is ready.
 
 Everything that must survive a restart lives under `/data`: the on-disk cutout cache in
@@ -43,28 +45,57 @@ Everything that must survive a restart lives under `/data`: the on-disk cutout c
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SPHEREX_CACHE_DIR` | `/data/cutouts` | Directory of the cutout cache; created at startup. |
+| `SPHEREX_CACHE_MAX_MB` | `1024` | Size cap of the cutout cache in MB; must be a positive number. |
 
 No secrets are needed: all data sources are public. Outbound HTTPS honours the standard
 `HTTPS_PROXY` and `SSL_CERT_FILE` variables if your network requires them.
 
-## Tests
+## Limits
+
+- Per client address: 10 searches at once, then 2 per minute; 60 frame requests at once, then
+  6 per minute. Beyond that the server answers 429 with a `Retry-After` header.
+- At most 4 searches and 4 frame builds run at a time; a request that cannot start within
+  30 s (search) or 15 s (frame) gets 503.
+- The cutout cache is capped at `SPHEREX_CACHE_MAX_MB`; older cutouts are
+  removed when it is exceeded. A typical search adds about 0.7 MB, a deep field about 6 MB.
+
+## Tests and validation
 
 ```sh
 pytest                               # unit tests on synthetic data, no network
-pytest -m live                       # live validation against IRSA and S3
+pytest -m live                       # three smoke tests against the real IRSA archive and S3
 node --test 'tests/js/*.test.mjs'    # pure frontend logic (Node 22)
 node --test 'tests/e2e/*.test.mjs'   # opt-in: starts the app and drives a real browser via Playwright
+python validation/run_validation.py  # live validation on real data; writes validation/REPORT.md
 ```
 
 ## Limitations
 
-- Coordinates are used as given; fast-moving stars need current-epoch coordinates to fall in
-  the 6′ field.
-- Each frame averages over the detector's wavelength range and visits sample that range
-  differently, so part of any frame-to-frame brightness change is not intrinsic.
-- Very bright stars show an empty (no-data) core because the detector saturates there.
-- The cutout cache has no eviction; it grows by about 0.7 MB (typical position) to 6 MB (deep
-  field) per new search.
+- **What it is for**: stars whose position changes by several arcseconds between visits, and
+  sources whose brightness changes by more than about a factor 1.5–2. It is not a tool for
+  finding asteroids, comets or a distant planet, and not a photometer.
+- **Solar-system objects**: each frame is a median over one visit, so anything moving faster
+  than about 1″ per hour within a visit is suppressed, and anything moving more than about 3′
+  between visits leaves the 6′ field.
+- **Coordinates are used as given**: fast-moving stars need current-epoch coordinates to fall
+  inside the field.
+- **Sparse frames**: frames built from only one or two exposures have no artefact rejection and
+  can show cosmic rays or a bright band; about half of all searches contain a frame with five
+  exposures or fewer. The page shows each frame's exposure count next to its date (e.g.
+  `2025-11-07 – 2025-11-10 · 19 exposures`), so such frames can be recognised.
+- **Brightness**: each frame averages over the detector's wavelength range and visits sample
+  that range differently. Constant stars vary by about 4 % in flux and up to about 40 % in peak
+  pixel between frames, sources with strong spectral features far more, and the brightest
+  pixels are clipped to white. Changes below about a factor 1.5 are not evidence of
+  variability.
+- **Saturation**: stars near saturation can switch between a visible core and a no-data hole
+  between frames, and the hole's outline can shift by about a pixel; that is not motion. Very
+  bright stars show an empty core throughout.
+- **Positions**: shifts smaller than about 1″ (a sixth of a pixel) are not significant.
+- **Extended emission** that fills the field is subtracted with the background.
+- **Exposure cap**: above 24 exposures per frame, exposures are picked evenly spaced in time
+  order (every k-th exposure), not at evenly spaced clock times; this samples the detector's
+  wavelength range more evenly.
 
 ## Acknowledgement
 

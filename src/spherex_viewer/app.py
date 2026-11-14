@@ -226,7 +226,7 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
         if detector not in DETECTORS:
             raise HTTPException(status_code=422, detail="Unknown detector; use one of D1–D6.")
         try:
-            if True:
+            async with slot(request.app.state.search_slots, SEARCH_WAIT_S):
                 exposures = await run_in_threadpool(request.app.state.discover,
                                                     ra_deg, dec_deg, detector)
         except DiscoveryError as exc:

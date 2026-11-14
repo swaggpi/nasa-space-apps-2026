@@ -1,8 +1,8 @@
 """Synthetic SPHEREx-like multi-extension FITS exposures and an in-memory range reader for tests.
 
-Built as specified in DESIGN.md section 7: a small detector with a TAN-SIP WCS, a constant
-background with Gaussian noise, one Gaussian star, an uncompressed float32 IMAGE HDU, a
-RICE_1 tile-compressed int32 FLAGS HDU (one tile per row, like the real files) and a VARIANCE HDU.
+A small detector with a TAN-SIP WCS, a constant background with Gaussian noise, one Gaussian
+star, an uncompressed float32 IMAGE HDU, a RICE_1 tile-compressed int32 FLAGS HDU (one tile per
+row, like the real files) and a VARIANCE HDU.
 """
 
 import io
@@ -13,6 +13,8 @@ import numpy as np
 from astropy.io import fits
 from astropy.modeling import fitting, models
 from astropy.wcs import WCS, Sip
+
+from spherex_viewer.remote import RemoteReadError
 
 PIXEL_SCALE_DEG = 6.15 / 3600
 
@@ -26,7 +28,7 @@ FLAG_NAMES = {
 
 
 def exposure_wcs(center: tuple[float, float], *, n: int, rot_deg: float, sip: bool) -> WCS:
-    """Celestial WCS of a synthetic n x n detector centred on `center` (ICRS degrees)."""
+    """Celestial WCS of a synthetic n x n detector centred on ``center`` (ICRS degrees)."""
     w = WCS(naxis=2)
     t = np.radians(rot_deg)
     s = PIXEL_SCALE_DEG
@@ -59,9 +61,9 @@ def make_exposure(
     bad: Iterable[tuple[int, int, int]] = (),
     seed: int,
 ) -> bytes:
-    """Return the bytes of a synthetic exposure (MJy/sr) with a star at sky position `star`.
+    """Return the bytes of a synthetic exposure (MJy/sr) with a star at sky position ``star``.
 
-    Each `bad` entry (x, y, bit) adds 1000 MJy/sr at detector pixel (x, y) and sets that flag bit.
+    Each ``bad`` entry (x, y, bit) adds 1000 MJy/sr at detector pixel (x, y) and sets that flag bit.
     """
     rng = np.random.default_rng(seed)
     w = exposure_wcs(center, n=n, rot_deg=rot_deg, sip=sip)
@@ -97,7 +99,7 @@ def make_exposure(
 
 def rewrite_flags(blob: bytes, *, tile_shape: tuple[int, int] | None = None,
                   rename: dict[str, str] | None = None) -> bytes:
-    """Return `blob` with the FLAGS HDU recompressed with `tile_shape` and/or cards renamed."""
+    """Return ``blob`` with the FLAGS HDU recompressed with ``tile_shape`` and/or cards renamed."""
     with fits.open(io.BytesIO(blob)) as hdul:
         flags = hdul["FLAGS"].data.copy()
         header = hdul["FLAGS"].header.copy()
@@ -135,17 +137,15 @@ def fit_centroid(image: np.ndarray, x: float, y: float, half: int = 3) -> tuple[
 
 
 class FakeRangeReader:
-    """In-memory `RangeReader`: serves byte slices of `blobs` and records every call in order."""
+    """In-memory ``RangeReader``: serves byte slices of ``blobs`` and records every call in order."""
 
     def __init__(self, blobs: dict[str, bytes]) -> None:
         self.blobs = blobs
         self.calls: list[tuple[str, int, int]] = []
 
     def read(self, url: str, start: int, stop: int) -> bytes:
-        """Return bytes [start, stop) of `blobs[url]`; `RemoteReadError` for an unknown URL."""
+        """Return bytes [start, stop) of ``blobs[url]``; ``RemoteReadError`` for an unknown URL."""
         self.calls.append((url, start, stop))
         if url not in self.blobs:
-            from spherex_viewer.remote import RemoteReadError
-
             raise RemoteReadError(f"unknown URL {url}")
         return self.blobs[url][start:stop]

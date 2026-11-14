@@ -1,21 +1,18 @@
-"""Flag masks, background subtraction, alignment onto the target grid, robust combination.
+"""Flag semantics, background subtraction, alignment onto the target grid, robust combination.
 
-Flag bits follow the SPHEREx Explanatory Supplement, Table 16 (DESIGN.md 5.4-5.7).
+Flag bits follow the SPHEREx Explanatory Supplement, Table 16.
 """
 
-from __future__ import annotations
-
+import re
 import warnings
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 import numpy as np
+from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 from reproject import reproject_interp
-
-if TYPE_CHECKING:
-    from spherex_viewer.remote import Window
 
 FLAG_BITS: dict[str, int] = {
     "TRANSIENT": 0, "OVERFLOW": 1, "SUR_ERROR": 2, "NONFUNC": 6, "DICHROIC": 7,
@@ -33,6 +30,44 @@ BACKGROUND_EXCLUDE_FLAGS = 0x3FFACEC7
 CUTOUT_VERSION = 1
 
 _MIN_BACKGROUND_PIXELS = 50
+_MSKN = re.compile(r"MSKN(\d{4})")
+_KNOWN_NAMES = {bit: name for name, bit in FLAG_BITS.items()}
+
+
+class UnsupportedLayoutError(RuntimeError):
+    """The file's layout or flag definitions are not the ones this code supports."""
+
+
+@dataclass
+class Window:
+    """Native-pixel window of one exposure.
+
+    ``image`` is float32 surface brightness in MJy/sr (NaN kept), ``flags`` the int32 flag
+    bits, both (ny, nx). ``wcs`` is the full-detector celestial WCS including SIP, and
+    ``(x0, y0)`` is the 0-based detector pixel of ``image[0, 0]``.
+    """
+
+    image: np.ndarray
+    flags: np.ndarray
+    wcs: WCS
+    x0: int
+    y0: int
+
+
+def check_flag_definitions(header: fits.Header) -> None:
+    """Raise UnsupportedLayoutError if a ``MSKNnnnn`` card renames or renumbers a known flag.
+
+    A card is checked when its bit or its name is in ``FLAG_BITS``. Other bits are accepted;
+    they are in neither mask, so they are left unmasked.
+    """
+    for key in header:
+        match = _MSKN.fullmatch(key)
+        if match is None:
+            continue
+        bit = int(match.group(1))
+        name = str(header[key]).strip()
+        if (bit in _KNOWN_NAMES or name in FLAG_BITS) and FLAG_BITS.get(name) != bit:
+            raise UnsupportedLayoutError(f"FLAGS mask plane {bit} differs from the known flags")
 
 
 def estimate_background(image: np.ndarray, flags: np.ndarray) -> float:
@@ -54,7 +89,8 @@ def align(window: Window, target: WCS, target_shape: tuple[int, int]) -> np.ndar
     """Background-subtracted, bad-pixel-masked window resampled onto the target grid.
 
     Bilinear interpolation through the full pixel-to-sky transform including SIP. Returns
-    float32 ``target_shape`` in MJy/sr; NaN where there is no valid data.
+    float32 ``target_shape`` in MJy/sr; NaN where there is no valid data (reproject fills
+    target pixels outside the window, or next to a NaN input pixel, with NaN).
     """
     background = estimate_background(window.image, window.flags)
     if not np.isfinite(background):
@@ -63,9 +99,8 @@ def align(window: Window, target: WCS, target_shape: tuple[int, int]) -> np.ndar
     image[(window.flags & BAD_FLAGS) != 0] = np.nan
     ny, nx = image.shape
     wcs = window.wcs[window.y0:window.y0 + ny, window.x0:window.x0 + nx]
-    data, footprint = reproject_interp((image, wcs), target, shape_out=target_shape,
-                                       order="bilinear")
-    data[footprint == 0] = np.nan
+    data = reproject_interp((image, wcs), target, shape_out=target_shape, order="bilinear",
+                            return_footprint=False)
     return data.astype(np.float32)
 
 

@@ -65,10 +65,11 @@ def segment(exposures: Sequence[Exposure]) -> list[list[Exposure]]:
     return bins
 
 
-def subsample(exposures: Sequence[Exposure], cap: int = EXPOSURE_CAP) -> list[Exposure]:
-    """Return at most ``cap`` exposures evenly spaced in time order, first and last included."""
+def subsample(exposures: Sequence[Exposure]) -> list[Exposure]:
+    """Return at most ``EXPOSURE_CAP`` exposures evenly spaced in time, first and last kept."""
     ordered = sorted(exposures, key=lambda e: e.mjd)
     n = len(ordered)
+    cap = EXPOSURE_CAP
     if n <= cap:
         return ordered
     return [ordered[(j * (n - 1) + (cap - 1) // 2) // (cap - 1)] for j in range(cap)]

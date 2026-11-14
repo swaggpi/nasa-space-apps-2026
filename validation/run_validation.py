@@ -43,9 +43,10 @@ from spherex_viewer.visits import EXPOSURE_CAP, FramePlan, plan_frames
 
 REPORT_PATH = Path(__file__).with_name("REPORT.md")
 CORE_RADIUS_PX = 3.0          # no-data count, peak and aperture radius around the expected position
-RING_RADIUS_PX = 6.0          # outer radius of the ring searched for flux around a no-data core
+RING_RADIUS_PX = 10.0         # outer radius searched for flux around a no-data core
 NOISE_EXCLUDE_PX = 7.0        # pixels closer than this to the expected position are not noise
 FIT_RADIUS_PX = 7.0           # Moffat fit uses finite pixels within this radius
+CACHE_MAX_BYTES = 2 * 1024**3
 DETECTION_SIGMA = 5.0
 MIN_CORE_HOLE = 3             # no-data pixels within CORE_RADIUS_PX that make a "core hole"
 VARIABILITY_SIGMA = 5.0
@@ -230,7 +231,8 @@ def aperture_sums(data: np.ndarray, x: float, y: float) -> tuple[float, float]:
     return total(x, y), err
 
 
-def fit_position(data: np.ndarray, x: float, y: float, saturated: bool) -> tuple[float, float] | None:
+def fit_position(data: np.ndarray, x: float, y: float,
+                 saturated: bool) -> tuple[float, float] | None:
     """Moffat2D + Const2D fit (LevMarLSQFitter) to finite pixels within FIT_RADIUS_PX."""
     r = radius_map(x, y)
     ok = (r <= FIT_RADIUS_PX) & np.isfinite(data)
@@ -245,7 +247,7 @@ def fit_position(data: np.ndarray, x: float, y: float, saturated: bool) -> tuple
         fitted = fitting.LevMarLSQFitter()(model, xx[ok], yy[ok], data[ok], maxiter=500)
     moffat = fitted[0]
     fx, fy = moffat.x_0.value, moffat.y_0.value
-    sane = (moffat.amplitude.value > 0 and 0.3 < abs(moffat.gamma.value) < 10
+    sane = (moffat.amplitude.value > 0 and 0.5 < moffat.fwhm < 10
             and math.hypot(fx - x, fy - y) <= FIT_RADIUS_PX)
     return (fx, fy) if sane else None
 
@@ -304,25 +306,46 @@ def offset_arcsec(origin: SkyCoord, point: SkyCoord) -> np.ndarray:
     return np.array([dra.to_value(u.arcsec), ddec.to_value(u.arcsec)])
 
 
+def shift(target: Target, det: DetectorResult) -> tuple[FrameMeasurement, FrameMeasurement,
+                                                        np.ndarray, np.ndarray] | None:
+    """First and last fitted frame, measured and predicted shift between them (arcsec)."""
+    fitted = [f for f in det.frames if f.fit is not None]
+    if len(fitted) < 2:
+        return None
+    centre = SkyCoord(target.ra_deg * u.deg, target.dec_deg * u.deg)
+    first, last = fitted[0], fitted[-1]
+    meas = offset_arcsec(centre, last.fit) - offset_arcsec(centre, first.fit)
+    pred = offset_arcsec(centre, last.expected) - offset_arcsec(centre, first.expected)
+    return first, last, meas, pred
+
+
+def motion_verdict(meas: np.ndarray, pred: np.ndarray) -> str:
+    """'follows the predicted motion', 'static' or 'inconclusive' (rule in the method section)."""
+    if np.hypot(*(meas - pred)) < 0.5 * np.hypot(*pred):
+        return "follows the predicted motion"
+    if np.hypot(*meas) < 0.5 * np.hypot(*pred):
+        return "static"
+    return "inconclusive"
+
+
 def motion_rows(target: Target, results: list[DetectorResult]) -> list[str]:
     """Measured versus predicted first-to-last shift per detector (arcsec)."""
-    centre = SkyCoord(target.ra_deg * u.deg, target.dec_deg * u.deg)
     rows = []
     for det in results:
-        fitted = [f for f in det.frames if f.fit is not None]
-        if len(fitted) < 2:
-            rows.append(f"| {det.detector} | {len(fitted)} of {len(det.frames)} | – | – | – | "
+        n_fit = sum(f.fit is not None for f in det.frames)
+        found = shift(target, det)
+        if found is None:
+            rows.append(f"| {det.detector} | {n_fit} of {len(det.frames)} | – | – | – | – | "
                         "fewer than two frames with a fit |")
             continue
-        first, last = fitted[0], fitted[-1]
-        meas = offset_arcsec(centre, last.fit) - offset_arcsec(centre, first.fit)
-        pred = offset_arcsec(centre, last.expected) - offset_arcsec(centre, first.expected)
+        first, last, meas, pred = found
         note = ("saturated core in first and/or last frame: fit uses the wings only"
-                if "saturated core" in (first.verdict, last.verdict) else "unsaturated")
+                if "saturated core" in (first.verdict, last.verdict) else "no saturated core")
         rows.append(
-            f"| {det.detector} | {len(fitted)} of {len(det.frames)} | "
+            f"| {det.detector} | {n_fit} of {len(det.frames)} | "
             f"{first.plan.label} → {last.plan.label} | {meas[0]:+.2f}, {meas[1]:+.2f} | "
-            f"{pred[0]:+.2f}, {pred[1]:+.2f} | {np.hypot(*(meas - pred)):.2f} ({note}) |")
+            f"{pred[0]:+.2f}, {pred[1]:+.2f} | {np.hypot(*(meas - pred)):.2f} | "
+            f"{motion_verdict(meas, pred)}; {note} |")
     return rows
 
 
@@ -355,6 +378,16 @@ def summary_line(target: Target, results: list[DetectorResult]) -> str:
         parts.append(f"nothing above the threshold in {counts['not detected']} frames "
                      f"(detectors {detector_span(by_verdict['not detected'])})")
     text += "; ".join(parts) + "."
+    if target.astrometry is not None:
+        tests = {d.detector: motion_verdict(*found[2:]) for d in results
+                 if (found := shift(target, d)) is not None}
+        groups = {v: [k for k, w in tests.items() if w == v] for v in sorted(set(tests.values()))}
+        text += (" Motion test (first to last fitted frame): "
+                 + "; ".join(f"{v} in {detector_span(k)}" for v, k in groups.items())
+                 + "; no test (fewer than two fits) in "
+                 + detector_span([d.detector for d in results if d.detector not in tests]) + "."
+                 + (" A static source at the expected position is an unrelated object, not the "
+                    "target." if "static" in groups else ""))
     if target.variable:
         varying = [d.detector for d in results if variability(d)[0] == "yes"]
         text += (" Aperture sums differ between frames by more than "
@@ -420,16 +453,16 @@ def astrometry_section() -> list[str]:
         "- Barnard's Star: Gaia DR3 4472832130942575872 (values confirmed in the Gaia DR3 table "
         "at IRSA), 269.44850253, +4.73942005 (2016.0), pm (−801.551, +10362.394) mas/yr, "
         "π 546.976 mas. Query centre = epoch 2026.0 without parallax: "
-        f"{TARGETS[0].ra_deg}, {TARGETS[0].dec_deg}.",
+        "{}, {}.".format(*centre_2026(BARNARD)),
         "- Epsilon Indi B: 2MASS 331.043836, −56.782707 (epoch 1999.855, treated as an observed "
         "position and corrected for parallax), with the Gaia DR3 motion of ε Indi A "
         "(+3966.661, −2536.192) mas/yr, π 274.843 mas. Query centre (2026.0): "
-        f"{TARGETS[1].ra_deg}, {TARGETS[1].dec_deg}. Cross-check: Gaia DR3 also lists the "
+        "{}, {}. ".format(*centre_2026(EPS_IND_B)) + "Cross-check: Gaia DR3 also lists the "
         "unresolved Ba+Bb (6412596012146801152, pm (+3981.977, −2466.832), π 270.658); its "
         f"predicted position on 2025-11-01 differs from ours by {indi_diff:.2f}″ "
         f"({indi_diff / PIXEL_SCALE_ARCSEC:.2f} px).",
         "- WISE 0855: query centre = the challenge's coordinates "
-        f"({TARGETS[2].ra_deg:.6f}, {TARGETS[2].dec_deg:.6f}), taken as the barycentric position "
+        f"({WISE_0855.ra_deg:.6f}, {WISE_0855.dec_deg:.6f}), taken as the barycentric position "
         "at epoch 2010.3. pm (−8.118, +0.680) ″/yr and π 0.449″ are confirmed from Luhman & "
         "Esplin 2016, AJ 152, 78 (arXiv:1605.06655), Table 4 (π 0.449 ± 0.008″, μα cosδ "
         "−8.118 ± 0.008″/yr, μδ 0.680 ± 0.007″/yr). The paper gives no reference position; its "
@@ -472,10 +505,13 @@ def method_section() -> list[str]:
         "(r > 10) of the same frame. A frame with a no-data pixel in the aperture is "
         "\"incomplete\" (the sum would be a lower bound). Variability: max − min over complete "
         f"frames divided by the combined σ of those two frames, \"yes\" if > {VARIABILITY_SIGMA:g}.",
-        f"- **Position fit** (moving targets, frames not \"not detected\"): `Moffat2D + Const2D` "
+        "- **Position fit** (moving targets, frames not \"not detected\"): `Moffat2D + Const2D` "
         f"fitted with `LevMarLSQFitter` to finite pixels with r ≤ {FIT_RADIUS_PX:g}; rejected "
-        "unless amplitude > 0, 0.3 < γ < 10 px and the centre lies within that radius. With a "
+        "unless amplitude > 0, 0.5 < FWHM < 10 px and the centre lies within that radius. With a "
         "no-data core only the wings are fitted, which can bias the centre.",
+        "- **Motion test** (first to last frame with a fit): \"follows the predicted motion\" if "
+        "|measured − predicted| < 0.5 |predicted|; \"static\" if |measured| < 0.5 |predicted| "
+        "(a fixed source near the expected position, i.e. not the target); else \"inconclusive\".",
         "",
     ]
 
@@ -485,10 +521,6 @@ def render(results: dict[str, list[DetectorResult]], info: dict[str, str]) -> st
              "Generated by `validation/run_validation.py` (CONTRACT.md item 9). " + info["run"],
              "", "## What a user of the tool sees", ""]
     lines += [summary_line(t, results[t.name]) for t in TARGETS]
-    for t in TARGETS:
-        if t.astrometry is not None:
-            lines.append(f"- {t.name} motion, measured vs predicted first-to-last shift: see "
-                         "the motion table below.")
     lines += ["", "Caveat for brightness: each frame averages over the detector's wavelength "
               "range and visits sample that range differently, so part of any frame-to-frame "
               "brightness change is not intrinsic (CONTRACT.md, known limitations).", ""]
@@ -501,7 +533,7 @@ def render(results: dict[str, list[DetectorResult]], info: dict[str, str]) -> st
             continue
         lines += [f"**{t.name}**", "",
                   "| detector | frames with fit | first → last | measured | predicted "
-                  "| difference (″) |", "|---|---|---|---|---|---|"]
+                  "| difference (″) | motion test |", "|---|---|---|---|---|---|---|"]
         lines += motion_rows(t, results[t.name]) + [""]
     anomalies = [f"- {t.name} {d.detector}: {d.error}" for t in TARGETS for d in results[t.name]
                  if d.error]
@@ -536,7 +568,7 @@ def count_cutouts(root: Path) -> int:
 def run(cache_dir: Path) -> tuple[dict[str, list[DetectorResult]], dict[str, str]]:
     """Run every target and detector sequentially through one cache and one FrameBuilder."""
     started = time.monotonic()
-    cache = CutoutCache(cache_dir)
+    cache = CutoutCache(cache_dir, CACHE_MAX_BYTES)
     before = count_cutouts(cache_dir)
     client = httpx.Client(timeout=httpx.Timeout(connect=10, read=30, write=10, pool=60),
                           limits=httpx.Limits(max_connections=8))

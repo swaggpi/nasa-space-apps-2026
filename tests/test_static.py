@@ -1,4 +1,4 @@
-"""Tests of the served static files and the acknowledgement text (row 30)."""
+"""Tests of the served static files and the acknowledgement text."""
 
 import re
 from importlib.resources import files
@@ -83,3 +83,7 @@ def test_acknowledgement_in_page_footer():
 def test_acknowledgement_in_readme():
     assert README.is_file(), f"{README} does not exist"
     assert ACKNOWLEDGEMENT in normalise(README.read_text(encoding="utf-8"))
+
+
+def test_static_files_are_not_rate_limited(client):
+    assert {client.get("/").status_code for _ in range(80)} == {200}

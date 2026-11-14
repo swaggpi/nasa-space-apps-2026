@@ -449,6 +449,19 @@ def test_healthz_after_startup(tmp_path):
     assert response.json() == {"status": "ok"}
 
 
+def run_while_busy(gate: Gate, held: list, extra) -> tuple[bool, int, object, list]:
+    """With `held` requests blocked in `gate`, send `extra`; return whether it answered within
+    a second, the gate count at that moment, its response and the held responses."""
+    try:
+        gate.wait_entered(len(held))
+        thread, result = in_thread(extra)
+        thread.join(1.0)
+        prompt, count = not thread.is_alive(), gate.count
+    finally:
+        gate.opened.set()
+    return prompt, count, finished(thread, result), [finished(*h) for h in held]
+
+
 def test_healthz_answers_while_searches_hold_every_worker_thread(tmp_path):
     discover = BlockingDiscover()
     client, _ = make_client(tmp_path, discover=discover)
@@ -456,36 +469,36 @@ def test_healthz_answers_while_searches_hold_every_worker_thread(tmp_path):
         limit_worker_threads(client, MAX_CONCURRENT_SEARCHES)
         searches = [in_thread(lambda: client.get("/api/search", params=SEARCH))
                     for _ in range(MAX_CONCURRENT_SEARCHES)]
-        try:
-            discover.wait_entered(MAX_CONCURRENT_SEARCHES)
-            start = time.monotonic()
-            health = finished(*in_thread(lambda: client.get("/healthz")))
-            assert health.status_code == 200
-            assert time.monotonic() - start < 1.0
-        finally:
-            discover.opened.set()
-        assert all(finished(*s).status_code == 200 for s in searches)
+        prompt, _, health, held = run_while_busy(discover, searches,
+                                                 lambda: client.get("/healthz"))
+    assert prompt
+    assert health.status_code == 200
+    assert [r.status_code for r in held] == [200] * MAX_CONCURRENT_SEARCHES
 
 
 def test_waiting_searches_hold_no_worker_thread(tmp_path):
     discover = BlockingDiscover()
     client, _ = make_client(tmp_path, discover=discover)
+    waiting = []
+
+    def page_while_searches_wait():
+        waiting.extend(in_thread(lambda: client.get("/api/search", params=SEARCH))
+                       for _ in range(5))
+        slots = client.app.state.search_slots
+        deadline = time.monotonic() + WAIT_S
+        while len(slots._waiters or ()) < 5 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return client.get("/")
+
     with client:
         limit_worker_threads(client, MAX_CONCURRENT_SEARCHES + 1)
         searches = [in_thread(lambda: client.get("/api/search", params=SEARCH))
-                    for _ in range(MAX_CONCURRENT_SEARCHES + 5)]
-        try:
-            discover.wait_entered(MAX_CONCURRENT_SEARCHES)
-            slots = client.app.state.search_slots
-            deadline = time.monotonic() + WAIT_S
-            while len(slots._waiters or ()) < 5 and time.monotonic() < deadline:
-                time.sleep(0.01)
-            page = finished(*in_thread(lambda: client.get("/")))
-            assert page.status_code == 200
-        finally:
-            discover.opened.set()
-        assert all(finished(*s).status_code == 200 for s in searches)
-    assert discover.count == MAX_CONCURRENT_SEARCHES + 5
+                    for _ in range(MAX_CONCURRENT_SEARCHES)]
+        prompt, _, page, held = run_while_busy(discover, searches, page_while_searches_wait)
+        held += [finished(*w) for w in waiting]
+    assert prompt
+    assert page.status_code == 200
+    assert [r.status_code for r in held] == [200] * (MAX_CONCURRENT_SEARCHES + 5)
 
 
 def test_search_gives_503_when_all_slots_stay_busy(tmp_path, monkeypatch):
@@ -495,15 +508,13 @@ def test_search_gives_503_when_all_slots_stay_busy(tmp_path, monkeypatch):
     with client:
         searches = [in_thread(lambda: client.get("/api/search", params=SEARCH))
                     for _ in range(MAX_CONCURRENT_SEARCHES)]
-        try:
-            discover.wait_entered(MAX_CONCURRENT_SEARCHES)
-            busy = finished(*in_thread(lambda: client.get("/api/search", params=SEARCH)), 2.0)
-            assert busy.status_code == 503
-            assert busy.json() == {"detail": SERVER_BUSY}
-            assert discover.count == MAX_CONCURRENT_SEARCHES
-        finally:
-            discover.opened.set()
-        assert all(finished(*s).status_code == 200 for s in searches)
+        prompt, count, busy, held = run_while_busy(
+            discover, searches, lambda: client.get("/api/search", params=SEARCH))
+    assert prompt
+    assert busy.status_code == 503
+    assert busy.json() == {"detail": SERVER_BUSY}
+    assert count == MAX_CONCURRENT_SEARCHES
+    assert [r.status_code for r in held] == [200] * MAX_CONCURRENT_SEARCHES
 
 
 def test_frame_gives_503_when_all_build_slots_stay_busy(tmp_path, blobs, monkeypatch):
@@ -515,16 +526,13 @@ def test_frame_gives_503_when_all_build_slots_stay_busy(tmp_path, blobs, monkeyp
     with client:
         frames = [in_thread(lambda uri=uri: client.post("/api/frame", json=frame_payload([uri])))
                   for uri in uris]
-        try:
-            reader.wait_entered(MAX_CONCURRENT_FRAMES)
-            busy = finished(*in_thread(
-                lambda: client.post("/api/frame", json=frame_payload([make_uri(8)]))), 2.0)
-            assert busy.status_code == 503
-            assert busy.json() == {"detail": SERVER_BUSY}
-            assert reader.count == MAX_CONCURRENT_FRAMES
-        finally:
-            reader.opened.set()
-        assert [finished(*f).status_code for f in frames] == [200, 200, 200, 502]
+        prompt, count, busy, held = run_while_busy(
+            reader, frames, lambda: client.post("/api/frame", json=frame_payload([make_uri(8)])))
+    assert prompt
+    assert busy.status_code == 503
+    assert busy.json() == {"detail": SERVER_BUSY}
+    assert count == MAX_CONCURRENT_FRAMES
+    assert [r.status_code for r in held] == [200, 200, 200, 502]
 
 
 def test_search_rate_limit_gives_429_with_retry_after(tmp_path, blobs):

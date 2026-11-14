@@ -1,4 +1,4 @@
-"""Tests of byte-range reading of FITS windows (DESIGN.md 3, 5.3; test-plan rows 13-17)."""
+"""Tests of byte-range reading of FITS windows from remote SPHEREx files."""
 
 import io
 import struct
@@ -11,14 +11,16 @@ from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
 
 from spherex_viewer import remote
-from spherex_viewer.remote import RemoteReadError, UnsupportedLayoutError
-from synthetic import FLAG_NAMES, FakeRangeReader, make_exposure, rewrite_flags
+from spherex_viewer.cutout import UnsupportedLayoutError
+from spherex_viewer.remote import RemoteReadError
+from synthetic import FLAG_NAMES, FakeRangeReader, exposure_wcs, make_exposure, rewrite_flags
 
 URL = "https://example.invalid/exposure.fits"
 TARGET_RA, TARGET_DEC = 150.0, 20.0
 TARGET_SHAPE = (59, 59)
 N = 300
 NAN_PIXEL = (150, 160)
+HEAD_READ = 21 * 2880
 
 
 def spec_target_wcs(ra: float, dec: float) -> WCS:
@@ -54,6 +56,15 @@ def patch_nan(blob: bytes, x: int, y: int) -> bytes:
     return blob[:offset] + struct.pack(">f", float("nan")) + blob[offset + 4:]
 
 
+def replace_card(blob: bytes, hdu: int, key: str, card: str) -> bytes:
+    """Return ``blob`` with the header card ``key`` of HDU ``hdu`` replaced by ``card``."""
+    info = hdu_spans(blob)[hdu]
+    for pos in range(info["hdrLoc"], info["datLoc"], 80):
+        if blob[pos:pos + 8] == key.encode().ljust(8):
+            return blob[:pos] + card.encode().ljust(80) + blob[pos + 80:]
+    raise KeyError(key)
+
+
 def dense_bad(seed: int, fraction: float = 0.05) -> list[tuple[int, int, int]]:
     rng = np.random.default_rng(seed)
     bits = list(FLAG_NAMES)
@@ -79,8 +90,6 @@ def edge_exposure() -> bytes:
                          rot_deg=-80.0, bad=dense_bad(6), seed=12)
 
 
-# Row 13
-
 def test_header_length_matches_astropy_offsets(exposure):
     for info in hdu_spans(exposure):
         assert remote.header_length(exposure[info["hdrLoc"]:]) == info["datLoc"] - info["hdrLoc"]
@@ -103,8 +112,6 @@ def test_data_length_matches_astropy_offsets(exposure):
         else:
             assert info["datLoc"] + length == len(exposure)
 
-
-# Row 14
 
 def window_reads(blob: bytes, target: WCS):
     reader = FakeRangeReader({URL: blob})
@@ -184,7 +191,7 @@ def test_byte_accounting(exposure, target):
     ny, nx = window.image.shape
     x0, y0, x1, y1 = window.x0, window.y0, window.x0 + nx, window.y0 + ny
 
-    assert calls[0][1:] == (0, 60480)
+    assert calls[0][1:] == (0, HEAD_READ)
     image_start = image_info["datLoc"]
     assert calls[1][1:] == (image_start + 4 * (y0 * N + x0), image_start + 4 * ((y1 - 1) * N + x1))
     assert calls[2][1:] == (flags_info["hdrLoc"], flags_info["hdrLoc"] + 40320)
@@ -204,11 +211,42 @@ def test_byte_accounting(exposure, target):
         assert stop <= variance_start or start >= variance_stop
 
 
-# Row 15
+@pytest.mark.parametrize(("ra", "dec"), [(10.0, -30.0), (TARGET_RA + 1.0, TARGET_DEC),
+                                         (TARGET_RA + 180.0, -TARGET_DEC)])
+def test_far_target_reads_only_the_headers(exposure, ra, dec):
+    window, calls = window_reads(exposure, spec_target_wcs(ra, dec))
+    assert window is None
+    assert [call[1:] for call in calls] == [(0, HEAD_READ)]
 
-def test_far_target_returns_none(exposure):
-    assert remote.read_window(FakeRangeReader({URL: exposure}), URL,
-                              spec_target_wcs(10.0, -30.0), TARGET_SHAPE) is None
+
+def test_target_just_off_the_detector_edge_returns_none(exposure):
+    _, _, wcs = full_read(exposure)
+    ra, dec = wcs.all_pix2world(N + 60.0, N / 2, 0)
+    window, calls = window_reads(exposure, spec_target_wcs(float(ra), float(dec)))
+    assert window is None
+    assert sum(stop - start for _, start, stop in calls) == HEAD_READ
+
+
+@pytest.mark.parametrize("rot_deg", [0.0, 15.0, 30.0, 45.0, 60.0, 135.0, 225.0])
+def test_footprint_window_accepts_every_grid_orientation(target, rot_deg):
+    wcs = exposure_wcs((TARGET_RA, TARGET_DEC), n=N, rot_deg=rot_deg, sip=True)
+    box = remote.footprint_window(wcs, (N, N), target, TARGET_SHAPE)
+    assert box is not None
+    x0, x1, y0, y1 = box
+    px, py = border_positions(wcs, target)
+    assert x0 < px.min() and x1 > px.max() and y0 < py.min() and y1 > py.max()
+
+
+def test_footprint_window_refuses_a_diverged_inversion(target, monkeypatch):
+    wcs = exposure_wcs((TARGET_RA, TARGET_DEC), n=2040, rot_deg=0.0, sip=True)
+    assert remote.footprint_window(wcs, (2040, 2040), target, TARGET_SHAPE) is not None
+
+    def scattered(ra, dec, origin, **kwargs):
+        spread = np.linspace(-500.0, 2500.0, np.size(ra))
+        return spread, spread[::-1]
+
+    monkeypatch.setattr(wcs, "all_world2pix", scattered)
+    assert remote.footprint_window(wcs, (2040, 2040), target, TARGET_SHAPE) is None
 
 
 def test_square_flag_tiles_are_unsupported(exposure, target):
@@ -223,17 +261,69 @@ def test_renamed_flag_bit_is_unsupported(exposure, target):
         remote.read_window(FakeRangeReader({URL: blob}), URL, target, TARGET_SHAPE)
 
 
-def test_check_flag_definitions(exposure):
-    header = raw_header(exposure, hdu_spans(exposure)[2])
-    remote.check_flag_definitions(header)
-    header["MSKN0010"] = "HOTPIX"
+def test_additional_flag_bit_is_accepted(exposure, target):
+    blob = rewrite_flags(exposure, rename={"MSKN0030": "NEWFLAG", "MSKM0030": 1 << 30})
+    window, _ = window_reads(blob, target)
+    expected, _ = window_reads(exposure, target)
+    np.testing.assert_array_equal(window.flags, expected.flags)
+
+
+def corrupt_heap(blob: bytes) -> bytes:
+    info = hdu_spans(blob)[2]
+    header = raw_header(blob, info)
+    heap = info["datLoc"] + header["NAXIS1"] * header["NAXIS2"]
+    end = info["datLoc"] + info["datSpan"]
+    return blob[:heap] + b"\xff" * (end - heap) + blob[end:]
+
+
+def truncate_in_image(blob: bytes) -> bytes:
+    return blob[:hdu_spans(blob)[1]["datLoc"] + 1000]
+
+
+def truncate_in_heap(blob: bytes) -> bytes:
+    info = hdu_spans(blob)[2]
+    return blob[:info["datLoc"] + info["datSpan"] // 2]
+
+
+MALFORMED = {
+    "corrupted FLAGS heap": corrupt_heap,
+    "IMAGE without NAXIS1": lambda b: replace_card(b, 1, "NAXIS1", "COMMENT"),
+    "primary without BITPIX": lambda b: replace_card(b, 0, "BITPIX", "COMMENT"),
+    "primary NAXIS is text": lambda b: replace_card(b, 0, "NAXIS", "NAXIS   = 'two'"),
+    "IMAGE NAXIS1 is text": lambda b: replace_card(b, 1, "NAXIS1", "NAXIS1  = 'wide'"),
+    "IMAGE CRPIX1 is text": lambda b: replace_card(b, 1, "CRPIX1", "CRPIX1  = 'centre'"),
+    "IMAGE CTYPE1 unknown": lambda b: replace_card(b, 1, "CTYPE1", "CTYPE1  = 'XX---TAN'"),
+    "FLAGS PCOUNT is text": lambda b: replace_card(b, 2, "PCOUNT", "PCOUNT  = 'many'"),
+    "FLAGS without PCOUNT": lambda b: replace_card(b, 2, "PCOUNT", "COMMENT"),
+    "truncated IMAGE data": truncate_in_image,
+    "truncated FLAGS heap": truncate_in_heap,
+    "not FITS": lambda b: b"<html>" + b" " * 70000,
+}
+
+
+@pytest.mark.parametrize("name", list(MALFORMED))
+def test_malformed_content_is_unsupported_layout(exposure, target, name):
+    blob = MALFORMED[name](exposure)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(UnsupportedLayoutError):
+            remote.read_window(FakeRangeReader({URL: blob}), URL, target, TARGET_SHAPE)
+
+
+class ShortBodyReader(FakeRangeReader):
+    """Serves the IMAGE rows read (the second call) one byte short."""
+
+    def read(self, url: str, start: int, stop: int) -> bytes:
+        data = super().read(url, start, stop)
+        return data[:-1] if len(self.calls) == 2 else data
+
+
+def test_short_body_is_unsupported_layout(exposure, target):
     with pytest.raises(UnsupportedLayoutError):
-        remote.check_flag_definitions(header)
+        remote.read_window(ShortBodyReader({URL: exposure}), URL, target, TARGET_SHAPE)
 
 
-# Row 16
-
-def http_reader(handler, attempts: int = 3) -> tuple[remote.HttpRangeReader, list[httpx.Request]]:
+def http_reader(handler) -> tuple[remote.HttpRangeReader, list[httpx.Request]]:
     requests: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -241,7 +331,7 @@ def http_reader(handler, attempts: int = 3) -> tuple[remote.HttpRangeReader, lis
         return handler(request, len(requests))
 
     client = httpx.Client(transport=httpx.MockTransport(record))
-    return remote.HttpRangeReader(client, attempts=attempts), requests
+    return remote.HttpRangeReader(client), requests
 
 
 @pytest.fixture
@@ -265,6 +355,27 @@ def test_http_full_response_is_an_error(sleeps):
     reader, _ = http_reader(lambda request, i: httpx.Response(200, content=b"x" * 1000))
     with pytest.raises(RemoteReadError):
         reader.read(URL, 0, 10)
+
+
+def test_http_oversized_partial_body_is_an_error(sleeps):
+    reader, _ = http_reader(lambda request, i: httpx.Response(206, content=b"x" * 11))
+    with pytest.raises(RemoteReadError):
+        reader.read(URL, 0, 10)
+
+
+def test_http_short_partial_body_is_returned(sleeps):
+    reader, _ = http_reader(lambda request, i: httpx.Response(206, content=b"x" * 4))
+    assert reader.read(URL, 0, 10) == b"x" * 4
+
+
+@pytest.mark.parametrize("url", [remote.S3_BASE + "x" * 70000, "https://exaémple..com/x",
+                                 "http://[::1/x"])
+def test_http_unusable_url_is_a_read_error(sleeps, url):
+    reader, requests = http_reader(lambda request, i: httpx.Response(206, content=b"x"))
+    with pytest.raises(RemoteReadError):
+        reader.read(url, 0, 10)
+    assert requests == []
+    assert sleeps == []
 
 
 @pytest.mark.parametrize("status", [503, 429])
@@ -296,8 +407,6 @@ def test_http_timeouts_exhaust_attempts(sleeps):
     assert len(requests) == 3
     assert sleeps == pytest.approx([0.5, 1.5])
 
-
-# Row 17
 
 def test_s3_url_dr1():
     uri = ("ibe/data/spherex/dr1/level2/2025W19_1B/l2b-v27-2026-197/3/"
