@@ -2931,8 +2931,13 @@ test("a search of more than 120 exposures loads its surround only when first use
   + "first zoom-out or arrow past the field acts at once", { timeout: TIMEOUT }, async () => {
   const plan = makePlan(DEEP_FRAMES);
   for (const action of ["zoom-out", "arrow"]) {
+    const gate = deferred();
     const { page, log } = await openPage({
-      search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      wide: async (n, payload, served) => {
+        await gate.promise;
+        return texturedWide(n, payload, served);
+      },
     });
     await page.setViewportSize({ width: 1366, height: 768 });
     await submit(page);
@@ -2956,7 +2961,9 @@ test("a search of more than 120 exposures loads its surround only when first use
       await press(page, "ArrowRight");
       await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
     }
-    assert.ok((await statusText(page)).includes("Loading the surrounding area: frame"));
+    // The first wide frame is held: the surround is provably still loading here.
+    assert.ok((await statusText(page)).includes("Loading the surrounding area: frame 1 of 3"));
+    gate.release();
     await waitForSurround(page);
     assert.equal(log.wides.length, 3);
     if (action === "zoom-out") await page.click("#zoom-in");
@@ -3074,17 +3081,30 @@ test("Enter in a coordinate field searches and, once the search is accepted, lea
 
 test("after Search here the arrow keys move the view at once", { timeout: TIMEOUT }, async () => {
   const plan = makePlan(DEEP_FRAMES);
+  const gate = deferred();
   const { page, log } = await openPage({
-    search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+    search: () => ({ status: 200, body: plan }),
+    frame: async (n) => {
+      if (n === 1) await gate.promise;
+      return frameBody(pixels(n), plan.frames[n].n_used);
+    },
+    wide: texturedWide,
   });
-  await openMap(page);
-  await clickMap(page, 25, 15);
-  await page.click("#sky-search");
-  await page.waitForFunction(() => document.querySelector("#date").textContent !== ""
-    && document.querySelector("#status").textContent.startsWith("Loading frame 2"));
-  assert.equal(await focused(page), "pick");
-  await press(page, "ArrowRight");
-  await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
+  try {
+    await openMap(page);
+    await clickMap(page, 25, 15);
+    await page.click("#sky-search");
+    // The second frame is held, so the first is shown and the search is still loading.
+    await page.waitForFunction(() => document.querySelector("#date").textContent !== "");
+    assert.equal(await statusText(page), "Loading frame 2 of 3…");
+    assert.equal(await focused(page), "pick");
+    await press(page, "ArrowRight");
+    await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
+    assert.equal(await statusText(page), "Loading frame 2 of 3…");
+    assert.equal(log.wides.length, 0);
+  } finally {
+    gate.release();
+  }
   await finalStatus(page);
   await waitForSurround(page);
   await press(page, "ArrowRight");
