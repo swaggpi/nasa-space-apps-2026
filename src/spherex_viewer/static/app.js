@@ -224,7 +224,8 @@ function pause(seconds) {
 /**
  * Sends one request and reads its JSON body, which `valid` must accept. A 429 or 503 answer
  * is retried once after its Retry-After delay, with `step` restored as the status, unless
- * `wait` is false: then it is a failure carrying that delay as `retryAfter` (seconds).
+ * `wait` is false: then it is a failure carrying that delay as `retryAfter` (seconds) and the
+ * HTTP `status`.
  * Returns {body} on success, {reason} on a network, HTTP or content failure, null once
  * aborted; any other error propagates.
  */
@@ -233,7 +234,7 @@ async function request(url, options, signal, valid, step, wait = true) {
     let response = await fetch(url, { ...options, signal });
     if (!wait && RETRIED_STATUSES.includes(response.status)) {
       const retryAfter = retryDelay(response.headers.get("Retry-After"));
-      return { reason: await errorDetail(response), retryAfter };
+      return { reason: await errorDetail(response), retryAfter, status: response.status };
     }
     if (RETRIED_STATUSES.includes(response.status)) {
       const delay = retryDelay(response.headers.get("Retry-After"));
@@ -536,7 +537,7 @@ async function loadNextArea(shift, early, signal) {
   if (outcome === null || signal.aborted) return;
   if (outcome.retryAfter !== undefined) {
     loading = false;
-    pauseAhead(outcome.retryAfter);
+    pauseAhead(outcome.retryAfter, outcome.status === 429);
     return;
   }
   if (outcome.reason !== undefined) {
@@ -637,11 +638,14 @@ function considerAhead(mx, my) {
   loadNextArea(shift, true, controller.signal);
 }
 
-/** Says once that the search limit is reached and tries again, by itself, when it allows. */
-function pauseAhead(seconds) {
+/**
+ * Says once that the search limit is reached (or the server is busy) and tries again, by
+ * itself, after the server's delay.
+ */
+function pauseAhead(seconds, limited) {
   aheadPausedUntil = Date.now() + seconds * 1000;
-  setStatus(joinStatus(summary,
-    `The search limit is reached; loading further on continues in ${seconds} s.`));
+  const cause = limited ? "The search limit is reached" : "The server is busy";
+  setStatus(joinStatus(summary, `${cause}; loading further on continues in ${seconds} s.`));
   applyView();
   clearTimeout(aheadTimer);
   aheadTimer = setTimeout(() => {
