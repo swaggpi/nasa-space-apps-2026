@@ -1,5 +1,6 @@
 """In-memory per-client token-bucket rate limiter."""
 
+import ipaddress
 import math
 import threading
 import time
@@ -12,8 +13,27 @@ SEARCH_PER_MINUTE = 2.0
 # Each frame reads up to 24 exposures (~1.2 MB each): a few searches' frames, then one per 10 s.
 FRAME_BURST = 60
 FRAME_PER_MINUTE = 6.0
-# Bounds the client table to a few MB whatever the number of distinct addresses.
+# With keys from `client_key` (at most 24 characters), 10,000 entries take about 2.5 MB.
 MAX_CLIENTS = 10_000
+# The one key shared by every client whose address is not a valid IP address.
+INVALID_ADDRESS_KEY = "invalid"
+
+
+def client_key(host: str) -> str:
+    """Rate-limit key of a client address: an IPv4 address as is, an IPv6 address as its /64
+    network (one subscriber), anything else as `INVALID_ADDRESS_KEY`.
+
+    An IPv4-mapped IPv6 address counts as its IPv4 address.
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return INVALID_ADDRESS_KEY
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.IPv6Network((address, 64), strict=False))
+    return str(address)
 
 
 class RateLimiter:

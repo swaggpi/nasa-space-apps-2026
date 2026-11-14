@@ -987,8 +987,10 @@ test("an empty plan reports that no exposures cover the position in the chosen d
     assertCleanRun(log);
   });
 
-test("one stretch for all frames: equal values match, a brighter source stays brighter",
-  { timeout: TIMEOUT }, async () => {
+// Both orders: a stretch frozen at the first loaded frame fails the dim-first order.
+for (const brightFirst of [true, false]) {
+  test(`one stretch for all frames: equal values match, a brighter source stays brighter `
+    + `(${brightFirst ? "bright" : "dim"} frame first)`, { timeout: TIMEOUT }, async () => {
     const equal = 100;
     const blank = 101;
     const source = new Set();
@@ -1003,20 +1005,22 @@ test("one stretch for all frames: equal values match, a brighter source stays br
       return ((i * 7) % 50) / 100;
     });
     const sourcePixel = 21 * SIZE + 21;
+    const amplitudes = brightFirst ? [6, 3] : [3, 6];
     const plan = makePlan([
       { label: "2025-05-06", n_available: 8, n_used: 8 },
       { label: "2025-11-07", n_available: 8, n_used: 8 },
     ]);
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }),
-      frame: (n) => frameBody(frame(n === 0 ? 6 : 3), 8),
+      frame: (n) => frameBody(frame(amplitudes[n]), 8),
     });
     await submit(page);
     await finalStatus(page);
     const { min } = await sliderState(page);
-    await selectFrame(page, min);
+    const brightIndex = amplitudes.indexOf(6);
+    await selectFrame(page, min + brightIndex);
     const bright = await canvasPixels(page);
-    await selectFrame(page, min + 1);
+    await selectFrame(page, min + 1 - brightIndex);
     const dim = await canvasPixels(page);
 
     assert.equal(bright[4 * equal + 3], 255);
@@ -1028,6 +1032,7 @@ test("one stretch for all frames: equal values match, a brighter source stays br
     assert.equal(dim[4 * blank + 3], 0);
     assertCleanRun(log);
   });
+}
 
 test("the first pixel value (north-east) is drawn at the canvas's top-left corner",
   { timeout: TIMEOUT }, async () => {

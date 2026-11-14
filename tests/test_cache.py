@@ -259,3 +259,29 @@ def test_eviction_error_is_logged_not_raised(tmp_path, monkeypatch, caplog):
         _fill(cache, [2])
     assert "Permission denied" in caplog.text
     assert cache.get(_uri(2), RA, DEC) is not None
+
+
+def test_eviction_and_size_count_skip_everything_outside_the_cache_layout(tmp_path):
+    size = _entry_size(tmp_path)
+    root = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    foreign = [outside / "precious.npy", outside / "linked.npy", root / "lost+found" / "x.npy",
+               root / "ab" / "notes.txt"]
+    (root / "ab").mkdir(parents=True)
+    (root / "lost+found").mkdir()
+    for path in foreign:
+        path.write_bytes(b"\0" * (3 * size))
+        os.utime(path, (1, 1))
+    (root / "cd").symlink_to(outside, target_is_directory=True)
+    (root / "ab" / "link.npy").symlink_to(outside / "linked.npy")
+
+    cache = CutoutCache(root, int(2.5 * size))
+    _fill(cache, range(2))
+    assert all(cache.get(_uri(i), RA, DEC) is not None for i in range(2))
+    _fill(cache, [2])
+
+    assert [i for i in range(3) if cache.get(_uri(i), RA, DEC) is not None] == [1, 2]
+    assert all(path.stat().st_size == 3 * size for path in foreign)
+    assert (root / "ab" / "link.npy").is_symlink()
+    assert (root / "cd").is_symlink()

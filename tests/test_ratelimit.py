@@ -2,7 +2,7 @@
 
 import pytest
 
-from spherex_viewer.ratelimit import RateLimiter
+from spherex_viewer.ratelimit import INVALID_ADDRESS_KEY, RateLimiter, client_key
 
 
 class Clock:
@@ -77,3 +77,22 @@ def test_client_table_is_capped(clock):
         assert limiter.take(f"10.0.0.{i}") == 0
     assert len(limiter) == 3
     assert limiter.take("10.0.0.99") == 60
+
+
+@pytest.mark.parametrize(
+    ("host", "key"),
+    [
+        ("203.0.113.7", "203.0.113.7"),
+        ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
+        ("2001:db8:1:2:ffff::", "2001:db8:1:2::/64"),
+        ("2001:db8:1:3::1", "2001:db8:1:3::/64"),
+        ("fe80::1%" + "e" * 16000, "fe80::/64"),
+        ("::ffff:203.0.113.7", "203.0.113.7"),
+        ("", INVALID_ADDRESS_KEY),
+        ("testclient", INVALID_ADDRESS_KEY),
+        ("203.0.113.7, 198.51.100.1", INVALID_ADDRESS_KEY),
+        ("x" * 16384, INVALID_ADDRESS_KEY),
+    ],
+)
+def test_client_key(host, key):
+    assert client_key(host) == key

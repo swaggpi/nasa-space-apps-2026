@@ -16,13 +16,11 @@ _MJD_EPOCH = datetime(1858, 11, 17, tzinfo=UTC)
 
 @dataclass(frozen=True)
 class FramePlan:
-    """Exposures planned for one frame; ``mjd_start``/``mjd_end`` span the whole bin (MJD)."""
+    """Exposures planned for one frame; ``label`` gives the UTC dates the whole bin spans."""
 
     index: int
     exposures: tuple[Exposure, ...]
     n_available: int
-    mjd_start: float
-    mjd_end: float
     label: str
 
     @property
@@ -66,7 +64,11 @@ def segment(exposures: Sequence[Exposure]) -> list[list[Exposure]]:
 
 
 def subsample(exposures: Sequence[Exposure]) -> list[Exposure]:
-    """Return at most ``EXPOSURE_CAP`` exposures evenly spaced in time, first and last kept."""
+    """Return at most ``EXPOSURE_CAP`` exposures in time order, first and last kept.
+
+    The exposures are picked at evenly spaced ranks of the time-ordered list, not at evenly
+    spaced times.
+    """
     ordered = sorted(exposures, key=lambda e: e.mjd)
     n = len(ordered)
     cap = EXPOSURE_CAP
@@ -92,8 +94,6 @@ def plan_frames(exposures: Sequence[Exposure]) -> list[FramePlan]:
                 index=index,
                 exposures=tuple(subsample(bin_)),
                 n_available=len(bin_),
-                mjd_start=start,
-                mjd_end=end,
                 label=date_label(start, end),
             )
         )

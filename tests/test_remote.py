@@ -305,6 +305,26 @@ def test_additional_flag_bit_is_accepted(exposure, target):
     np.testing.assert_array_equal(window.flags, expected.flags)
 
 
+@pytest.mark.parametrize(
+    ("key", "card"),
+    [
+        ("ZVAL2", "ZVAL2   =                   -1"),
+        ("ZVAL2", "ZVAL2   =                    8"),
+        ("ZVAL1", "ZVAL1   =                    0"),
+        ("ZNAME1", "ZNAME1  = 'NOISEBIT'"),
+        ("ZNAME2", "COMMENT"),
+    ],
+)
+def test_unexpected_rice_parameters_never_reach_the_decoder(exposure, target, monkeypatch,
+                                                            key, card):
+    decoded = []
+    monkeypatch.setattr(remote, "decode_flag_rows", lambda *args: decoded.append(args))
+    blob = replace_card(exposure, 2, key, card)
+    with pytest.raises(UnsupportedLayoutError):
+        remote.read_window(FakeRangeReader({URL: blob}), URL, target, TARGET_SHAPE)
+    assert decoded == []
+
+
 def truncate_in_image(blob: bytes) -> bytes:
     return blob[:hdu_spans(blob)[1]["datLoc"] + 1000]
 

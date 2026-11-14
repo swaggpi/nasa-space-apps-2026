@@ -100,8 +100,6 @@ def test_plan_frames_wise0855_like_visits():
     assert [p.index for p in plans] == [0, 1, 2, 3]
     assert not any(p.capped for p in plans)
     assert [e for p in plans for e in p.exposures] == exposures
-    assert [p.mjd_start for p in plans] == pytest.approx([a for _, a, _ in VISIT_RANGES])
-    assert [p.mjd_end for p in plans] == pytest.approx([b for _, _, b in VISIT_RANGES])
 
 
 @pytest.mark.parametrize("n", [1, 5, 23, 24])
@@ -156,8 +154,6 @@ def test_plan_frames_capped_and_uncapped_bins():
     assert first.exposures[0] == exposures[0] and first.exposures[-1] == exposures[299]
     assert set(first.exposures) <= set(exposures[:300])
     assert list(first.exposures) == sorted(first.exposures, key=lambda e: e.mjd)
-    assert first.mjd_start == T0
-    assert first.mjd_end == T0 + 299 / 32
     assert first.label == "2023-02-25 – 2023-03-06"
 
     assert second.index == 1
@@ -165,18 +161,7 @@ def test_plan_frames_capped_and_uncapped_bins():
     assert second.n_used == 5
     assert second.capped is False
     assert second.exposures == tuple(exposures[300:])
-    assert second.mjd_start == exposures[300].mjd
-    assert second.mjd_end == exposures[304].mjd
     assert second.label == "2025-11-21"
-
-
-def test_plan_frames_mjd_range_is_whole_bin_not_used_exposures():
-    mjds = [T0 + i / 32 for i in range(300)]
-    plans = plan_frames(_exposures(mjds))
-    assert len(plans) == 1
-    assert plans[0].mjd_start == mjds[0]
-    assert plans[0].mjd_end == mjds[-1]
-    assert all(plans[0].mjd_start <= e.mjd <= plans[0].mjd_end for e in plans[0].exposures)
 
 
 def test_plan_frames_empty():

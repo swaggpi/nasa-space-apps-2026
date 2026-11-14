@@ -4,6 +4,8 @@ import hashlib
 import io
 import logging
 import os
+import re
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -15,6 +17,7 @@ from .grid import GRID_SHAPE
 
 _EVICT_TO_FRACTION = 0.9
 _CUTOUT_BYTES = 4 * GRID_SHAPE[0] * GRID_SHAPE[1]
+_SUBDIR = re.compile(r"[0-9a-f]{2}")
 
 
 def _npy_header() -> bytes:
@@ -35,6 +38,8 @@ class CutoutCache:
     The total size of the cache files is kept at or below ``max_bytes``: when a ``put`` takes
     it above, the oldest files by modification time are deleted until it is at most 90 % of
     ``max_bytes``. The total is counted once at construction and then tracked in memory.
+    Only regular ``.npy`` files in real two-hex-digit subdirectories count and are evicted;
+    symbolic links are never followed.
     """
 
     def __init__(self, root: Path, max_bytes: int) -> None:
@@ -95,13 +100,27 @@ class CutoutCache:
     def _files(self) -> list[tuple[float, int, Path]]:
         """(modification time, size, path) of every cache file; vanished files are skipped."""
         files = []
-        for path in self.root.glob("*/*.npy"):
-            try:
-                stat = path.stat()
-            except OSError:
+        for subdir in self._entries(self.root):
+            if not (_SUBDIR.fullmatch(subdir.name) and subdir.is_dir(follow_symlinks=False)):
                 continue
-            files.append((stat.st_mtime, stat.st_size, path))
+            for entry in self._entries(Path(subdir.path)):
+                if not entry.name.endswith(".npy"):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    files.append((info.st_mtime, info.st_size, Path(entry.path)))
         return files
+
+    @staticmethod
+    def _entries(directory: Path) -> list[os.DirEntry]:
+        try:
+            with os.scandir(directory) as entries:
+                return list(entries)
+        except OSError:
+            return []
 
     def _evict(self) -> None:
         """Delete the oldest files until the total is at most 90 % of the cap (lock held)."""

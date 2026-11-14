@@ -263,6 +263,8 @@ def _check_flags_header(header: fits.Header, detector_shape: tuple[int, int]) ->
         "GCOUNT": 1, "TFIELDS": 1, "TTYPE1": "COMPRESSED_DATA", "ZIMAGE": True,
         "ZCMPTYPE": "RICE_1", "ZBITPIX": 32, "ZNAXIS": 2, "ZNAXIS1": nx, "ZNAXIS2": ny,
         "ZTILE1": nx, "ZTILE2": 1,
+        # astropy's RICE decoder trusts these; other values can crash the process.
+        "ZNAME1": "BLOCKSIZE", "ZVAL1": 32, "ZNAME2": "BYTEPIX", "ZVAL2": 4,
     }
     for key, value in expected.items():
         if header.get(key) != value:

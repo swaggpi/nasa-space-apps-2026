@@ -5,6 +5,8 @@ import json
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 
 import anyio.to_thread
 import numpy as np
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 import synthetic
 from spherex_viewer import app as app_module
 from spherex_viewer.app import (
+    BODY_TIMEOUT,
     BODY_TOO_LARGE,
     FRAME_FAILED,
     INVALID_DEC,
@@ -26,9 +29,11 @@ from spherex_viewer.app import (
     SEARCH_FAILED,
     SERVER_BUSY,
     BodyLimit,
+    check_rate,
     create_app,
 )
 from spherex_viewer.discovery import DiscoveryError, Exposure
+from spherex_viewer.ratelimit import RateLimiter
 from spherex_viewer.remote import s3_url
 
 PIX_DEG = 6.15 / 3600
@@ -471,6 +476,45 @@ def test_body_limit_rejects_large_content_length_without_reading():
     assert len(messages) == 1
 
 
+def test_body_limit_answers_408_and_skips_the_app_when_the_body_stalls():
+    seen = []
+    sent = []
+    messages = [{"type": "http.request", "body": b"12345", "more_body": True}]
+
+    async def inner(scope, receive, send):
+        seen.append(await receive())
+
+    async def stalling_receive():
+        if messages:
+            return messages.pop(0)
+        await asyncio.Event().wait()
+
+    scope = {"type": "http", "method": "POST", "path": "/api/frame",
+             "headers": [(b"content-length", b"10")]}
+    start = time.monotonic()
+    asyncio.run(BodyLimit(inner, max_bytes=10, read_s=0.05)(scope, stalling_receive,
+                                                             sent_to(sent)))
+    assert time.monotonic() - start < 1.0
+    assert seen == []
+    assert sent[0]["status"] == 408
+    assert (b"connection", b"close") in sent[0]["headers"]
+    assert json.loads(sent[1]["body"]) == {"detail": BODY_TIMEOUT}
+
+
+def sent_to(sent: list):
+    async def send(message):
+        sent.append(message)
+
+    return send
+
+
+def test_dockerfile_command_limits_concurrency():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    command = json.loads(next(line for line in dockerfile.splitlines()
+                              if line.startswith("CMD "))[4:])
+    assert command[command.index("--limit-concurrency") + 1] == "100"
+
+
 def test_body_limit_passes_body_at_the_limit_in_one_message():
     chunks = [{"type": "http.request", "body": b"12345", "more_body": True},
               {"type": "http.request", "body": b"67890", "more_body": False}]
@@ -657,3 +701,90 @@ def test_startup_fails_when_cache_dir_cannot_be_created(tmp_path):
     with pytest.raises(OSError):
         with TestClient(app):
             pass
+
+
+def test_invalid_searches_do_not_use_the_search_budget(tmp_path):
+    client, _ = make_client(tmp_path, discover=CountingDiscover(SMALL_BIN))
+    invalid = [{"ra": "abc", "dec": "20"}, {"ra": "150", "dec": "91"},
+               {"ra": "150", "dec": "20", "detector": "D7"}]
+    with client:
+        rejected = [client.get("/api/search", params=invalid[i % 3]).status_code
+                    for i in range(12)]
+        accepted = [client.get("/api/search", params=SEARCH).status_code for _ in range(10)]
+        limited = client.get("/api/search", params=SEARCH)
+    assert rejected == [422] * 12
+    assert accepted == [200] * 10
+    assert limited.status_code == 429
+
+
+def run_disconnected(client: TestClient, method: str, path: str, query: bytes = b"",
+                     body: bytes = b"") -> list[dict]:
+    """Send one request straight to the ASGI app from a client that is gone after its body."""
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    sent: list[dict] = []
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": method,
+        "scheme": "http", "path": path, "raw_path": path.encode(), "query_string": query,
+        "root_path": "", "client": ("127.0.0.1", 50000), "server": ("testserver", 80),
+        "headers": [(b"host", b"testserver"), (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
+    }
+    client.portal.call(client.app, scope, receive, sent_to(sent))
+    return sent
+
+
+def test_disconnected_search_does_not_query_the_archive_and_frees_its_slot(tmp_path):
+    discover = CountingDiscover(SMALL_BIN)
+    client, _ = make_client(tmp_path, discover=discover)
+    with client:
+        run_disconnected(client, "GET", "/api/search", b"ra=150&dec=20")
+        assert discover.calls == []
+        assert client.app.state.search_slots._value == MAX_CONCURRENT_SEARCHES
+        assert client.get("/api/search", params=SEARCH).status_code == 200
+    assert len(discover.calls) == 1
+
+
+def test_disconnected_frame_reads_nothing_and_frees_its_slot(tmp_path, blobs):
+    client, reader = make_client(tmp_path, blobs)
+    body = json.dumps(frame_payload([make_uri(0)])).encode()
+    with client:
+        run_disconnected(client, "POST", "/api/frame", body=body)
+        assert reader.calls == []
+        assert client.app.state.frame_slots._value == MAX_CONCURRENT_FRAMES
+        assert client.post("/api/frame", json=frame_payload([make_uri(0)])).status_code == 200
+
+
+def rate_request(host: str | None):
+    return SimpleNamespace(client=None if host is None else SimpleNamespace(host=host))
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "shared"),
+    [
+        ("203.0.113.7", "203.0.113.7", True),
+        ("203.0.113.7", "203.0.113.8", False),
+        ("2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:fffe", True),
+        ("2001:db8:1:2::1", "2001:db8:1:3::1", False),
+        ("not an address", "x" * 16384, True),
+        ("unix-socket", None, True),
+    ],
+)
+def test_rate_limit_key_is_the_client_address_or_ipv6_network(first, second, shared):
+    limiter = RateLimiter(1, 1.0)
+    check_rate(limiter, rate_request(first))
+    if shared:
+        with pytest.raises(app_module.HTTPException) as exc:
+            check_rate(limiter, rate_request(second))
+        assert exc.value.status_code == 429
+    else:
+        check_rate(limiter, rate_request(second))
+
+
+def test_long_client_string_is_not_stored_as_a_key():
+    limiter = RateLimiter(10, 1.0)
+    check_rate(limiter, rate_request("x" * 16384))
+    assert all(len(key) <= 24 for key in limiter._buckets)

@@ -22,10 +22,17 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import discovery
 from .cache import CutoutCache
 from .coords import CoordinateError, parse_dec, parse_ra
-from .discovery import DETECTORS, DiscoveryError, Exposure, is_valid_uri
+from .discovery import DETECTORS, MAX_URI_LENGTH, DiscoveryError, Exposure, is_valid_uri
 from .frames import FrameBuilder, FrameError
 from .grid import GRID_SHAPE
-from .ratelimit import FRAME_BURST, FRAME_PER_MINUTE, SEARCH_BURST, SEARCH_PER_MINUTE, RateLimiter
+from .ratelimit import (
+    FRAME_BURST,
+    FRAME_PER_MINUTE,
+    SEARCH_BURST,
+    SEARCH_PER_MINUTE,
+    RateLimiter,
+    client_key,
+)
 from .remote import HttpRangeReader, RangeReader
 from .visits import EXPOSURE_CAP, plan_frames
 
@@ -34,12 +41,14 @@ DEFAULT_CACHE_DIR = Path("/data/cutouts")
 CACHE_MAX_MB_ENV = "SPHEREX_CACHE_MAX_MB"
 DEFAULT_CACHE_MAX_MB = 1024
 
-MAX_URI_LENGTH = 300
 # astropy's angle parser takes time quadratic in input length (60,000 characters: ~19 s of CPU);
 # a precise sexagesimal value needs about 30.
 MAX_COORD_LENGTH = 64
 # A frame request with 24 URIs of 300 characters is about 8 kB.
 MAX_BODY_BYTES = 64 * 1024
+# A body of at most 64 kB arrives in well under a second; a client that stalls longer only
+# holds a connection and its buffer.
+BODY_READ_S = 10.0
 
 MAX_CONCURRENT_SEARCHES = 4
 # TAP answers took 2.7-32 s, so a queued search waits about one slow answer before giving up.
@@ -50,6 +59,7 @@ FRAME_WAIT_S = 15.0
 
 INVALID_REQUEST = "Invalid request."
 BODY_TOO_LARGE = "Request body too large."
+BODY_TIMEOUT = "Request body not received in time."
 SERVER_BUSY = "The server is busy. Try again in a moment."
 SEARCH_FAILED = "The archive search failed. Try again later."
 FRAME_FAILED = "No exposure of this frame could be loaded."
@@ -77,12 +87,15 @@ class BodyLimit:
     """ASGI middleware: answers 413 once a request body exceeds `max_bytes`, before the app runs.
 
     The body is read completely (at most `max_bytes`) and then handed to the app, so chunked
-    bodies without `Content-Length` are bounded too.
+    bodies without `Content-Length` are bounded too. A body not complete within `read_s`
+    seconds is answered with 408 and its bytes are dropped.
     """
 
-    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES) -> None:
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES,
+                 read_s: float = BODY_READ_S) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        self.read_s = read_s
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -90,23 +103,19 @@ class BodyLimit:
             return
         length = dict(scope["headers"]).get(b"content-length")
         if length is not None and (not length.isdigit() or int(length) > self.max_bytes):
-            await self._reject(send)
+            await self._reject(send, 413, BODY_TOO_LARGE)
             return
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            message = await receive()
-            if message["type"] != "http.request":
-                return
-            chunk = message.get("body", b"")
-            size += len(chunk)
-            if size > self.max_bytes:
-                await self._reject(send)
-                return
-            chunks.append(chunk)
-            if not message.get("more_body", False):
-                break
-        body = b"".join(chunks)
+        try:
+            async with asyncio.timeout(self.read_s):
+                body = await self._read_body(receive)
+        except TimeoutError:
+            await self._reject(send, 408, BODY_TIMEOUT)
+            return
+        if body is None:
+            return
+        if len(body) > self.max_bytes:
+            await self._reject(send, 413, BODY_TOO_LARGE)
+            return
         delivered = False
 
         async def replay() -> Message:
@@ -118,10 +127,24 @@ class BodyLimit:
 
         await self.app(scope, replay, send)
 
+    async def _read_body(self, receive: Receive) -> bytes | None:
+        """The whole body; None if the client disconnected; stops once over `max_bytes`."""
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return None
+            chunk = message.get("body", b"")
+            size += len(chunk)
+            chunks.append(chunk)
+            if size > self.max_bytes or not message.get("more_body", False):
+                return b"".join(chunks)
+
     @staticmethod
-    async def _reject(send: Send) -> None:
-        content = json.dumps({"detail": BODY_TOO_LARGE}).encode()
-        await send({"type": "http.response.start", "status": 413, "headers": [
+    async def _reject(send: Send, status: int, detail: str) -> None:
+        content = json.dumps({"detail": detail}).encode()
+        await send({"type": "http.response.start", "status": status, "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(content)).encode()),
             (b"connection", b"close"),
@@ -148,22 +171,34 @@ def cache_max_bytes() -> int:
 
 
 @asynccontextmanager
-async def slot(semaphore: asyncio.Semaphore, wait_s: float) -> AsyncIterator[None]:
-    """Hold one of `semaphore`'s slots; 503 if none frees within `wait_s` seconds."""
+async def slot(semaphore: asyncio.Semaphore, wait_s: float,
+               request: Request) -> AsyncIterator[None]:
+    """Hold one of `semaphore`'s slots; 503 if none frees within `wait_s` seconds.
+
+    A client that disconnected while waiting gets its slot back at once, without the work; the
+    503 raised then is never received.
+    """
     try:
         async with asyncio.timeout(wait_s):
             await semaphore.acquire()
     except TimeoutError:
         raise HTTPException(status_code=503, detail=SERVER_BUSY) from None
     try:
+        # Reading the (buffered) body first makes the next receive report the connection state.
+        await request.body()
+        if await request.is_disconnected():
+            raise HTTPException(status_code=503, detail=SERVER_BUSY)
         yield
     finally:
         semaphore.release()
 
 
 def check_rate(limiter: RateLimiter, request: Request) -> None:
-    """Raise 429 with `Retry-After` when the client's budget in `limiter` is used up."""
-    retry_after = limiter.take(request.client.host if request.client else "")
+    """Raise 429 with `Retry-After` when the client's budget in `limiter` is used up.
+
+    The budget is per `client_key` of the client address (IPv4 address, IPv6 /64).
+    """
+    retry_after = limiter.take(client_key(request.client.host if request.client else ""))
     if retry_after:
         raise HTTPException(status_code=429,
                             detail=f"Too many requests. Try again in {retry_after} s.",
@@ -217,7 +252,6 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
 
     @app.get("/api/search")
     async def search(request: Request, ra: str, dec: str, detector: str = "D2") -> dict:
-        check_rate(search_limiter, request)
         try:
             if len(ra) > MAX_COORD_LENGTH:
                 raise CoordinateError(INVALID_RA)
@@ -232,8 +266,9 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
             raise HTTPException(status_code=422, detail=INVALID_DEC) from None
         if detector not in DETECTORS:
             raise HTTPException(status_code=422, detail="Unknown detector; use one of D1–D6.")
+        check_rate(search_limiter, request)
         try:
-            async with slot(request.app.state.search_slots, SEARCH_WAIT_S):
+            async with slot(request.app.state.search_slots, SEARCH_WAIT_S, request):
                 exposures = await run_in_threadpool(request.app.state.discover,
                                                     ra_deg, dec_deg, detector)
         except DiscoveryError as exc:
@@ -266,7 +301,7 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
             raise HTTPException(status_code=422, detail="Invalid SPHEREx exposure URI.")
         uris = list(dict.fromkeys(body.uris))
         try:
-            async with slot(request.app.state.frame_slots, FRAME_WAIT_S):
+            async with slot(request.app.state.frame_slots, FRAME_WAIT_S, request):
                 result = await run_in_threadpool(request.app.state.builder.build,
                                                  uris, body.ra_deg, body.dec_deg)
         except FrameError as exc:
