@@ -1,0 +1,158 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { capNotice, computeStretch, nextIndex, toRGBA } from "../../src/spherex_viewer/static/lib.js";
+
+const SOURCE = 12;
+const BACKGROUND = [
+  0.01, -0.02, 0.03, 0.0, -0.01,
+  0.02, 0.05, -0.03, 0.01, 0.04,
+  -0.04, 0.02, 0.0, 0.03, -0.02,
+  0.01, -0.01, 0.02, -0.05, 0.0,
+  0.03, 0.0, -0.02, 0.01, 0.02,
+];
+
+function frameWithSource(amplitude) {
+  const frame = [...BACKGROUND];
+  frame[SOURCE] = amplitude;
+  return frame;
+}
+
+function greys(pixels, stretch) {
+  const rgba = toRGBA(pixels, stretch);
+  return Array.from({ length: pixels.length }, (_, i) => rgba[4 * i]);
+}
+
+function expectedGrey(v, { lo, hi, soft }) {
+  const t = Math.asinh((v - lo) / soft) / Math.asinh((hi - lo) / soft);
+  return Math.round(255 * Math.min(Math.max(t, 0), 1));
+}
+
+function assertClose(actual, expected, label) {
+  assert.ok(Math.abs(actual - expected) <= 1e-9 * Math.max(1, Math.abs(expected)),
+    `${label}: expected ${expected}, got ${actual}`);
+}
+
+function plan(frames, cap = 24) {
+  return {
+    ra_deg: 133.795129, dec_deg: -7.245147, detector: "D2", width: 59, height: 59,
+    n_exposures: frames.reduce((sum, f) => sum + f.n_available, 0),
+    cap,
+    capped: frames.some((f) => f.capped),
+    frames: frames.map((f, index) => ({
+      index, label: `2025-05-0${index + 1}`, mjd_start: 60801 + index, mjd_end: 60801.3 + index,
+      n_available: f.n_available, n_used: f.n_used, capped: f.capped,
+      uris: Array.from({ length: f.n_used }, (_, j) => `ibe/data/spherex/dr1/level2/x/${index}_${j}.fits`),
+    })),
+  };
+}
+
+test("one stretch for all frames: equal values give equal grey, the doubled source is brighter in frame B", () => {
+  const a = frameWithSource(3.0);
+  const b = frameWithSource(6.0);
+  const stretch = computeStretch([a, b]);
+  const greyA = greys(a, stretch);
+  const greyB = greys(b, stretch);
+
+  for (let i = 0; i < BACKGROUND.length; i++) {
+    if (i !== SOURCE) assert.equal(greyA[i], greyB[i], `pixel ${i}`);
+  }
+  assert.ok(greyB[SOURCE] > greyA[SOURCE], `B ${greyB[SOURCE]} should exceed A ${greyA[SOURCE]}`);
+
+  const perFrameA = greys(a, computeStretch([a]));
+  const perFrameB = greys(b, computeStretch([b]));
+  assert.equal(perFrameA[SOURCE], perFrameB[SOURCE]);
+});
+
+test("computeStretch follows section 5.12 on a hand-computed pool, ignoring nulls", () => {
+  // pool 0,1,2,3,4,5,100: med 3; |v-med| sorted 0,1,1,2,2,3,97 -> MAD 2; sigma 2.9652
+  // lo = 3 - 5.9304; hi = rank ceil(0.999*7) = 7 -> 100; soft = max(14.826, 102.9304/1000)
+  const stretch = computeStretch([[0, 1, 2, null], [null, 3, 4, 5, 100]]);
+  assertClose(stretch.lo, -2.9304, "lo");
+  assertClose(stretch.hi, 100, "hi");
+  assertClose(stretch.soft, 14.826, "soft");
+});
+
+test("computeStretch uses the nearest-rank 99.9th percentile for hi", () => {
+  // 1..1001: med 501, MAD 250, sigma 370.65; hi = rank ceil(999.999) = 1000
+  const pixels = Array.from({ length: 1001 }, (_, i) => i + 1);
+  const stretch = computeStretch([pixels]);
+  assertClose(stretch.lo, 501 - 2 * 370.65, "lo");
+  assertClose(stretch.hi, 1000, "hi");
+  assertClose(stretch.soft, 5 * 370.65, "soft");
+});
+
+test("toRGBA maps values with the asinh grey formula of section 5.12", () => {
+  const stretch = { lo: -2.9304, hi: 100, soft: 14.826 };
+  const values = [-10, -2.9304, 0, 2, 5, 50, 100, 250];
+  const actual = greys(values, stretch);
+  assert.deepEqual(actual, values.map((v) => expectedGrey(v, stretch)));
+  assert.equal(actual[0], 0);
+  assert.equal(actual[1], 0);
+  assert.equal(actual[6], 255);
+  assert.equal(actual[7], 255);
+});
+
+test("an empty pool gives the default stretch", () => {
+  assert.deepEqual(computeStretch([]), { lo: 0, hi: 1, soft: 1 });
+  assert.deepEqual(computeStretch([[null, null, null]]), { lo: 0, hi: 1, soft: 1 });
+});
+
+test("a constant frame gives a finite stretch and finite greys", () => {
+  const frame = new Array(3481).fill(0.25);
+  const stretch = computeStretch([frame]);
+  for (const key of ["lo", "hi", "soft"]) assert.ok(Number.isFinite(stretch[key]), key);
+  assert.ok(stretch.hi > stretch.lo);
+  assert.ok(stretch.soft > 0);
+  assertClose(stretch.lo, 0.25, "lo");
+  assertClose(stretch.hi, 1.25, "hi");
+  assertClose(stretch.soft, 0.001, "soft");
+  const rgba = toRGBA(frame, stretch);
+  assert.ok(rgba.every((x) => Number.isFinite(x)));
+  assert.equal(rgba[0], 0);
+  assert.equal(rgba[3], 255);
+});
+
+test("toRGBA returns 4 bytes per pixel, R=G=B with alpha 255, and 0,0,0,0 for null", () => {
+  const pixels = [0, null, 0.5, 1, null];
+  const rgba = toRGBA(pixels, { lo: 0, hi: 1, soft: 1 });
+  assert.ok(rgba instanceof Uint8ClampedArray);
+  assert.equal(rgba.length, 4 * pixels.length);
+  pixels.forEach((v, i) => {
+    const px = Array.from(rgba.slice(4 * i, 4 * i + 4));
+    if (v === null) {
+      assert.deepEqual(px, [0, 0, 0, 0], `pixel ${i}`);
+    } else {
+      assert.equal(px[0], px[1], `pixel ${i}`);
+      assert.equal(px[1], px[2], `pixel ${i}`);
+      assert.equal(px[3], 255, `pixel ${i}`);
+    }
+  });
+  assert.equal(rgba[0], 0);
+  assert.equal(rgba[12], 255);
+});
+
+test("capNotice names how many frames were capped and the cap", () => {
+  const capped = plan([
+    { n_available: 8, n_used: 8, capped: false },
+    { n_available: 300, n_used: 24, capped: true },
+    { n_available: 40, n_used: 24, capped: true },
+  ]);
+  assert.equal(capNotice(capped),
+    "Cap applied: 2 of 3 frames use 24 of their exposures, evenly sampled in time.");
+});
+
+test("capNotice is empty for a plan without a cap and for an empty plan", () => {
+  assert.equal(capNotice(plan([
+    { n_available: 8, n_used: 8, capped: false },
+    { n_available: 24, n_used: 24, capped: false },
+  ])), "");
+  assert.equal(capNotice(plan([])), "");
+});
+
+test("nextIndex advances and wraps to the first frame", () => {
+  assert.equal(nextIndex(0, 3), 1);
+  assert.equal(nextIndex(1, 3), 2);
+  assert.equal(nextIndex(2, 3), 0);
+  assert.equal(nextIndex(0, 1), 0);
+});
