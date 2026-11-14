@@ -389,9 +389,12 @@ def summary_line(target: Target, results: list[DetectorResult]) -> str:
                  + (" A static source at the expected position is an unrelated object, not the "
                     "target." if "static" in groups else ""))
     if target.variable:
-        varying = [d.detector for d in results if variability(d)[0] == "yes"]
+        status = {d.detector: variability(d)[0] for d in results}
         text += (" Aperture sums differ between frames by more than "
-                 f"{VARIABILITY_SIGMA:g}σ in: {detector_span(varying)} (see caveats).")
+                 f"{VARIABILITY_SIGMA:g}σ in: "
+                 f"{detector_span([k for k, v in status.items() if v == 'yes'])}; not measurable "
+                 "(fewer than two frames without no-data pixels in the aperture) in: "
+                 f"{detector_span([k for k, v in status.items() if v == 'n/a'])} (see caveats).")
     return text
 
 

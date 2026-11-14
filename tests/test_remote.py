@@ -260,6 +260,20 @@ def test_footprint_window_accepts_every_grid_orientation(target, rot_deg):
     assert x0 < px.min() and x1 > px.max() and y0 < py.min() and y1 > py.max()
 
 
+@pytest.mark.parametrize(("ra", "dec"), [(TARGET_RA - 64.0, TARGET_DEC + 58.0),
+                                         (TARGET_RA + 3.0, TARGET_DEC), (330.0, -20.0)])
+def test_far_target_is_refused_without_sky_to_pixel_transform(target, monkeypatch, ra, dec):
+    wcs = exposure_wcs((TARGET_RA, TARGET_DEC), n=2040, rot_deg=37.0, sip=True)
+    calls = []
+    inverse = wcs.all_world2pix
+    monkeypatch.setattr(wcs, "all_world2pix", lambda *a, **k: calls.append(1) or inverse(*a, **k))
+    assert remote.footprint_window(wcs, (2040, 2040), target, TARGET_SHAPE) is not None
+    assert calls == [1]
+    assert remote.footprint_window(wcs, (2040, 2040), spec_target_wcs(ra, dec),
+                                   TARGET_SHAPE) is None
+    assert calls == [1]
+
+
 def test_footprint_window_refuses_a_diverged_inversion(target, monkeypatch):
     wcs = exposure_wcs((TARGET_RA, TARGET_DEC), n=2040, rot_deg=0.0, sip=True)
     assert remote.footprint_window(wcs, (2040, 2040), target, TARGET_SHAPE) is not None
