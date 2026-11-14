@@ -504,7 +504,8 @@ def method_section() -> list[str]:
         "1.4826 × MAD scatter of the same aperture placed on a 7-px grid of empty-sky positions "
         "(r > 10) of the same frame. A frame with a no-data pixel in the aperture is "
         "\"incomplete\" (the sum would be a lower bound). Variability: max − min over complete "
-        f"frames divided by the combined σ of those two frames, \"yes\" if > {VARIABILITY_SIGMA:g}.",
+        "frames divided by the combined σ of those two frames, \"yes\" if > "
+        f"{VARIABILITY_SIGMA:g}.",
         "- **Position fit** (moving targets, frames not \"not detected\"): `Moffat2D + Const2D` "
         f"fitted with `LevMarLSQFitter` to finite pixels with r ≤ {FIT_RADIUS_PX:g}; rejected "
         "unless amplitude > 0, 0.5 < FWHM < 10 px and the centre lies within that radius. With a "

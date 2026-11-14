@@ -379,19 +379,50 @@ test("a single frame from a single exposure is reported in the singular", { time
     assertCleanRun(log);
   });
 
-test("the date label shows the selected frame's label", { timeout: TIMEOUT }, async () => {
-  const plan = makePlan(THREE_FRAMES);
+test("the date label shows the selected frame's date and the exposures it was built from",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    // Frame 1 was planned with 19 exposures, but only one contributed.
+    const used = [8, 1, 15];
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n) => frameBody(pixels(n), used[n]),
+    });
+    await submit(page);
+    assert.equal(await finalStatus(page), "3 frames from 24 of 42 exposures.");
+    const expected = [
+      "2025-05-06 \u00b7 8 exposures",
+      "2025-11-07 \u2013 2025-11-10 \u00b7 1 exposure",
+      "2026-04-20 \u00b7 15 exposures",
+    ];
+    const { min, value } = await sliderState(page);
+    assert.equal(await dateText(page), expected[value - min]);
+    for (const n of [2, 0, 1]) {
+      await selectFrame(page, min + n);
+      assert.equal(await dateText(page), expected[n]);
+    }
+    assertCleanRun(log);
+  });
+
+test("the longest date label fits on a phone-width screen", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan([{ label: "2025-11-07 \u2013 2025-11-10", n_available: 19, n_used: 19 }]);
   const { page, log } = await openPage({
     search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
   });
+  await page.setViewportSize({ width: 320, height: 800 });
   await submit(page);
   await finalStatus(page);
-  const { min, value } = await sliderState(page);
-  assert.equal(await dateText(page), plan.frames[value - min].label);
-  for (const n of [2, 0, 1]) {
-    await selectFrame(page, min + n);
-    assert.equal(await dateText(page), plan.frames[n].label);
-  }
+  assert.equal(await dateText(page), "2025-11-07 \u2013 2025-11-10 \u00b7 19 exposures");
+  const fit = await page.evaluate(() => {
+    const date = document.querySelector("#date").getBoundingClientRect();
+    return {
+      right: date.right,
+      viewport: document.documentElement.clientWidth,
+      scroll: document.documentElement.scrollWidth,
+    };
+  });
+  assert.ok(fit.right <= fit.viewport, `date ends at ${fit.right} of ${fit.viewport}`);
+  assert.ok(fit.scroll <= fit.viewport, `page scrolls to ${fit.scroll} of ${fit.viewport}`);
   assertCleanRun(log);
 });
 
@@ -454,7 +485,7 @@ test("one failing frame is reported with its reason and loading continues",
     assert.equal(disabled, false);
     assert.equal(max - min + 1, 2);
     await selectFrame(page, max);
-    assert.equal(await dateText(page), plan.frames[2].label);
+    assert.equal(await dateText(page), "2026-04-20 \u00b7 15 exposures");
     assertCleanRun(log);
   });
 
@@ -630,7 +661,8 @@ test("play toggles looping playback through the loaded frames", { timeout: TIMEO
       value: Number(document.querySelector("#slider").value),
       label: document.querySelector("#date").textContent.trim(),
     }));
-    assert.equal(label, plan.frames[value - min].label);
+    const { label: date, n_used: n } = plan.frames[value - min];
+    assert.equal(label, `${date} \u00b7 ${n} exposures`);
     if (seen.at(-1) !== value) seen.push(value);
     await page.waitForTimeout(100);
   }

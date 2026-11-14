@@ -1,4 +1,4 @@
-"""Tests of masking, background, reprojection and combine (DESIGN.md 5.4-5.8; rows 18-22)."""
+"""Tests of flag checks, masking, background, reprojection and combine."""
 
 import io
 import warnings
@@ -9,8 +9,8 @@ from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
 
 from spherex_viewer import cutout
-from spherex_viewer.remote import Window
-from synthetic import fit_centroid, make_exposure
+from spherex_viewer.cutout import UnsupportedLayoutError, Window
+from synthetic import FLAG_NAMES, fit_centroid, make_exposure
 
 TARGET_RA, TARGET_DEC = 150.0, 20.0
 TARGET_SHAPE = (59, 59)
@@ -18,6 +18,7 @@ STAR_PIXEL = (40.3, 21.7)
 N = 300
 SOURCE, HOT = 21, 10
 
+# Supplement Table 16 and the Mosaic Tool's masked set (Supplement 3.4.3).
 SPEC_FLAG_BITS = {
     "TRANSIENT": 0, "OVERFLOW": 1, "SUR_ERROR": 2, "NONFUNC": 6, "DICHROIC": 7, "MISSING_DATA": 9,
     "HOT": 10, "COLD": 11, "FULLSAMPLE": 12, "PHANMISS": 14, "NONLINEAR": 15, "PERSIST": 17,
@@ -25,6 +26,7 @@ SPEC_FLAG_BITS = {
     "STREAK": 25, "BLOOM": 26, "SNOWBALL": 27, "HALO": 28, "SATELLITE_HALO": 29,
 }
 SPEC_BAD_BITS = [0, 2, 6, 7, 9, 10, 11, 14, 15, 17, 20, 22, 23, 24, 25, 26, 27, 28, 29]
+UNKNOWN_BIT = 30
 
 
 def spec_target_wcs(ra: float, dec: float) -> WCS:
@@ -82,24 +84,37 @@ def detector_pixel_of(wcs: WCS, grid_x: float, grid_y: float) -> tuple[int, int]
     return int(round(float(x))), int(round(float(y)))
 
 
-# Flag constants (5.4, 5.5)
-
-def test_flag_bits_match_specification():
-    assert cutout.FLAG_BITS == SPEC_FLAG_BITS
-
-
-def test_bad_flags_match_mosaic_tool_set():
-    assert cutout.BAD_FLAGS == sum(1 << b for b in SPEC_BAD_BITS) == 0x3FD2CEC5
-    for name in ("OVERFLOW", "SOURCE", "OUTLIER", "FULLSAMPLE"):
-        assert not cutout.BAD_FLAGS & (1 << SPEC_FLAG_BITS[name])
+def flags_header(names: dict[int, str]) -> fits.Header:
+    header = fits.Header()
+    for bit, name in names.items():
+        header[f"MSKN{bit:04d}"] = name
+        header[f"MSKM{bit:04d}"] = 1 << bit
+    return header
 
 
-def test_background_exclude_flags():
-    extra = sum(1 << SPEC_FLAG_BITS[name] for name in ("OVERFLOW", "OUTLIER", "SOURCE"))
-    assert cutout.BACKGROUND_EXCLUDE_FLAGS == cutout.BAD_FLAGS | extra == 0x3FFACEC7
+def test_flag_definitions_of_the_supplement_are_accepted():
+    cutout.check_flag_definitions(flags_header({b: n for n, b in SPEC_FLAG_BITS.items()}))
+    cutout.check_flag_definitions(flags_header(FLAG_NAMES))
 
 
-# Row 18
+def test_additional_unknown_flag_bit_is_accepted():
+    names = {b: n for n, b in SPEC_FLAG_BITS.items()} | {UNKNOWN_BIT: "NEWFLAG", 31: "OTHER"}
+    cutout.check_flag_definitions(flags_header(names))
+
+
+@pytest.mark.parametrize("change", [
+    {10: "HOTPIX"},
+    {10: "COLD", 11: "HOT"},
+    {UNKNOWN_BIT: "SOURCE"},
+    {21: "NEWFLAG"},
+])
+def test_renamed_or_renumbered_known_flag_is_rejected(change):
+    names = {b: n for n, b in SPEC_FLAG_BITS.items()}
+    if UNKNOWN_BIT in change:
+        del names[SPEC_FLAG_BITS[change[UNKNOWN_BIT]]]
+    with pytest.raises(UnsupportedLayoutError):
+        cutout.check_flag_definitions(flags_header(names | change))
+
 
 @pytest.fixture(scope="module")
 def plain_exposure() -> tuple[np.ndarray, np.ndarray, fits.Header]:
@@ -133,6 +148,27 @@ def test_background_nan_without_usable_pixel(plain_exposure):
                                                np.zeros((20, 20), np.int32)))
 
 
+def test_background_is_sigma_clipped():
+    rng = np.random.default_rng(7)
+    image = rng.normal(0.25, 0.1, (N, N)).astype(np.float32)
+    outliers = rng.random((N, N)) < 0.1
+    image[outliers] += 3.0
+    assert np.median(image) > 0.25 + 0.01
+    background = cutout.estimate_background(image, np.zeros((N, N), np.int32))
+    assert background == pytest.approx(0.25, abs=0.003)
+
+
+@pytest.mark.parametrize("bit", list(SPEC_FLAG_BITS.values()) + [UNKNOWN_BIT])
+def test_align_masks_exactly_the_bad_bits(plain_exposure, bit):
+    image, flags, header = plain_exposure
+    wcs = make_wcs(header)
+    flags = flags.copy()
+    x, y = detector_pixel_of(wcs, 15.0, 15.0)
+    flags[y, x] = 1 << bit
+    out = cutout.align(window_for(image, flags, wcs), TARGET, TARGET_SHAPE)
+    assert np.isnan(out).any() == (bit in SPEC_BAD_BITS)
+
+
 def test_align_without_background_is_all_nan(plain_exposure):
     image, flags, header = plain_exposure
     window = window_for(image, np.full(flags.shape, 1 << HOT, np.int32), make_wcs(header))
@@ -140,8 +176,6 @@ def test_align_without_background_is_all_nan(plain_exposure):
     assert out.shape == TARGET_SHAPE
     assert np.isnan(out).all()
 
-
-# Row 19
 
 HOT_GRID_PIXEL = (15.0, 44.0)
 
@@ -177,8 +211,6 @@ def test_unflagged_hot_pixel_is_kept(hot_exposure):
     assert not np.isnan(out).any()
     assert np.nanmax(out) > 100
 
-
-# Rows 20, 21
 
 ALIGN_CASES = [
     (37.0, (0.01, 0.02)),
@@ -224,8 +256,6 @@ def test_sip_is_honoured():
     moved = np.hypot(without_sip[0] - with_sip[0], without_sip[1] - with_sip[1])
     assert moved > 0.5 * predicted_shift
 
-
-# Row 22
 
 @pytest.fixture
 def stack() -> list[np.ndarray]:

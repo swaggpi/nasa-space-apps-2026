@@ -1,6 +1,8 @@
 // Page logic for the SPHEREx viewer: search, progressive frame loading and playback.
 
-import { capNotice, computeStretch, joinStatus, nextIndex, plural, toRGBA } from "./lib.js";
+import {
+  capNotice, computeStretch, frameLabel, joinStatus, nextIndex, plural, toRGBA,
+} from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
 const UNREACHABLE = "the server could not be reached";
@@ -110,7 +112,7 @@ async function loadFrames(plan, signal) {
       pixels: result.pixels,
       width: result.width,
       height: result.height,
-      label: planned.label,
+      label: frameLabel(planned.label, result.n_used),
     });
     used += result.n_used;
     stretch = computeStretch(frames.map((f) => f.pixels));

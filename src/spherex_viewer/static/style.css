@@ -159,6 +159,7 @@ input:disabled {
 
   #date {
     grid-column: 1 / -1;
+    white-space: normal;
     text-align: left;
   }
 }

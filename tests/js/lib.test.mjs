@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  capNotice, computeStretch, joinStatus, nextIndex, plural, toRGBA,
+  capNotice, computeStretch, frameLabel, joinStatus, nextIndex, plural, toRGBA,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -155,6 +155,12 @@ test("joinStatus joins non-empty parts with single spaces and no trailing space"
   assert.equal(joinStatus("Loading frame 1 of 2\u2026", ""), "Loading frame 1 of 2\u2026");
   assert.equal(joinStatus("a.", "", "b.", ""), "a. b.");
   assert.equal(joinStatus("", ""), "");
+});
+
+test("frameLabel adds the exposure count after a middle dot with a space on each side", () => {
+  assert.equal(frameLabel("2025-11-07 \u2013 2025-11-10", 19),
+    "2025-11-07 \u2013 2025-11-10 \u00b7 19 exposures");
+  assert.equal(frameLabel("2026-09-22", 1), "2026-09-22 \u00b7 1 exposure");
 });
 
 test("nextIndex advances and wraps to the first frame", () => {

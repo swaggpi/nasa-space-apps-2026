@@ -121,6 +121,16 @@ def rewrite_flags(blob: bytes, *, tile_shape: tuple[int, int] | None = None,
     return buf.getvalue()
 
 
+def corrupt_flags_heap(blob: bytes) -> bytes:
+    """Return ``blob`` with every byte of the FLAGS heap set to 0xFF (undecodable RICE data)."""
+    with fits.open(io.BytesIO(blob), disable_image_compression=True) as hdul:
+        info = hdul.fileinfo(2)
+        header = hdul[2].header
+        heap = info["datLoc"] + header["NAXIS1"] * header["NAXIS2"]
+    end = info["datLoc"] + info["datSpan"]
+    return blob[:heap] + b"\xff" * (end - heap) + blob[end:]
+
+
 def fit_centroid(image: np.ndarray, x: float, y: float, half: int = 3) -> tuple[float, float]:
     """Gaussian2D + constant fit to the finite pixels of a box around (x, y); returns (x, y)."""
     xc, yc = int(round(float(x))), int(round(float(y)))

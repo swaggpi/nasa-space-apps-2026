@@ -1,5 +1,5 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
-// status texts and playback index. No DOM access; imported by app.js and by Node tests.
+// status and date texts and playback index. No DOM access; imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -74,6 +74,17 @@ export function plural(count, noun) {
  */
 export function joinStatus(...parts) {
   return parts.filter((part) => part !== "").join(" ");
+}
+
+/**
+ * Date-label text for a loaded frame: its date range and the exposures it was built from,
+ * e.g. "2026-09-22 \u00b7 1 exposure".
+ * @param {string} label the frame's date range
+ * @param {number} nUsed exposures that contributed, from the frame response
+ * @returns {string}
+ */
+export function frameLabel(label, nUsed) {
+  return `${label} \u00b7 ${plural(nUsed, "exposure")}`;
 }
 
 /**

@@ -13,7 +13,14 @@ from astropy.wcs import WCS, FITSFixedWarning
 from spherex_viewer import remote
 from spherex_viewer.cutout import UnsupportedLayoutError
 from spherex_viewer.remote import RemoteReadError
-from synthetic import FLAG_NAMES, FakeRangeReader, exposure_wcs, make_exposure, rewrite_flags
+from synthetic import (
+    FLAG_NAMES,
+    FakeRangeReader,
+    corrupt_flags_heap,
+    exposure_wcs,
+    make_exposure,
+    rewrite_flags,
+)
 
 URL = "https://example.invalid/exposure.fits"
 TARGET_RA, TARGET_DEC = 150.0, 20.0
@@ -219,6 +226,22 @@ def test_far_target_reads_only_the_headers(exposure, ra, dec):
     assert [call[1:] for call in calls] == [(0, HEAD_READ)]
 
 
+def header_only_exposure(n: int, rot_deg: float) -> bytes:
+    """Primary and IMAGE headers of an n x n SIP exposure centred on the target, no data."""
+    header = fits.Header([("XTENSION", "IMAGE"), ("BITPIX", -32), ("NAXIS", 2), ("NAXIS1", n),
+                          ("NAXIS2", n), ("PCOUNT", 0), ("GCOUNT", 1), ("EXTNAME", "IMAGE")])
+    header.extend(exposure_wcs((TARGET_RA, TARGET_DEC), n=n, rot_deg=rot_deg,
+                               sip=True).to_header(relax=True))
+    return (fits.PrimaryHDU().header.tostring() + header.tostring()).encode("ascii")
+
+
+def test_far_target_on_full_size_detector_reads_only_the_headers():
+    blob = header_only_exposure(2040, 37.0)
+    window, calls = window_reads(blob, spec_target_wcs(TARGET_RA - 64.0, TARGET_DEC + 58.0))
+    assert window is None
+    assert sum(stop - start for _, start, stop in calls) <= HEAD_READ
+
+
 def test_target_just_off_the_detector_edge_returns_none(exposure):
     _, _, wcs = full_read(exposure)
     ra, dec = wcs.all_pix2world(N + 60.0, N / 2, 0)
@@ -268,14 +291,6 @@ def test_additional_flag_bit_is_accepted(exposure, target):
     np.testing.assert_array_equal(window.flags, expected.flags)
 
 
-def corrupt_heap(blob: bytes) -> bytes:
-    info = hdu_spans(blob)[2]
-    header = raw_header(blob, info)
-    heap = info["datLoc"] + header["NAXIS1"] * header["NAXIS2"]
-    end = info["datLoc"] + info["datSpan"]
-    return blob[:heap] + b"\xff" * (end - heap) + blob[end:]
-
-
 def truncate_in_image(blob: bytes) -> bytes:
     return blob[:hdu_spans(blob)[1]["datLoc"] + 1000]
 
@@ -286,7 +301,7 @@ def truncate_in_heap(blob: bytes) -> bytes:
 
 
 MALFORMED = {
-    "corrupted FLAGS heap": corrupt_heap,
+    "corrupted FLAGS heap": corrupt_flags_heap,
     "IMAGE without NAXIS1": lambda b: replace_card(b, 1, "NAXIS1", "COMMENT"),
     "primary without BITPIX": lambda b: replace_card(b, 0, "BITPIX", "COMMENT"),
     "primary NAXIS is text": lambda b: replace_card(b, 0, "NAXIS", "NAXIS   = 'two'"),
