@@ -8,7 +8,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { computeStretch, toRGBA } from "../../src/spherex_viewer/static/lib.js";
+import {
+  computeStretch, difference, toDifferenceRGBA, toRGBA,
+} from "../../src/spherex_viewer/static/lib.js";
 
 const { chromium } = createRequire(import.meta.url)("playwright");
 
@@ -29,15 +31,14 @@ const BODY = [
   "aside>p#position",
   "aside>p#hint",
   "aside>label#marker-control", "label>input#show-marker",
+  "aside>label#difference-control", "label>input#difference",
   "aside>button#pick",
-  "aside>details#enter", "details>summary",
-  "details>form#search",
+  "aside>form#search",
   "form>label", "label>input#ra",
   "form>label", "label>input#dec",
-  "form>button#submit",
-  "aside>details#advanced", "details>summary",
-  "details>label", "label>select#detector",
+  "form>label", "label>select#detector",
   ...Array(6).fill("select>option"),
+  "form>button#submit",
   "aside>p#status",
   "body>footer#ack",
 ];
@@ -59,6 +60,11 @@ const MAP_HINT = "Click the map to select a position.";
 const MAP_FAILED = "The sky map could not be loaded; enter coordinates to search.";
 // The server's grid (src/spherex_viewer/grid.py): 59 pixels of 6.15 arcseconds per side.
 const FIELD_ARCSEC = 59 * 6.15;
+const IMAGE_LABEL = "SPHEREx image of the selected frame, north up, east left";
+const DIFFERENCE_LABEL =
+  "Difference between the selected frame and the other frames, north up, east left";
+const INVALID_RA =
+  "Invalid RA: use degrees from 0 to 360 or sexagesimal hours such as 08h55m10.831s.";
 
 let server;
 let cacheDir;
@@ -151,6 +157,8 @@ const EXAMPLE_LABELS = [
   "2026-04-27 \u2013 2026-04-30 \u00b7 7 exposures",
 ];
 const EXAMPLE_FAILED = "The example could not be loaded; enter coordinates to search.";
+const NO_DATA = "Blue-grey pixels have no usable data.";
+const UNEXPECTED = "the server sent an unexpected answer";
 
 function starPixels(marker, seed) {
   const cx = Math.round(marker.x);
@@ -183,6 +191,26 @@ function exampleRGBA(n) {
   return Array.from(toRGBA(EXAMPLE.frames[n].pixels, stretch));
 }
 
+const MUTED = "rgb(156, 163, 175)"; // --muted, #9ca3af
+
+/** Text colour and cursor of the Difference label, which must look inactive while disabled. */
+function differenceLook(page) {
+  return page.$eval("#difference-control", (el) => {
+    const style = getComputedStyle(el);
+    return [style.color, style.cursor];
+  });
+}
+
+/** RGBA bytes of frame n drawn as its difference from the others, on their common stretch. */
+function differenceRGBA(frames, n) {
+  const stretch = computeStretch(frames.map((f) => f.pixels));
+  return Array.from(toDifferenceRGBA(difference(frames, n), stretch));
+}
+
+const EXAMPLE_FRAMES = EXAMPLE.frames.map((f) => ({
+  pixels: f.pixels, width: SIZE, height: SIZE, nUsed: f.n_used,
+}));
+
 const exampleOk = () => ({ status: 200, body: EXAMPLE });
 
 /**
@@ -196,25 +224,31 @@ function skyOk(url) {
 }
 
 /**
- * Opens the page with `example.json`, `api/search`, `api/frame` and the sky survey stubbed.
- * `example()`, `search(url)`, `frame(n)` and `sky(url)` return {status, body} (body
- * JSON-encoded unless `raw` or `jpeg` is given) or {abort: true}; any other foreign request
- * is aborted and logged. `aladin` false fails the request for the map script. Unless `wait`
- * is false, returns once the example is shown or its failure is reported.
+ * Opens the page at `query` with `example.json`, `api/search`, `api/frame` and the sky survey
+ * stubbed. `example()`, `search(url)`, `frame(n, body)` (n counts frame requests, body is the
+ * parsed request) and `sky(url)` return {status, body, headers} (body JSON-encoded unless
+ * `raw` or `jpeg` is given, headers optional) or {abort: true}; `search: null` sends searches
+ * to the real server; any other foreign request is aborted and logged. `aladin` false fails
+ * the request for the map script. Unless `wait` is false, returns once a frame, the example's
+ * failure or a status is shown.
  */
 async function openPage({
   search = unusedSearch, frame = () => ({ status: 200, body: {} }), example = exampleOk,
-  sky = skyOk, aladin = true, wait = true,
+  sky = skyOk, aladin = true, wait = true, query = "",
 }) {
   const origin = new URL(baseUrl).origin;
   const log = {
     requests: [], foreign: [], sky: [], scripts: [], searches: [], frames: [], unexpectedApi: [],
-    errors: [], examples: [], inFlight: 0, maxInFlight: 0,
+    errors: [], examples: [], frameTimes: [], inFlight: 0, maxInFlight: 0,
   };
   const page = await context.newPage();
   page.on("request", (request) => log.requests.push(request.url()));
   page.on("pageerror", (error) => log.errors.push(String(error)));
-  const reply = (route, { status, body, raw, jpeg, abort }) => {
+  page.on("dialog", (dialog) => {
+    log.errors.push(`dialog: ${dialog.message()}`);
+    dialog.dismiss();
+  });
+  const reply = (route, { status, body, raw, jpeg, abort, headers }) => {
     if (abort) return route.abort("connectionfailed");
     if (jpeg !== undefined) {
       return route.fulfill({
@@ -226,7 +260,7 @@ async function openPage({
       status,
       contentType: raw === undefined ? "application/json" : "text/plain",
       body: raw ?? JSON.stringify(body),
-      headers: { "Access-Control-Allow-Origin": "*" },
+      headers: { "Access-Control-Allow-Origin": "*", ...headers },
     });
   };
   await page.route(() => true, async (route) => {
@@ -247,16 +281,21 @@ async function openPage({
     }
     if (url.pathname === "/api/search" && request.method() === "GET") {
       log.searches.push(url);
+      if (search === null) return route.continue();
       return reply(route, await search(url));
     }
     if (url.pathname === "/api/frame" && request.method() === "POST") {
       const n = log.frames.length;
-      log.frames.push(JSON.parse(request.postData()));
+      const payload = JSON.parse(request.postData());
+      log.frames.push(payload);
+      const times = { sent: Date.now(), answered: null };
+      log.frameTimes.push(times);
       log.inFlight += 1;
       log.maxInFlight = Math.max(log.maxInFlight, log.inFlight);
       try {
-        return await reply(route, await frame(n));
+        return await reply(route, await frame(n, payload));
       } finally {
+        times.answered = Date.now();
         log.inFlight -= 1;
       }
     }
@@ -270,7 +309,7 @@ async function openPage({
     }
     return route.continue();
   });
-  await page.goto(baseUrl);
+  await page.goto(new URL(query, baseUrl).href);
   if (wait) {
     await page.waitForFunction(() => document.querySelector("#date").textContent !== ""
       || document.querySelector("#status").textContent !== "");
@@ -286,16 +325,19 @@ function frameOk(plan) {
   return (n) => frameBody(pixels(n), plan.frames[n].n_used);
 }
 
-/** Opens a disclosure through its summary, as a visitor would, unless it is open already. */
-async function openDisclosure(page, id) {
-  if (!(await page.$eval(`#${id}`, (el) => el.open))) await page.click(`#${id} > summary`);
+/** Index in `plan` of the frame a request asks for. */
+function planIndex(plan, payload) {
+  return plan.frames.findIndex((f) => f.uris.join() === payload.uris.join());
+}
+
+/** Indices in `plan` of every frame request, in the order sent. */
+function requestedFrames(plan, log) {
+  return log.frames.map((payload) => planIndex(plan, payload));
 }
 
 async function submit(page, { ra = RA, dec = DEC, detector = "D2" } = {}) {
-  await openDisclosure(page, "enter");
   await page.fill("#ra", ra);
   await page.fill("#dec", dec);
-  await openDisclosure(page, "advanced");
   await page.selectOption("#detector", detector);
   await page.click("#submit");
 }
@@ -315,10 +357,27 @@ async function waitForStatus(page, predicate) {
   throw new Error(`status never matched; last value: ${JSON.stringify(text)}`);
 }
 
-const finished = (text) => !text.startsWith("Searching") && !text.startsWith("Loading");
+const finished = (text) => !text.startsWith("Searching") && !text.startsWith("Loading")
+  && !text.startsWith("Waiting");
 
 async function finalStatus(page) {
   return waitForStatus(page, (text) => text !== "" && finished(text));
+}
+
+/** Starts recording every text the status line is given; read them with `statusHistory`. */
+async function recordStatuses(page) {
+  await page.evaluate(() => {
+    window.statusHistory = [];
+    new MutationObserver((records) => {
+      for (const r of records) window.statusHistory.push(r.addedNodes[0]?.textContent ?? "");
+    }).observe(document.querySelector("#status"), { childList: true });
+  });
+}
+
+/** Recorded status texts, consecutive repeats merged. */
+async function statusHistory(page) {
+  const all = await page.evaluate(() => window.statusHistory);
+  return all.filter((t, i) => t !== all[i - 1]);
 }
 
 async function sliderState(page) {
@@ -439,22 +498,31 @@ afterEach(async () => {
 
 const unusedSearch = () => ({ status: 500, body: { detail: "unused" } });
 
+/** Every element of the body as parent>tag#id, in document order. */
+function bodyElements(page) {
+  return page.$$eval("body *", (els) => els.map((el) => {
+    const id = el.id ? `#${el.id}` : "";
+    return `${el.parentElement.tagName.toLowerCase()}>${el.tagName.toLowerCase()}${id}`;
+  }));
+}
+
 test("the body holds exactly the agreed elements, in order, and nothing else", { timeout: TIMEOUT },
   async () => {
     const { page, log } = await openPage({});
-    const body = await page.$$eval("body *", (els) => els.map((el) => {
-      const id = el.id ? `#${el.id}` : "";
-      return `${el.parentElement.tagName.toLowerCase()}>${el.tagName.toLowerCase()}${id}`;
-    }));
-    assert.deepEqual(body, BODY);
+    assert.deepEqual(await bodyElements(page), BODY);
 
     // A label's text includes its control's; the detector label also lists the options.
     const labels = await page.$$eval("label",
       (els) => els.map((el) => el.textContent.replace(/\s+/g, " ").trim()));
-    assert.deepEqual(labels,
-      ["Show target marker", "RA", "Dec", "Detector D1 D2 D3 D4 D5 D6"]);
-    assert.deepEqual(await page.$$eval("summary", (els) => els.map((el) => el.textContent)),
-      ["Enter coordinates", "Advanced settings"]);
+    assert.deepEqual(labels, [
+      "Show target marker",
+      "Difference from the other frames (white: brighter, black: fainter)",
+      "RA", "Dec", "Detector D1 · 0.75–1.1 µm "
+        + "D2 · 1.1–1.6 µm D3 · 1.6–2.4 µm "
+        + "D4 · 2.4–3.8 µm D5 · 3.8–4.4 µm "
+        + "D6 · 4.4–5.0 µm",
+    ]);
+    assert.deepEqual(await page.$$("summary, details"), []);
     assert.deepEqual(await page.$$eval("button", (els) => els.map((el) => [
       el.id, el.textContent.trim(), el.getAttribute("aria-label")])), [
       ["prev", "\u2039", "Previous frame"],
@@ -473,6 +541,7 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
     assert.equal(await page.getAttribute("#ra", "type"), "text");
     assert.equal(await page.getAttribute("#dec", "type"), "text");
     assert.equal(await page.getAttribute("#show-marker", "type"), "checkbox");
+    assert.equal(await page.getAttribute("#difference", "type"), "checkbox");
     assert.equal(await page.getAttribute("#slider", "type"), "range");
     assert.ok((await page.getAttribute("#slider", "aria-label")).length > 0);
     assert.equal(await page.getAttribute("#status", "aria-live"), "polite");
@@ -488,26 +557,41 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
     assertCleanRun(log);
   });
 
-test("the detector selector sits inside the closed Advanced settings disclosure",
+test("the search controls are all visible on a fresh load without a click, in panel order",
   { timeout: TIMEOUT }, async () => {
     const { page, log } = await openPage({});
-    assert.equal(await page.$eval("#detector", (el) => el.closest("details")?.id), "advanced");
-    assert.equal(await page.$eval("#advanced", (el) => el.open), false);
-    assert.equal(await page.isVisible("#detector"), false);
-    assert.equal(await page.isVisible("#advanced > summary"), true);
-    await page.click("#advanced > summary");
-    assert.equal(await page.isVisible("#detector"), true);
+    const order = ["#name", "#position", "#hint", "#difference-control", "#pick", "#ra", "#dec",
+      "#detector", "#submit", "#status"];
+    for (const id of order.slice(3, 9)) assert.equal(await page.isVisible(id), true, id);
+    const tops = await page.$$eval(order.join(", "),
+      (els) => els.map((el) => [`#${el.id}`, el.getBoundingClientRect().top]));
+    assert.deepEqual(tops.map(([id]) => id), order);
+    for (let i = 1; i < tops.length; i++) {
+      assert.ok(tops[i][1] > tops[i - 1][1], `${tops[i][0]} not below ${tops[i - 1][0]}`);
+    }
+    assert.equal(await page.$eval("#detector", (el) => el.form?.id), "search");
+    assert.notEqual(await page.evaluate(() => document.activeElement?.id), "ra");
     assertCleanRun(log);
   });
 
-test("Enter coordinates is visible on load and reveals the RA/Dec search with RA focused",
+test("typing RA and Dec, choosing a detector and pressing Enter searches with no other click",
   { timeout: TIMEOUT }, async () => {
-    const { page, log } = await openPage({});
-    assert.equal(await page.isVisible("#enter > summary"), true);
-    for (const id of ["#ra", "#dec", "#submit"]) assert.equal(await page.isVisible(id), false, id);
-    await page.click("#enter > summary");
-    for (const id of ["#ra", "#dec", "#submit"]) assert.equal(await page.isVisible(id), true, id);
-    await page.waitForFunction(() => document.activeElement?.id === "ra");
+    const plan = makePlan(THREE_FRAMES, { detector: "D4" });
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+    });
+    await page.click("#ra");
+    await page.keyboard.type(RA);
+    await page.click("#dec");
+    await page.keyboard.type(DEC);
+    await page.selectOption("#detector", "D4");
+    await page.focus("#dec");
+    await page.keyboard.press("Enter");
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    const params = log.searches[0].searchParams;
+    assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
+      [RA, DEC, "D4"]);
+    assert.equal(await page.evaluate(() => location.search), `?ra=${RA}&dec=${DEC}&detector=D4`);
     assertCleanRun(log);
   });
 
@@ -683,9 +767,11 @@ for (const [name, reply] of [
       }
       assert.equal(await text(page, "#name"), "");
       assert.equal(await page.isVisible("#marker-control"), false);
-      assert.equal(await page.isVisible("#enter > summary"), true);
+      for (const id of ["#ra", "#dec", "#detector", "#submit"]) {
+        assert.equal(await page.isVisible(id), true, id);
+      }
       await submit(page);
-      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
       assert.equal(await page.isDisabled("#play"), false);
       assert.equal(log.examples.length, 1);
       assertCleanRun(log);
@@ -742,12 +828,12 @@ test("a search started before the example has loaded wins over the late example"
     try {
       await page.waitForFunction(() => document.querySelector("#search") !== null);
       await submit(page);
-      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
       gate.release();
       await page.waitForTimeout(500);
       assert.equal(await text(page, "#name"), `RA ${RA}, Dec ${DEC}`);
       assert.equal(await dateText(page), "2025-05-06 \u00b7 8 exposures");
-      assert.equal(await statusText(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await statusText(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
       assertCleanRun(log);
     } finally {
       gate.release();
@@ -773,7 +859,7 @@ test("at 1366x768 the image and all player controls fit in the initial view, pan
   { timeout: TIMEOUT }, async () => {
     const { page, log } = await openPage({});
     await page.setViewportSize({ width: 1366, height: 768 });
-    const { rects, width, height } = await layout(page, [...PLAYER, "#panel", "#enter"]);
+    const { rects, width, height } = await layout(page, [...PLAYER, "#panel", "#submit"]);
     for (const s of PLAYER) {
       const r = rects[s];
       assert.ok(r.left >= 0 && r.top >= 0 && r.right <= width && r.bottom <= height,
@@ -785,7 +871,9 @@ test("at 1366x768 the image and all player controls fit in the initial view, pan
       assert.ok(rects[s].top >= image.bottom, `${s} not below the image`);
     }
     assert.ok(rects["#panel"].left >= image.right, "panel not beside the image");
-    assert.ok(rects["#enter"].bottom <= height, "Enter coordinates not in view");
+    assert.ok(rects["#panel"].top >= 0 && rects["#panel"].bottom <= height,
+      `panel at ${JSON.stringify(rects["#panel"])} not in view`);
+    assert.ok(rects["#submit"].bottom <= height, "Show not in view");
     assertCleanRun(log);
   });
 
@@ -793,8 +881,6 @@ test("at 390 px width the target panel is below the player and nothing scrolls s
   { timeout: TIMEOUT }, async () => {
     const { page, log } = await openPage({});
     await page.setViewportSize({ width: 390, height: 844 });
-    await openDisclosure(page, "enter");
-    await openDisclosure(page, "advanced");
     const { rects, width, scrollWidth } = await layout(page, [...PLAYER, "#panel", "#submit"]);
     for (const s of PLAYER) {
       assert.ok(rects["#panel"].top >= rects[s].bottom, `panel not below ${s}`);
@@ -863,7 +949,7 @@ test("frames are requested one at a time and the slider grows as each arrives",
         [RA, DEC, "D2"]);
       assert.deepEqual(log.frames,
         plan.frames.map((f) => ({ ra_deg: plan.ra_deg, dec_deg: plan.dec_deg, uris: f.uris })));
-      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
       assertCleanRun(log);
     } finally {
       gates.forEach((g) => g.release());
@@ -877,7 +963,7 @@ test("a single frame from a single exposure is reported in the singular", { time
       search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
     });
     await submit(page);
-    assert.equal(await finalStatus(page), "1 frame from 1 of 1 exposure.");
+    assert.equal(await finalStatus(page), `1 frame from 1 of 1 exposure. ${NO_DATA}`);
     assertCleanRun(log);
   });
 
@@ -891,7 +977,7 @@ test("the date label shows the selected frame's date and the exposures it was bu
       frame: (n) => frameBody(pixels(n), used[n]),
     });
     await submit(page);
-    assert.equal(await finalStatus(page), "3 frames from 24 of 42 exposures.");
+    assert.equal(await finalStatus(page), `3 frames from 24 of 42 exposures. ${NO_DATA}`);
     const expected = [
       "2025-05-06 \u00b7 8 exposures",
       "2025-11-07 \u2013 2025-11-10 \u00b7 1 exposure",
@@ -951,7 +1037,8 @@ test("the cap notice for several capped frames appears while loading and when fi
       assert.equal(await waitForStatus(page, (t) => t.startsWith("Loading frame 1")),
         `Loading frame 1 of 3\u2026 ${notice}`);
       gate.release();
-      assert.equal(await finalStatus(page), `3 frames from 56 of 400 exposures. ${notice}`);
+      assert.equal(await finalStatus(page),
+        `3 frames from 56 of 400 exposures. ${notice} ${NO_DATA}`);
       assertCleanRun(log);
     } finally {
       gate.release();
@@ -965,7 +1052,8 @@ test("the cap notice for one capped frame is in the singular", { timeout: TIMEOU
   });
   await submit(page);
   assert.equal(await finalStatus(page), "1 frame from 24 of 30 exposures. "
-    + "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly spaced in time order.");
+    + "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly spaced in time order. "
+    + NO_DATA);
   assertCleanRun(log);
 });
 
@@ -981,7 +1069,8 @@ test("one failing frame is reported with its reason and loading continues",
     });
     await submit(page);
     assert.equal(await finalStatus(page),
-      "2 frames from 23 of 42 exposures. 1 frame could not be loaded: every exposure failed.");
+      "2 frames from 23 of 42 exposures. 1 frame could not be loaded: every exposure failed. "
+      + NO_DATA);
     assert.equal(log.frames.length, 3);
     const { disabled, min, max } = await sliderState(page);
     assert.equal(disabled, false);
@@ -997,15 +1086,20 @@ test("several failing frames are counted in the plural with the last reason",
     const reply = frameOk(plan);
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }),
-      frame: (n) => [
+      frame: (n, payload) => [
         reply,
-        () => ({ status: 503, raw: "unavailable" }),
-        () => ({ status: 429, body: { detail: "Too many requests, try again later." } }),
-      ][n](n),
+        () => ({ status: 503, raw: "unavailable", headers: { "Retry-After": "1" } }),
+        () => ({
+          status: 429,
+          body: { detail: "Too many requests, try again later." },
+          headers: { "Retry-After": "1" },
+        }),
+      ][planIndex(plan, payload)](n),
     });
     await submit(page);
     assert.equal(await finalStatus(page), "1 frame from 8 of 42 exposures. "
-      + "2 frames could not be loaded: Too many requests, try again later.");
+      + `2 frames could not be loaded: Too many requests, try again later. ${NO_DATA}`);
+    assert.deepEqual(requestedFrames(plan, log), [0, 1, 1, 2, 2]);
     assertCleanRun(log);
   });
 
@@ -1014,11 +1108,13 @@ test("when every frame fails the status says so with the reason", { timeout: TIM
     const plan = makePlan(THREE_FRAMES.slice(0, 2));
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }),
-      frame: (n) => (n === 0 ? { status: 502, body: { detail: "every exposure failed" } }
-        : { status: 503, raw: "unavailable" }),
+      frame: (n, payload) => (planIndex(plan, payload) === 0
+        ? { status: 502, body: { detail: "every exposure failed" } }
+        : { status: 503, raw: "unavailable", headers: { "Retry-After": "1" } }),
     });
     await submit(page);
     assert.equal(await finalStatus(page), "No frame could be loaded: 503 Service Unavailable.");
+    assert.deepEqual(requestedFrames(plan, log), [0, 1, 1]);
     assert.equal(await page.isDisabled("#play"), true);
     assert.equal(await page.isDisabled("#slider"), true);
     assertCleanRun(log);
@@ -1043,9 +1139,13 @@ for (const [status, detail] of [
 ]) {
   test(`a ${status} search error shows its detail in the status line`, { timeout: TIMEOUT },
     async () => {
-      const { page, log } = await openPage({ search: () => ({ status, body: { detail } }) });
+      const { page, log } = await openPage({
+        search: () => ({ status, body: { detail }, headers: { "Retry-After": "1" } }),
+      });
       await submit(page, { ra: "abc" });
       assert.equal(await finalStatus(page), `Error: ${detail}`);
+      // Only a 429 or 503 refusal is asked again, once.
+      assert.equal(log.searches.length, status === 429 ? 2 : 1);
       assert.equal(log.frames.length, 0);
       assert.equal(await page.isDisabled("#play"), true);
       assert.equal(await page.isDisabled("#slider"), true);
@@ -1055,9 +1155,12 @@ for (const [status, detail] of [
 
 test("a search error without a JSON detail shows the HTTP status", { timeout: TIMEOUT },
   async () => {
-    const { page, log } = await openPage({ search: () => ({ status: 503, raw: "down" }) });
+    const { page, log } = await openPage({
+      search: () => ({ status: 503, raw: "down", headers: { "Retry-After": "1" } }),
+    });
     await submit(page);
     assert.equal(await finalStatus(page), "Error: 503 Service Unavailable");
+    assert.equal(log.searches.length, 2);
     assertCleanRun(log);
   });
 
@@ -1374,13 +1477,12 @@ test("Search here searches the selection with the current detector, closes the m
   const { page, log } = await openPage({
     search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
   });
-  await openDisclosure(page, "advanced");
   await page.selectOption("#detector", "D4");
   await openMap(page);
   const pick = await clickMap(page, 25, 15);
   assert.deepEqual(log.searches, []);
   await page.click("#sky-search");
-  assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+  assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
   assert.equal(log.searches.length, 1);
   const params = log.searches[0].searchParams;
   assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
@@ -1446,7 +1548,7 @@ for (const [name, options] of [
       assert.equal(await statusText(page), MAP_FAILED);
       assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
       await submit(page);
-      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
       assert.equal(log.searches[0].searchParams.get("ra"), RA);
       assertCleanMapRun(log);
     });
@@ -1498,3 +1600,707 @@ test("at 390x844 the map spans the width, a tap selects and nothing scrolls side
     assert.deepEqual(log.searches, []);
     assertCleanMapRun(log);
   });
+
+for (const [name, reply] of [
+  ["a body that is not JSON", () => ({ status: 200, raw: "<html>" })],
+  ["a body of the wrong shape", () => ({ status: 200, body: {} })],
+]) {
+  test(`a search answered with ${name} ends with an error instead of hanging`,
+    { timeout: TIMEOUT }, async () => {
+      const { page, log } = await openPage({ search: reply });
+      await submit(page);
+      assert.equal(await finalStatus(page), `Error: ${UNEXPECTED}`);
+      assert.equal(log.searches.length, 1);
+      assert.equal(log.frames.length, 0);
+      assert.equal(await page.isDisabled("#play"), true);
+      assertCleanRun(log);
+    });
+}
+
+test("a frame answer of the wrong shape counts as a failed frame and loading continues",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n) => (n === 1 ? frameBody(pixels(1).slice(0, 10), 19) : reply(n)),
+    });
+    await submit(page);
+    assert.equal(await finalStatus(page), "2 frames from 23 of 42 exposures. "
+      + `1 frame could not be loaded: ${UNEXPECTED}. ${NO_DATA}`);
+    assert.equal(log.frames.length, 3);
+    const { min, max } = await sliderState(page);
+    assert.equal(max - min + 1, 2);
+    assertCleanRun(log);
+  });
+
+for (const { status, headers, seconds } of [
+  { status: 429, headers: { "Retry-After": "1" }, seconds: 1 },
+  { status: 503, headers: undefined, seconds: 2 },
+]) {
+  test(`a frame refused once with ${status} is asked again after ${seconds} s and loads`,
+    { timeout: TIMEOUT }, async () => {
+      const plan = makePlan(THREE_FRAMES);
+      const reply = frameOk(plan);
+      const { page, log } = await openPage({
+        search: () => ({ status: 200, body: plan }),
+        frame: (n, payload) => (n === 1
+          ? { status, body: { detail: "Too many requests, try again later." }, headers }
+          : reply(planIndex(plan, payload))),
+      });
+      await recordStatuses(page);
+      await submit(page);
+      const done = `3 frames from 42 of 42 exposures. ${NO_DATA}`;
+      assert.equal(await finalStatus(page), done);
+      assert.deepEqual(await statusHistory(page), [
+        "Searching the SPHEREx archive\u2026",
+        "Loading frame 1 of 3\u2026",
+        "Loading frame 2 of 3\u2026",
+        `Waiting ${seconds} s before continuing.`,
+        "Loading frame 2 of 3\u2026",
+        "Loading frame 3 of 3\u2026",
+        done,
+      ]);
+      assert.deepEqual(requestedFrames(plan, log), [0, 1, 1, 2]);
+      const gap = log.frameTimes[2].sent - log.frameTimes[1].answered;
+      assert.ok(gap >= seconds * 1000 - 100, `asked again ${gap} ms after the refusal`);
+      assert.equal(log.maxInFlight, 1);
+      assertCleanRun(log);
+    });
+}
+
+test("a frame refused twice is reported as failed and later frames still load",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n, payload) => (planIndex(plan, payload) === 1
+        ? {
+          status: 429,
+          body: { detail: "Too many requests, try again later." },
+          headers: { "Retry-After": "1" },
+        }
+        : reply(planIndex(plan, payload))),
+    });
+    await submit(page);
+    assert.equal(await finalStatus(page), "2 frames from 23 of 42 exposures. "
+      + `1 frame could not be loaded: Too many requests, try again later. ${NO_DATA}`);
+    assert.deepEqual(requestedFrames(plan, log), [0, 1, 1, 2]);
+    const { max } = await sliderState(page);
+    await selectFrame(page, max);
+    assert.equal(await dateText(page), "2026-04-20 \u00b7 15 exposures");
+    assertCleanRun(log);
+  });
+
+test("a search refused once with 429 is asked again and its frames load",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    let searches = 0;
+    const { page, log } = await openPage({
+      search: () => (searches++ === 0
+        ? {
+          status: 429,
+          body: { detail: "Too many requests, try again later." },
+          headers: { "Retry-After": "1" },
+        }
+        : { status: 200, body: plan }),
+      frame: frameOk(plan),
+    });
+    await recordStatuses(page);
+    await submit(page);
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    assert.deepEqual((await statusHistory(page)).slice(0, 4), [
+      "Searching the SPHEREx archive\u2026",
+      "Waiting 1 s before continuing.",
+      "Searching the SPHEREx archive\u2026",
+      "Loading frame 1 of 3\u2026",
+    ]);
+    assert.equal(log.searches.length, 2);
+    assert.equal(log.frames.length, 3);
+    assertCleanRun(log);
+  });
+
+test("a new search during a wait cancels the old retry and its result stays",
+  { timeout: TIMEOUT }, async () => {
+    const first = makePlan(THREE_FRAMES);
+    const second = {
+      ...makePlan([{ label: "2026-05-01", n_available: 5, n_used: 5 }]), ra_deg: 10,
+    };
+    const { page, log } = await openPage({
+      search: (url) => ({ status: 200, body: url.searchParams.get("ra") === RA ? first : second }),
+      frame: (n, payload) => (payload.ra_deg === first.ra_deg
+        ? { status: 429, body: { detail: "later" }, headers: { "Retry-After": "2" } }
+        : frameBody(pixels(0), 5)),
+    });
+    await submit(page);
+    await waitForStatus(page, (t) => t === "Waiting 2 s before continuing.");
+    await recordStatuses(page);
+    await submit(page, { ra: "10", dec: "-7.245147" });
+    const done = `1 frame from 5 of 5 exposures. ${NO_DATA}`;
+    assert.equal(await finalStatus(page), done);
+    await page.waitForTimeout(2500);
+    assert.deepEqual(log.frames.map((f) => f.ra_deg), [first.ra_deg, second.ra_deg]);
+    assert.deepEqual(await statusHistory(page),
+      ["Searching the SPHEREx archive\u2026", "Loading frame 1 of 1\u2026", done]);
+    assert.equal(await text(page, "#name"), "RA 10, Dec -7.245147");
+    assert.equal(await dateText(page), "2026-05-01 \u00b7 5 exposures");
+    assertCleanRun(log);
+  });
+
+for (const nullFrame of [null, 2]) {
+  test(`the no-data sentence ends the status only when a loaded frame lacks data `
+    + `(${nullFrame === null ? "none does" : "one does"})`, { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const clean = (n) => pixels(n).map((v) => v ?? 0.2);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n) => frameBody(n === nullFrame ? pixels(n) : clean(n), plan.frames[n].n_used),
+    });
+    await recordStatuses(page);
+    await submit(page);
+    const done = nullFrame === null ? "3 frames from 42 of 42 exposures."
+      : `3 frames from 42 of 42 exposures. ${NO_DATA}`;
+    assert.equal(await finalStatus(page), done);
+    assert.deepEqual(await statusHistory(page), [
+      "Searching the SPHEREx archive\u2026",
+      "Loading frame 1 of 3\u2026",
+      "Loading frame 2 of 3\u2026",
+      "Loading frame 3 of 3\u2026",
+      done,
+    ]);
+    assertCleanRun(log);
+  });
+}
+
+test("the no-data sentence follows the cap notice and the failed-frame sentence",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan([
+      { label: "2025-05-06", n_available: 8, n_used: 8 },
+      { label: "2025-06-01 \u2013 2025-06-29", n_available: 300, n_used: 24 },
+      { label: "2025-07-01 \u2013 2025-07-29", n_available: 92, n_used: 24 },
+    ]);
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n) => (n === 2 ? { status: 502, body: { detail: "every exposure failed" } }
+        : reply(n)),
+    });
+    await submit(page);
+    assert.equal(await finalStatus(page), "2 frames from 32 of 400 exposures. "
+      + "Cap applied: 2 of 3 frames use 24 of their exposures, evenly spaced in time order. "
+      + `1 frame could not be loaded: every exposure failed. ${NO_DATA}`);
+    assertCleanRun(log);
+  });
+
+test("moving the timeline during playback pauses on the chosen frame", { timeout: TIMEOUT },
+  async () => {
+    const { page, log } = await openPage({});
+    await page.click("#play");
+    assert.equal(await text(page, "#play"), "Pause");
+    await page.focus("#slider");
+    await page.keyboard.press("End");
+    assert.equal(await text(page, "#play"), "Play");
+    await page.waitForTimeout(1300);
+    assert.equal((await sliderState(page)).value, 2);
+    assert.equal(await dateText(page), EXAMPLE_LABELS[2]);
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(2));
+    assertCleanRun(log);
+  });
+
+test("the timeline announces the shown frame's label and nothing while no frame is shown",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: async (n) => {
+        await gate.promise;
+        return reply(n);
+      },
+    });
+    const announced = () => page.getAttribute("#slider", "aria-valuetext");
+    try {
+      assert.equal(await announced(), EXAMPLE_LABELS[0]);
+      await selectFrame(page, 2);
+      assert.equal(await announced(), EXAMPLE_LABELS[2]);
+      await page.click("#play");
+      await page.waitForFunction(() => document.querySelector("#slider").value !== "2");
+      await page.click("#play");
+      assert.equal(await announced(), await dateText(page));
+      assert.notEqual(await announced(), EXAMPLE_LABELS[2]);
+
+      await submit(page);
+      await waitForStatus(page, (t) => t.startsWith("Loading frame 1"));
+      assert.equal(await announced(), null);
+      gate.release();
+      await finalStatus(page);
+      assert.equal(await announced(), "2025-05-06 \u00b7 8 exposures");
+      await selectFrame(page, 2);
+      assert.equal(await announced(), "2026-04-20 \u00b7 15 exposures");
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("at phone widths the date row and the panel keep their place for short and long labels",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan([
+      { label: "2025-05-06", n_available: 8, n_used: 8 },
+      { label: "2025-11-07 \u2013 2025-11-10", n_available: 24, n_used: 24 },
+    ]);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+    });
+    await submit(page);
+    await finalStatus(page);
+    for (const width of [320, 360, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      const boxes = [];
+      for (const n of [0, 1]) {
+        await selectFrame(page, n);
+        boxes.push(await page.evaluate(() => ({
+          date: document.querySelector("#date").getBoundingClientRect().height,
+          panel: document.querySelector("#panel").getBoundingClientRect().top,
+        })));
+      }
+      assert.equal(await dateText(page), "2025-11-07 \u2013 2025-11-10 \u00b7 24 exposures");
+      assert.deepEqual(boxes[1], boxes[0], `at ${width} px`);
+    }
+    assertCleanRun(log);
+  });
+
+test("the Difference box draws each example frame minus the others, unticking restores it",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.equal(await page.isEnabled("#difference"), true);
+    assert.equal(await page.isChecked("#difference"), false);
+    const [color, cursor] = await differenceLook(page);
+    assert.notEqual(color, MUTED);
+    assert.equal(cursor, "pointer");
+    assert.equal(await page.getAttribute("#image", "aria-label"), IMAGE_LABEL);
+
+    await page.click("#difference-control");
+    assert.equal(await page.isChecked("#difference"), true);
+    for (const n of [0, 1, 2]) {
+      if (n > 0) await page.click("#next");
+      assert.equal((await sliderState(page)).value, n);
+      assert.deepEqual(await canvasPixels(page), differenceRGBA(EXAMPLE_FRAMES, n));
+      assert.notDeepEqual(await canvasPixels(page), exampleRGBA(n));
+      assert.equal(await dateText(page), EXAMPLE_LABELS[n]);
+      await assertMarkerAt(page, EXAMPLE_MARKERS[n]);
+      assert.equal(await page.getAttribute("#image", "aria-label"), DIFFERENCE_LABEL);
+    }
+    await selectFrame(page, 1);
+    assert.deepEqual(await canvasPixels(page), differenceRGBA(EXAMPLE_FRAMES, 1));
+
+    await page.click("#difference-control");
+    assert.equal(await page.isChecked("#difference"), false);
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(1));
+    assert.equal(await dateText(page), EXAMPLE_LABELS[1]);
+    await assertMarkerAt(page, EXAMPLE_MARKERS[1]);
+    assert.equal(await page.getAttribute("#image", "aria-label"), IMAGE_LABEL);
+    assert.equal(await text(page, "#play"), "Play");
+    assertCleanRun(log);
+  });
+
+test("with Difference ticked, frames that are all equal are drawn mid-grey",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }),
+      frame: (n) => frameBody(pixels(1), plan.frames[n].n_used),
+    });
+    await submit(page);
+    await finalStatus(page);
+    await page.click("#difference-control");
+    const rgba = await canvasPixels(page);
+    for (let i = 0; i < SIZE * SIZE; i++) {
+      const expected = i === 1770 ? [0, 0, 0, 0] : [128, 128, 128, 255];
+      assert.deepEqual(rgba.slice(4 * i, 4 * i + 4), expected, `pixel ${i}`);
+    }
+    assertCleanRun(log);
+  });
+
+test("the timeline is at least 24 px high on a phone and on a desktop", { timeout: TIMEOUT },
+  async () => {
+    const { page, log } = await openPage({});
+    for (const width of [360, 1366]) {
+      await page.setViewportSize({ width, height: 800 });
+      const { height } = await page.locator("#slider").boundingBox();
+      assert.ok(height >= 24, `timeline ${height} px high at ${width} px`);
+    }
+    assertCleanRun(log);
+  });
+
+test("the detector options state their wavelength range and fit at 320 px width",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    assert.deepEqual(await page.$$eval("#detector option", (els) => els.map((el) => el.text)), [
+      "D1 \u00b7 0.75\u20131.1 \u00b5m",
+      "D2 \u00b7 1.1\u20131.6 \u00b5m",
+      "D3 \u00b7 1.6\u20132.4 \u00b5m",
+      "D4 \u00b7 2.4\u20133.8 \u00b5m",
+      "D5 \u00b7 3.8\u20134.4 \u00b5m",
+      "D6 \u00b7 4.4\u20135.0 \u00b5m",
+    ]);
+    await page.setViewportSize({ width: 320, height: 800 });
+    const { scroll, client } = await page.evaluate(() => ({
+      scroll: document.documentElement.scrollWidth,
+      client: document.documentElement.clientWidth,
+    }));
+    assert.ok(scroll <= client, `page scrolls to ${scroll} of ${client}`);
+    assertCleanRun(log);
+  });
+
+// --- Interactions of the sky map with the loading and player rules -------------------------
+
+test("Search here follows the loading rules: a refused search waits once, a frame answer of "
+  + "the wrong shape counts as failed", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const reply = frameOk(plan);
+  let searches = 0;
+  const { page, log } = await openPage({
+    search: () => (searches++ === 0
+      ? {
+        status: 429,
+        body: { detail: "Too many requests, try again later." },
+        headers: { "Retry-After": "1" },
+      }
+      : { status: 200, body: plan }),
+    frame: (n) => (n === 1 ? frameBody(pixels(1).slice(0, 10), 19) : reply(n)),
+  });
+  await openMap(page);
+  const pick = await clickMap(page, 25, 15);
+  await recordStatuses(page);
+  await page.click("#sky-search");
+  const done = "2 frames from 23 of 42 exposures. "
+    + `1 frame could not be loaded: ${UNEXPECTED}. ${NO_DATA}`;
+  assert.equal(await finalStatus(page), done);
+  assert.deepEqual(await statusHistory(page), [
+    "Searching the SPHEREx archive\u2026",
+    "Waiting 1 s before continuing.",
+    "Searching the SPHEREx archive\u2026",
+    "Loading frame 1 of 3\u2026",
+    "Loading frame 2 of 3\u2026",
+    "Loading frame 3 of 3\u2026",
+    done,
+  ]);
+  assert.equal(log.searches.length, 2);
+  for (const url of log.searches) assert.equal(url.searchParams.get("ra"), pick.text[1]);
+  assert.equal(log.frames.length, 3);
+  assertCleanMapRun(log);
+});
+
+test("a map-started search answered with a body that is not JSON ends with an error",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({ search: () => ({ status: 200, raw: "<html>" }) });
+    await openMap(page);
+    await clickMap(page, 25, 15);
+    await page.click("#sky-search");
+    assert.equal(await finalStatus(page), `Error: ${UNEXPECTED}`);
+    assert.equal(log.frames.length, 0);
+    assert.equal(await page.isDisabled("#play"), true);
+    assertCleanMapRun(log);
+  });
+
+test("opening and closing the map while playing leaves playback running; the timeline then "
+  + "pauses it and Search here stops it", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+  });
+  await page.click("#play");
+  await openMap(page);
+  assert.equal(await page.isVisible("#slider"), false);
+  await page.click("#sky-close");
+  assert.equal(await text(page, "#play"), "Pause");
+  const before = (await sliderState(page)).value;
+  await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+    before);
+  await selectFrame(page, 2);
+  assert.equal(await text(page, "#play"), "Play");
+  await page.waitForTimeout(1300);
+  assert.equal((await sliderState(page)).value, 2);
+  assert.deepEqual(await canvasPixels(page), exampleRGBA(2));
+
+  await page.click("#play");
+  await openMap(page);
+  // Reopened, Aladin redraws its sky canvas a moment later; a click before that misses it.
+  await page.waitForTimeout(300);
+  await clickMap(page, 25, 15);
+  await page.click("#sky-search");
+  assert.equal(await text(page, "#play"), "Play");
+  assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+  await page.waitForTimeout(1300);
+  assert.equal((await sliderState(page)).value, 0);
+  assert.equal(await text(page, "#play"), "Play");
+  assertCleanMapRun(log);
+});
+
+test("Difference is enabled from a search's second frame, follows new frames and a new "
+  + "search unticks it", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const gates = Array.from({ length: 6 }, () => deferred());
+  const reply = frameOk(plan);
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }),
+    frame: async (n) => {
+      await gates[n].promise;
+      return reply(n % 3);
+    },
+  });
+  const state = () => page.$eval("#difference", (el) => [el.disabled, el.checked]);
+  const loaded = (n) => [0, 1, 2].slice(0, n).map((k) => ({
+    pixels: pixels(k), width: SIZE, height: SIZE, nUsed: plan.frames[k].n_used,
+  }));
+  try {
+    await submit(page);
+    await waitForStatus(page, (t) => t.startsWith("Loading frame 1"));
+    assert.deepEqual(await state(), [true, false]);
+    gates[0].release();
+    await waitForStatus(page, (t) => t.startsWith("Loading frame 2"));
+    assert.deepEqual(await state(), [true, false]);
+    gates[1].release();
+    await waitForStatus(page, (t) => t.startsWith("Loading frame 3"));
+    assert.deepEqual(await state(), [false, false]);
+
+    await page.click("#difference-control");
+    assert.deepEqual(await canvasPixels(page), differenceRGBA(loaded(2), 0));
+    gates[2].release();
+    await finalStatus(page);
+    assert.deepEqual(await canvasPixels(page), differenceRGBA(loaded(3), 0));
+    assert.equal(await page.getAttribute("#image", "aria-label"), DIFFERENCE_LABEL);
+
+    await submit(page, { detector: "D5" });
+    await waitForStatus(page, (t) => t.startsWith("Loading frame 1"));
+    assert.deepEqual(await state(), [true, false]);
+    assert.equal(await page.getAttribute("#image", "aria-label"), IMAGE_LABEL);
+    assertCleanRun(log);
+  } finally {
+    gates.forEach((g) => g.release());
+  }
+});
+
+test("a one-frame result leaves Difference disabled", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan([{ label: "2025-05-06", n_available: 8, n_used: 8 }]);
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+  });
+  await submit(page);
+  assert.equal(await finalStatus(page), `1 frame from 8 of 8 exposures. ${NO_DATA}`);
+  assert.equal(await page.isDisabled("#difference"), true);
+  assert.equal(await page.isChecked("#difference"), false);
+  assert.deepEqual(await differenceLook(page), [MUTED, "default"]);
+  assertCleanRun(log);
+});
+
+test("at 360 px width nothing scrolls sideways", { timeout: TIMEOUT }, async () => {
+  const { page, log } = await openPage({});
+  await page.setViewportSize({ width: 360, height: 800 });
+  const { width, scrollWidth } = await layout(page, ["#difference-control"]);
+  assert.ok(scrollWidth <= width, `page scrolls to ${scrollWidth} of ${width}`);
+  assertCleanRun(log);
+});
+
+const LINK = `?ra=${RA}&dec=${DEC}&detector=D6`;
+
+test("a link with ra, dec and detector runs that search on load without the example",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES, { detector: "D6" });
+    const { page, log } = await openPage({
+      query: LINK, search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+    });
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    assert.equal(log.searches.length, 1);
+    const search = log.searches[0].searchParams;
+    assert.deepEqual([search.get("ra"), search.get("dec"), search.get("detector")],
+      [RA, DEC, "D6"]);
+    assert.equal(log.frames.length, 3);
+    assert.equal(await dateText(page), "2025-05-06 · 8 exposures");
+    assert.equal(await text(page, "#name"), `RA ${RA}, Dec ${DEC}`);
+    assert.equal(await page.inputValue("#ra"), RA);
+    assert.equal(await page.inputValue("#dec"), DEC);
+    assert.equal(await page.inputValue("#detector"), "D6");
+    assert.deepEqual(log.examples, []);
+    assert.equal(await page.evaluate(() => location.search), LINK);
+    assertCleanRun(log);
+  });
+
+for (const query of ["?detector=D6", "?ra=1"]) {
+  test(`an incomplete link (${query}) shows the example`, { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({ query });
+    assert.deepEqual(log.examples, [new URL("example.json", baseUrl).href]);
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+    assert.equal(await text(page, "#name"), "Test Star");
+    assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
+    assert.deepEqual(log.searches, []);
+    assertCleanRun(log);
+  });
+}
+
+test("a submitted search leaves its link in the address bar and a reload repeats it",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES, { detector: "D5" });
+    const reply = frameOk(plan);
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: (n) => reply(n % 3),
+    });
+    const historyLength = await page.evaluate(() => history.length);
+    await submit(page, { detector: "D5" });
+    await finalStatus(page);
+    assert.equal(await page.evaluate(() => location.search),
+      `?ra=${RA}&dec=${DEC}&detector=D5`);
+    assert.equal(await page.evaluate(() => history.length), historyLength);
+    await page.reload();
+    await waitForStatus(page, (t) => t === `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    assert.equal(log.searches.length, 2);
+    assert.equal(log.searches[1].href, log.searches[0].href);
+    assert.equal(log.examples.length, 1);
+    assertCleanRun(log);
+  });
+
+test("a link with an unknown detector searches the default detector", { timeout: TIMEOUT },
+  async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const { page, log } = await openPage({
+      query: `?ra=${RA}&dec=${DEC}&detector=D9`,
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+    });
+    await finalStatus(page);
+    assert.equal(log.searches[0].searchParams.get("detector"), "D2");
+    assert.equal(await page.inputValue("#detector"), "D2");
+    assert.equal(await page.evaluate(() => location.search), `?ra=${RA}&dec=${DEC}&detector=D9`);
+    assertCleanRun(log);
+  });
+
+test("markup in a link reaches the page only as text and the server rejects it",
+  { timeout: TIMEOUT }, async () => {
+    const ra = "<img src=x onerror=alert(1)>";
+    const { page, log } = await openPage({
+      query: `?ra=${encodeURIComponent(ra)}&dec=${encodeURIComponent(DEC)}&detector=D6`,
+      search: null,
+    });
+    assert.equal(await finalStatus(page), `Error: ${INVALID_RA}`);
+    assert.equal(log.searches[0].searchParams.get("ra"), ra);
+    assert.equal(await text(page, "#name"), `RA ${ra}, Dec ${DEC}`);
+    assert.equal(await page.inputValue("#ra"), ra);
+    assert.equal((await page.$$("img")).length, 0);
+    assert.deepEqual(await bodyElements(page), BODY);
+    assertCleanRun(log);
+  });
+
+// --- Interactions of the sky map with the difference view and result links -----------------
+
+test("Search here leaves its link in the address bar like a typed search and a reload "
+  + "repeats it", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES, { detector: "D5" });
+  const reply = frameOk(plan);
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: (n) => reply(n % 3),
+  });
+  await page.selectOption("#detector", "D5");
+  const historyLength = await page.evaluate(() => history.length);
+  await openMap(page);
+  const pick = await clickMap(page, 25, 15);
+  await page.click("#sky-search");
+  const done = `3 frames from 42 of 42 exposures. ${NO_DATA}`;
+  assert.equal(await finalStatus(page), done);
+  assert.equal(await page.evaluate(() => location.search),
+    `?ra=${pick.text[1]}&dec=${pick.text[2]}&detector=D5`);
+  assert.equal(await page.evaluate(() => history.length), historyLength);
+  await page.reload();
+  await waitForStatus(page, (t) => t === done);
+  assert.equal(log.searches.length, 2);
+  assert.equal(log.searches[1].href, log.searches[0].href);
+  assert.equal(log.examples.length, 1);
+  assert.equal(await page.inputValue("#ra"), pick.text[1]);
+  assert.equal(await page.inputValue("#dec"), pick.text[2]);
+  assertCleanMapRun(log);
+});
+
+test("a page opened with a link opens the sky map centred on the linked result",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES, { detector: "D6" });
+    const { page, log } = await openPage({
+      query: `?ra=${encodeURIComponent(RA)}&dec=${encodeURIComponent(DEC)}&detector=D6`,
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+    });
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    await openMap(page);
+    const centre = await clickMap(page, 0, 0);
+    const cosDec = Math.cos((plan.dec_deg * Math.PI) / 180);
+    assert.ok(Math.abs((centre.ra - plan.ra_deg) * cosDec) < 0.01
+      && Math.abs(centre.dec - plan.dec_deg) < 0.01, `centre ${centre.ra}, ${centre.dec}`);
+    assert.deepEqual(log.examples, []);
+    assert.equal(log.searches.length, 1);
+    assertCleanMapRun(log);
+  });
+
+test("Difference applies to a map-started search's frames; opening the map keeps it, Search "
+  + "here unticks it", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const reply = frameOk(plan);
+  const gate = deferred();
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }),
+    frame: async (n) => {
+      if (n >= 3) await gate.promise;
+      return reply(n % 3);
+    },
+  });
+  const state = () => page.$eval("#difference", (el) => [el.disabled, el.checked]);
+  const loaded = [0, 1, 2].map((k) => ({
+    pixels: pixels(k), width: SIZE, height: SIZE, nUsed: plan.frames[k].n_used,
+  }));
+  await openMap(page);
+  await clickMap(page, 25, 15);
+  await page.click("#sky-search");
+  await finalStatus(page);
+  assert.deepEqual(await state(), [false, false]);
+  await page.click("#difference-control");
+  assert.deepEqual(await canvasPixels(page), differenceRGBA(loaded, 0));
+  assert.equal(await page.getAttribute("#image", "aria-label"), DIFFERENCE_LABEL);
+
+  await openMap(page);
+  await page.click("#sky-close");
+  assert.deepEqual(await state(), [false, true]);
+  assert.deepEqual(await canvasPixels(page), differenceRGBA(loaded, 0));
+
+  await openMap(page);
+  await page.waitForTimeout(300);
+  await clickMap(page, -25, 15);
+  await page.click("#sky-search");
+  await waitForStatus(page, (t) => t.startsWith("Loading frame 1"));
+  assert.deepEqual(await state(), [true, false]);
+  assert.equal(await page.getAttribute("#image", "aria-label"), IMAGE_LABEL);
+  gate.release();
+  await finalStatus(page);
+  assert.deepEqual(await state(), [false, false]);
+  assert.deepEqual(await canvasPixels(page), Array.from(toRGBA(loaded[0].pixels,
+    computeStretch(loaded.map((f) => f.pixels)))));
+  assertCleanMapRun(log);
+});
+
+test("with Difference ticked, the map opened during playback leaves both running; the "
+  + "timeline then pauses on the chosen difference frame", { timeout: TIMEOUT }, async () => {
+  const { page, log } = await openPage({});
+  await page.click("#difference-control");
+  await page.click("#play");
+  await openMap(page);
+  await page.click("#sky-close");
+  assert.equal(await text(page, "#play"), "Pause");
+  assert.equal(await page.isChecked("#difference"), true);
+  const before = (await sliderState(page)).value;
+  await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+    before);
+  await selectFrame(page, 2);
+  assert.equal(await text(page, "#play"), "Play");
+  await page.waitForTimeout(1300);
+  assert.equal((await sliderState(page)).value, 2);
+  assert.deepEqual(await canvasPixels(page), differenceRGBA(EXAMPLE_FRAMES, 2));
+  assert.equal(await page.getAttribute("#image", "aria-label"), DIFFERENCE_LABEL);
+  assertCleanMapRun(log);
+});

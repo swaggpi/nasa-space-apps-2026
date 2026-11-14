@@ -2,8 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  capNotice, computeStretch, fieldCorners, fieldTexts, formatPosition, frameLabel, isClick,
-  joinStatus, markerPercent, nextIndex, parseExample, plural, previousIndex, toRGBA,
+  capNotice, computeStretch, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
+  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, parseExample, parseLink,
+  plural, previousIndex, retryDelay, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -219,9 +220,9 @@ test("parseExample converts a valid example to page frames with labels and marke
     position: "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6",
     frames: [
       { pixels: [0.1, null, 0.3, 0], width: 2, height: 2,
-        label: "2025-01-01 \u00b7 1 exposure", marker: { x: 0.5, y: 1 } },
+        label: "2025-01-01 \u00b7 1 exposure", nUsed: 1, marker: { x: 0.5, y: 1 } },
       { pixels: [0.1, null, 0.3, 1], width: 2, height: 2,
-        label: "2025-02-01 \u00b7 2 exposures", marker: { x: 1.5, y: 1 } },
+        label: "2025-02-01 \u00b7 2 exposures", nUsed: 2, marker: { x: 1.5, y: 1 } },
     ],
   });
 });
@@ -332,4 +333,173 @@ test("isClick accepts a release within 5 px of the press and treats more as a dr
   assert.equal(isClick(press, { x: 104, y: 204 }), false);
   assert.equal(isClick(press, { x: 100, y: 194 }), false);
   assert.equal(isClick(press, { x: 160, y: 230 }), false);
+});
+
+test("retryDelay rounds Retry-After up to whole seconds within 1..30, else 2", () => {
+  const cases = [
+    [null, 2], ["", 2], ["soon", 2], ["Wed, 21 Oct 2026 07:28:00 GMT", 2],
+    ["0", 1], ["5", 5], ["2.5", 3], ["600", 30], ["-3", 1], ["2.1", 3],
+  ];
+  for (const [header, seconds] of cases) assert.equal(retryDelay(header), seconds, `${header}`);
+});
+
+test("validPlan accepts a search answer and an answer without frames", () => {
+  assert.equal(validPlan(plan([UNCAPPED, CAPPED])), true);
+  assert.equal(validPlan(plan([])), true);
+});
+
+test("validPlan rejects answers the page cannot use", () => {
+  const withFrame = (change) => {
+    const data = plan([UNCAPPED, UNCAPPED]);
+    data.frames[1] = { ...data.frames[1], ...change };
+    return data;
+  };
+  const noFrames = plan([UNCAPPED]);
+  delete noFrames.frames;
+  const broken = [
+    null, Object.assign([], plan([UNCAPPED])), noFrames,
+    withFrame({ uris: undefined }),
+    withFrame({ uris: [] }),
+    { ...plan([UNCAPPED]), ra_deg: "133.8" },
+    { ...plan([UNCAPPED]), dec_deg: null },
+    { ...plan([UNCAPPED]), detector: 2 },
+    { ...plan([UNCAPPED]), n_exposures: -1 },
+    { ...plan([UNCAPPED]), cap: 1.5 },
+    { ...plan([UNCAPPED]), capped: "no" },
+    withFrame({ label: 5 }),
+    withFrame({ capped: undefined }),
+    withFrame({ uris: [5] }),
+  ];
+  broken.forEach((data, i) => assert.equal(validPlan(data), false, `case ${i}`));
+});
+
+function frameAnswer(change = {}) {
+  const pixels = Array.from({ length: 59 * 59 }, (_, i) => (i % 97 === 0 ? null : i / 100));
+  return { width: 59, height: 59, n_used: 8, pixels, ...change };
+}
+
+test("validFrameBody accepts a 59x59 frame answer with no-data pixels", () => {
+  assert.equal(validFrameBody(frameAnswer()), true);
+});
+
+test("validFrameBody rejects frame answers the page cannot draw", () => {
+  const pixels = (index, value) => {
+    const values = frameAnswer().pixels;
+    values[index] = value;
+    return values;
+  };
+  const noCount = frameAnswer();
+  delete noCount.n_used;
+  const broken = [
+    frameAnswer({ pixels: new Array(10).fill(0) }),
+    frameAnswer({ pixels: pixels(5, "1") }),
+    frameAnswer({ pixels: pixels(5, Number.NaN) }),
+    noCount,
+    frameAnswer({ width: 0, pixels: [] }),
+    frameAnswer({ height: 0, pixels: [] }),
+  ];
+  broken.forEach((data, i) => assert.equal(validFrameBody(data), false, `case ${i}`));
+});
+
+test("noDataNote names blue-grey pixels only when some frame has a null pixel", () => {
+  assert.equal(noDataNote([]), "");
+  assert.equal(noDataNote([{ pixels: [0, 1] }, { pixels: [2, 3] }]), "");
+  assert.equal(noDataNote([{ pixels: [0, 1] }, { pixels: [2, null] }, { pixels: [4, 5] }]),
+    "Blue-grey pixels have no usable data.");
+});
+
+const DETECTORS = ["D1", "D2", "D3", "D4", "D5", "D6"];
+
+function frame(pixels, nUsed, width = 3, height = 3) {
+  return { pixels, width, height, nUsed };
+}
+
+function differenceGreys(diff, stretch) {
+  const rgba = toDifferenceRGBA(diff, stretch);
+  return Array.from({ length: diff.length }, (_, i) => rgba[4 * i]);
+}
+
+test("three identical frames give mid-grey everywhere", () => {
+  const pixels = Array.from({ length: 3481 }, (_, i) => ((i * 7 + 13) % 50) / 100);
+  const frames = Array.from({ length: 3 }, () => frame(pixels, 2, 59, 59));
+  const stretch = computeStretch(frames.map((f) => f.pixels));
+  for (let k = 0; k < frames.length; k++) {
+    const rgba = toDifferenceRGBA(difference(frames, k), stretch);
+    for (let i = 0; i < pixels.length; i++) {
+      assert.deepEqual(Array.from(rgba.slice(4 * i, 4 * i + 4)), [128, 128, 128, 255],
+        `frame ${k} pixel ${i}`);
+    }
+  }
+});
+
+test("difference subtracts the nUsed-weighted mean of the other frames", () => {
+  const frames = [1, 2, 4].map((v, k) => frame(new Array(9).fill(v), [1, 3, 0][k]));
+  assert.deepEqual(difference(frames, 0), new Array(9).fill(-1));
+  assert.deepEqual(difference(frames, 1), new Array(9).fill(1));
+  assert.deepEqual(difference(frames, 2), new Array(9).fill(2.25));
+});
+
+test("difference is null where the frame or every other frame has no data", () => {
+  const zeros = new Array(9).fill(0);
+  const nines = new Array(9).fill(9);
+  zeros[4] = null;
+  nines[0] = null;
+  const frames = [frame(zeros, 1), frame(nines, 1)];
+  assert.deepEqual(difference(frames, 0), [null, -9, -9, -9, null, -9, -9, -9, -9]);
+  assert.deepEqual(difference(frames, 1), [null, 9, 9, 9, null, 9, 9, 9, 9]);
+});
+
+test("difference averages over the 3x3 neighbours inside the image", () => {
+  const frames = [frame([0, 0, 0, 0, 9, 0, 0, 0, 0], 1), frame(new Array(9).fill(0), 1)];
+  assert.deepEqual(difference(frames, 0), [2.25, 1.5, 2.25, 1.5, 1, 1.5, 2.25, 1.5, 2.25]);
+  assert.deepEqual(difference([frames[0]], 0), new Array(9).fill(null));
+});
+
+test("toDifferenceRGBA is mid-grey at zero, clamps at full scale, transparent for null", () => {
+  const rgba = toDifferenceRGBA([null, 0, 1e9, -1e9, 5, -5], { lo: 0, hi: 10, soft: 1 });
+  assert.ok(rgba instanceof Uint8ClampedArray);
+  assert.equal(rgba.length, 24);
+  assert.deepEqual(Array.from(rgba.slice(0, 4)), [0, 0, 0, 0]);
+  [128, 255, 0, 226, 29].forEach((grey, k) => {
+    assert.deepEqual(Array.from(rgba.slice(4 * (k + 1), 4 * (k + 2))), [grey, grey, grey, 255],
+      `value ${k + 1}`);
+  });
+});
+
+test("a source moved by 2 px is drawn black where it was and white where it is", () => {
+  const W = 59;
+  const withStar = (cx, cy) => {
+    const pixels = Array.from({ length: W * W }, (_, i) => ((i * 7 + 13) % 50) / 100);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) pixels[(cy + dy) * W + cx + dx] += 20;
+    }
+    return pixels;
+  };
+  const frames = [frame(withStar(20, 30), 10, W, W), frame(withStar(22, 30), 10, W, W)];
+  const stretch = computeStretch(frames.map((f) => f.pixels));
+  const row = differenceGreys(difference(frames, 1), stretch).slice(30 * W + 15, 30 * W + 27);
+  assert.deepEqual(row, [128, 128, 128, 38, 15, 15, 128, 240, 240, 217, 128, 128]);
+});
+
+test("parseLink reads back what linkQuery writes, trimmed", () => {
+  assert.deepEqual(parseLink(linkQuery(" 08h55m10.831s ", "-7d14m42.53s", "D5"), DETECTORS, "D2"),
+    { ra: "08h55m10.831s", dec: "-7d14m42.53s", detector: "D5" });
+  assert.equal(linkQuery(" 1 ", " 2 ", "D1"), "?ra=1&dec=2&detector=D1");
+  const query = linkQuery("269.4462683", "+4.7682045", "D6");
+  assert.equal(query, "?ra=269.4462683&dec=%2B4.7682045&detector=D6");
+  assert.deepEqual(parseLink(query, DETECTORS, "D2"),
+    { ra: "269.4462683", dec: "+4.7682045", detector: "D6" });
+});
+
+test("parseLink needs both ra and dec, non-empty after trimming", () => {
+  for (const search of ["", "?ra=1", "?dec=1", "?ra=%20&dec=2", "?detector=D6"]) {
+    assert.equal(parseLink(search, DETECTORS, "D2"), null, search);
+  }
+});
+
+test("parseLink uses the fallback for a missing or unknown detector", () => {
+  assert.deepEqual(parseLink("?ra=1&dec=2&detector=D9", DETECTORS, "D2"),
+    { ra: "1", dec: "2", detector: "D2" });
+  assert.deepEqual(parseLink("?ra=1&dec=2", DETECTORS, "D3"),
+    { ra: "1", dec: "2", detector: "D3" });
 });

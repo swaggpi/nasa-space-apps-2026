@@ -23,8 +23,8 @@ motion and parallax; it agrees with the star's measured centre to within 0.15 pi
 The page shows the sky image with Play/Pause, previous and next frame and a timeline below it,
 and the date (or date range) and exposure count of the shown frame. The target panel beside it
 (below it on narrow screens) names what is shown, gives a short hint for the example, toggles
-the marker, and holds "Pick on sky map" and "Enter coordinates", which opens the RA/Dec search;
-the detector is under "Advanced settings" (D2 by default).
+the marker and the difference view, and always shows the search: "Pick on sky map", the RA and
+Dec fields, the detector with its wavelength range (D2 by default) and "Show".
 
 "Pick on sky map" replaces the image with a map of the sky (2MASS J, H, K colour images,
 near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
@@ -41,6 +41,23 @@ images come from the 2MASS colour HiPS that IRSA hosts: when the map is opened, 
 browser fetches them from `irsa.ipac.caltech.edu`; nothing else on the page leaves the server's
 origin. The library is 2.4 MB uncompressed (0.8 MB gzipped), so the reverse proxy should
 compress responses (Caddy: `encode gzip`).
+
+The box "Difference from the other frames" in the target panel (off by default, available once
+two frames are loaded) draws each frame as its difference from the others instead: the frame
+minus the exposure-weighted average of the other frames, averaged over 3×3 pixels, on the sky
+image's brightness scale. Mid-grey means no difference, white brighter, black fainter; pixels
+without a difference stay transparent.
+
+A result can be linked: `?ra=…&dec=…&detector=…` after the page's address opens that search
+without a click, also inside an `<iframe>`. Every submitted search leaves such a link in the
+address bar, so a reload repeats the search; without these parameters the page opens on the
+example. The five challenge targets, each with a detector that suits it, to append to the
+page's address (e.g. http://localhost:8000/):
+`?ra=269.4462683&dec=4.7682045&detector=D6` (Barnard's Star),
+`?ra=331.0965743&dec=-56.8010859&detector=D5` (Epsilon Indi B),
+`?ra=08h55m10.831s&dec=-7d14m42.53s&detector=D6` (WISE 0855),
+`?ra=76.9560812&dec=30.40120459&detector=D5` (RW Aurigae),
+`?ra=248.16737837&dec=66.75500675&detector=D6` (R Draconis).
 
 ## Run locally
 
@@ -105,7 +122,17 @@ pytest -m live                       # three smoke tests against the real IRSA a
 node --test 'tests/js/*.test.mjs'    # pure frontend logic (Node 22)
 node --test 'tests/e2e/*.test.mjs'   # opt-in: starts the app and drives a real browser via Playwright
 python validation/run_validation.py  # live validation on real data; writes validation/REPORT.md
+node validation/check_difference.mjs http://localhost:8000 > /tmp/DIFFERENCE.md \
+    && mv /tmp/DIFFERENCE.md validation/DIFFERENCE.md
 ```
+
+The last command checks the difference view on real loops of the five targets and a constant
+control star through a running server (a JSON file of recorded loops works too). It exits with
+status 1 if a must-show target (Barnard's Star, Epsilon Indi B, RW Aurigae) has no frame from
+more than five exposures or is not drawn strongly at the centre in each such frame, or if a field
+pixel reaches half scale; a strong centre is not by itself a change (see the control in
+`validation/DIFFERENCE.md`). On a failed check or an unreachable server the committed
+`validation/DIFFERENCE.md` is left in place.
 
 ## Limitations
 
@@ -131,6 +158,22 @@ python validation/run_validation.py  # live validation on real data; writes vali
   bright stars show an empty core throughout.
 - **Positions**: shifts smaller than about 1″ (a sixth of a pixel) are not significant.
 - **Extended emission** that fills the field is subtracted with the background.
+- **Difference view** (numbers from `validation/DIFFERENCE.md`; grey distance is how far a
+  pixel is drawn from mid-grey, out of the 127.5 grey levels between mid-grey and black or
+  white): every bright star leaves a residual at the centre even when it is constant, from the
+  few-per-cent flux and pixel-phase scatter described under Brightness. The constant flux
+  standard HD 2811 is drawn at 57.5–75.5 in D5 and D6, often as a black-and-white pair, against
+  76.5–121.5 for Barnard's Star (D6), Epsilon Indi B (D5) and RW Aurigae (D5), in frames from
+  more than five exposures. A pair or patch at a bright star is therefore not by itself proof of
+  motion or variability; compare its strength with the control. A patch of one sign means the
+  frame is brighter or fainter there than the others (RW Aurigae); a cool object can show one
+  from wavelength sampling alone in D1–D4, as Epsilon Indi B, a constant source, does in D2.
+  Pixels next to the no-data hole of a saturated star are unreliable (R Draconis). Frames from
+  five or fewer exposures can show artefacts as change. WISE 0855 is not
+  distinguishable from the field (at most 17.5 of the 127.5 grey levels at the target, up to
+  46.5 elsewhere). In frames from more than five exposures, no pixel more than 9 px from the
+  centre reaches half scale (64) in any of the checked loops, so the fainter field stars there
+  stay below it.
 - **Exposure cap**: above 24 exposures per frame, exposures are picked evenly spaced in time
   order (every k-th exposure), not at evenly spaced clock times; this samples the detector's
   wavelength range more evenly.

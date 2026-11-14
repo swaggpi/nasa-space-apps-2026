@@ -119,6 +119,7 @@ button {
   flex: 1 1 0;
   min-width: 0;
   width: 0;
+  height: 40px;
   margin: 0 0 0 4px;
   accent-color: var(--accent);
 }
@@ -137,6 +138,7 @@ input:disabled {
 #date {
   margin: 0;
   min-height: 1.45em;
+  font-size: min(1rem, 4vw);
   font-variant-numeric: tabular-nums;
 }
 
@@ -175,7 +177,8 @@ input:disabled {
   display: none;
 }
 
-#marker-control {
+#marker-control,
+#difference-control {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -183,42 +186,33 @@ input:disabled {
   cursor: pointer;
 }
 
-#show-marker {
+#show-marker,
+#difference {
   width: 18px;
   height: 18px;
   margin: 0;
   accent-color: var(--accent);
 }
 
-summary {
-  cursor: pointer;
-  width: fit-content;
+#difference {
+  flex: none;
 }
 
-#enter > summary,
-#pick {
-  padding: 8px 14px;
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  color: var(--fg);
-  font-weight: 600;
+#difference-control:has(:disabled) {
+  color: var(--muted);
+  cursor: default;
 }
 
 #pick {
   justify-self: start;
   min-height: 0;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
   background: none;
+  color: var(--fg);
+  font-weight: 600;
   line-height: inherit;
-}
-
-#advanced > summary {
-  font-size: 0.875rem;
-  color: var(--muted);
-}
-
-#search,
-#advanced > label {
-  margin-top: 10px;
 }
 
 #search {
@@ -226,8 +220,7 @@ summary {
   gap: 10px;
 }
 
-#search label,
-#advanced label {
+#search label {
   display: flex;
   flex-direction: column;
   gap: 4px;
