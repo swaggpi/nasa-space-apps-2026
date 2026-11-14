@@ -36,7 +36,15 @@ from spherex_viewer.app import (
 from spherex_viewer.cache import CutoutCache
 from spherex_viewer.discovery import DiscoveryError, Exposure
 from spherex_viewer.frames import FrameBuilder, FrameResult
-from spherex_viewer.ratelimit import RateLimiter
+from spherex_viewer.ratelimit import (
+    FRAME_BURST,
+    FRAME_PER_MINUTE,
+    SEARCH_BURST,
+    SEARCH_PER_MINUTE,
+    WIDE_BURST,
+    WIDE_PER_MINUTE,
+    RateLimiter,
+)
 from spherex_viewer.remote import s3_url
 
 PIX_DEG = 6.15 / 3600
@@ -644,14 +652,16 @@ def test_frame_gives_503_when_all_build_slots_stay_busy(tmp_path, blobs, monkeyp
 def test_search_rate_limit_gives_429_with_retry_after(tmp_path, blobs):
     client, _ = make_client(tmp_path, blobs, discover=CountingDiscover(SMALL_BIN))
     with client:
-        statuses = [client.get("/api/search", params=SEARCH).status_code for _ in range(10)]
+        statuses = [client.get("/api/search", params=SEARCH).status_code
+                    for _ in range(SEARCH_BURST)]
         limited = client.get("/api/search", params=SEARCH)
         frame = client.post("/api/frame", json=frame_payload([make_uri(0)]))
         health = [client.get("/healthz").status_code for _ in range(30)]
-    assert statuses == [200] * 10
+    assert (SEARCH_BURST, SEARCH_PER_MINUTE) == (30, 6.0)
+    assert statuses == [200] * 30
     assert limited.status_code == 429
-    assert limited.headers["retry-after"] == "30"
-    assert limited.json() == {"detail": "Too many requests. Try again in 30 s."}
+    assert limited.headers["retry-after"] == "10"
+    assert limited.json() == {"detail": "Too many requests. Try again in 10 s."}
     assert frame.status_code == 200
     assert health == [200] * 30
 
@@ -660,12 +670,15 @@ def test_frame_rate_limit_gives_429_with_retry_after(tmp_path):
     client, _ = make_client(tmp_path, discover=CountingDiscover(SMALL_BIN))
     payload = frame_payload(["ibe/data/spherex/dr1/level2/x.txt"])
     with client:
-        statuses = {client.post("/api/frame", json=payload).status_code for _ in range(60)}
+        statuses = {client.post("/api/frame", json=payload).status_code
+                    for _ in range(FRAME_BURST)}
         limited = client.post("/api/frame", json=payload)
         search = client.get("/api/search", params=SEARCH)
+    assert (FRAME_BURST, FRAME_PER_MINUTE) == (180, 18.0)
     assert statuses == {422}
     assert limited.status_code == 429
-    assert limited.headers["retry-after"] == "10"
+    # One token takes 60 / 18 s; the bucket refills a little while the burst is sent.
+    assert limited.headers["retry-after"] in {"3", "4"}
     assert search.status_code == 200
 
 
@@ -726,11 +739,12 @@ def test_invalid_searches_do_not_use_the_search_budget(tmp_path):
                {"ra": "150", "dec": "20", "detector": "D7"}]
     with client:
         rejected = [client.get("/api/search", params=invalid[i % 3]).status_code
-                    for i in range(12)]
-        accepted = [client.get("/api/search", params=SEARCH).status_code for _ in range(10)]
+                    for i in range(36)]
+        accepted = [client.get("/api/search", params=SEARCH).status_code
+                    for _ in range(SEARCH_BURST)]
         limited = client.get("/api/search", params=SEARCH)
-    assert rejected == [422] * 12
-    assert accepted == [200] * 10
+    assert rejected == [422] * 36
+    assert accepted == [200] * SEARCH_BURST
     assert limited.status_code == 429
 
 
@@ -869,23 +883,27 @@ def test_wide_frames_have_their_own_rate_limit(tmp_path, blobs):
     bad = ["ibe/data/spherex/dr1/level2/x.txt"]
     with client:
         narrow = {client.post("/api/frame", json=frame_payload(bad)).status_code
-                  for _ in range(60)}
+                  for _ in range(FRAME_BURST)}
         wide_after_narrow = client.post("/api/frame", json=wide_payload([make_uri(0)]))
-        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code for _ in range(39)}
+        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code
+                for _ in range(WIDE_BURST - 1)}
         limited = client.post("/api/frame", json=wide_payload([make_uri(0)]))
+    assert (WIDE_BURST, WIDE_PER_MINUTE) == (120, 18.0)
     assert narrow == {422} and wide == {422}
     assert wide_after_narrow.status_code == 200
     assert limited.status_code == 429
-    assert limited.headers["retry-after"] == "10"
-    assert limited.json() == {"detail": "Too many requests. Try again in 10 s."}
+    seconds = limited.headers["retry-after"]
+    assert seconds in {"3", "4"}
+    assert limited.json() == {"detail": f"Too many requests. Try again in {seconds} s."}
 
     client, _ = make_client(tmp_path / "second", blobs)
     with client:
-        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code for _ in range(40)}
+        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code
+                for _ in range(WIDE_BURST)}
         limited = client.post("/api/frame", json=wide_payload([make_uri(0)]))
         narrow = client.post("/api/frame", json=frame_payload([make_uri(0)]))
     assert wide == {422}
-    assert limited.status_code == 429 and limited.headers["retry-after"] == "10"
+    assert limited.status_code == 429 and limited.headers["retry-after"] in {"3", "4"}
     assert narrow.status_code == 200
 
 

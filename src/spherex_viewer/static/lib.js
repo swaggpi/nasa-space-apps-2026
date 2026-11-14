@@ -310,6 +310,64 @@ export function panStep(view, dx, dy, grid) {
 }
 
 /**
+ * Room, in grid pixels, between the view's leading edge and the loaded area's edge within
+ * which an arrow press that moved the view loads the area further on ahead of time.
+ */
+export const AHEAD_PIXELS = 1.5 * FIELD_PIXELS;
+
+/**
+ * Where to load ahead after an arrow press moved the view by (mx, my) on the wide grid: the
+ * new area's centre in whole fields from the loaded one, or null for no preload. Along the
+ * press, the area moves two fields when the view spans at most one field (one when it spans
+ * at most two; none when wider): the most that still holds the view once it reaches the
+ * loaded edge, so it joins on there. Across the press, it moves the most whole fields that
+ * still hold the view where it is, towards the side the view is off centre by at least a
+ * third of a field.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid
+ * @param {number} mx -1, 0 or 1: the press's movement (right = west)
+ * @param {number} my -1, 0 or 1 (down = south)
+ * @returns {{dx: number, dy: number} | null} fields right (west) and down (south)
+ */
+export function aheadShift(view, grid, mx, my) {
+  if (grid !== WIDE_PIXELS || (mx === 0 && my === 0)) return null;
+  const span = FIELD_PIXELS / view.zoom;
+  const along = Math.floor((grid - span + 1e-9) / FIELD_PIXELS);
+  if (along < 1) return null;
+  const lo = span / 2 - 0.5;
+  const hi = grid - 0.5 - span / 2;
+  const centre = (grid - 1) / 2;
+  const axis = (c, m) => {
+    if (m !== 0) return (m > 0 ? hi - c : c - lo) <= AHEAD_PIXELS ? m * Math.min(along, 2) : null;
+    const offset = c - centre;
+    if (Math.abs(offset) < FIELD_PIXELS / 3) return 0;
+    const behind = offset > 0 ? c - lo : hi - c;
+    return Math.sign(offset) * Math.min(2, Math.floor((behind + 1e-9) / FIELD_PIXELS));
+  };
+  const dx = axis(view.cx, mx);
+  const dy = axis(view.cy, my);
+  if (dx === null || dy === null) return null;
+  return { dx, dy };
+}
+
+/**
+ * The view over an area `shift` fields away, when that area holds all of it, else null.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid (that of the new area as well)
+ * @param {{dx: number, dy: number}} shift fields right (west) and down (south)
+ * @returns {{zoom: number, cx: number, cy: number} | null}
+ */
+export function shiftedView(view, grid, shift) {
+  const moved = {
+    zoom: view.zoom,
+    cx: view.cx - FIELD_PIXELS * shift.dx,
+    cy: view.cy - FIELD_PIXELS * shift.dy,
+  };
+  const held = clampView(moved, grid);
+  return held.cx === moved.cx && held.cy === moved.cy && held.zoom === moved.zoom ? moved : null;
+}
+
+/**
  * Size and place of the image stage in percent of the frame that shows the view.
  * @param {{zoom: number, cx: number, cy: number}} view
  * @param {number} grid pixels per side of the loaded grid

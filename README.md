@@ -134,9 +134,13 @@ No secrets are needed: all data sources are public. Outbound HTTPS honours the s
 
 ## Limits
 
-- Per client address: 10 searches at once, then 2 per minute; 60 frame requests at once, then
-  6 per minute; separately, 40 wide frame requests (`"fields": 3`) at once, then 6 per minute.
-  Beyond that the server answers 429 with a `Retry-After` header.
+- Per client address: 30 searches at once, then 6 per minute; 180 frame requests at once, then
+  18 per minute; separately, 120 wide frame requests (`"fields": 3`) at once, then 18 per
+  minute. Beyond that the server answers 429 with a `Retry-After` header. These are three times
+  the earlier limits, so the most one visitor can make the server fetch from the archive is
+  three times as much (in a burst about 0.2 GB of frames and 1 GB of wide frames, then about
+  0.5 and 1.5 GB per minute); the total load of all visitors stays bounded by the server-wide
+  limits below, which are unchanged.
 - At most 4 searches and 4 frame builds run at a time, and of the frame builds at most one
   wide one; a request that cannot start within 30 s (search) or 15 s (frame; a wide frame
   waits up to 15 s for the wide slot, then for a frame slot) gets 503.

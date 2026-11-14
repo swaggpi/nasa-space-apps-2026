@@ -78,6 +78,19 @@ body {
     var(--checker-at) var(--checker-at) / var(--checker) var(--checker);
 }
 
+/* While the surround is loading, the eight fields around the centre are plain: not loaded
+   yet, as distinct from the checkerboard of pixels without data. */
+#image.pending {
+  --not-loaded: linear-gradient(var(--panel) 0 0);
+  background:
+    var(--not-loaded) top / 100% calc(100% / 3) no-repeat,
+    var(--not-loaded) bottom / 100% calc(100% / 3) no-repeat,
+    var(--not-loaded) left / calc(100% / 3) 100% no-repeat,
+    var(--not-loaded) right / calc(100% / 3) 100% no-repeat,
+    repeating-conic-gradient(var(--nodata-a) 0 25%, var(--nodata-b) 0 50%)
+      var(--checker-at) var(--checker-at) / var(--checker) var(--checker);
+}
+
 /* A ring six image pixels across, centred on the target's position. */
 #marker {
   position: absolute;

@@ -2,7 +2,17 @@
 
 import pytest
 
-from spherex_viewer.ratelimit import INVALID_ADDRESS_KEY, RateLimiter, client_key
+from spherex_viewer.ratelimit import (
+    FRAME_BURST,
+    FRAME_PER_MINUTE,
+    INVALID_ADDRESS_KEY,
+    SEARCH_BURST,
+    SEARCH_PER_MINUTE,
+    WIDE_BURST,
+    WIDE_PER_MINUTE,
+    RateLimiter,
+    client_key,
+)
 
 
 class Clock:
@@ -96,3 +106,15 @@ def test_client_table_is_capped(clock):
 )
 def test_client_key(host, key):
     assert client_key(host) == key
+
+
+@pytest.mark.parametrize("burst, per_minute, limits, retry_after", [
+    (SEARCH_BURST, SEARCH_PER_MINUTE, (30, 6.0), 10),
+    (FRAME_BURST, FRAME_PER_MINUTE, (180, 18.0), 4),
+    (WIDE_BURST, WIDE_PER_MINUTE, (120, 18.0), 4),
+])
+def test_per_client_limits_and_their_retry_after(clock, burst, per_minute, limits, retry_after):
+    assert (burst, per_minute) == limits
+    limiter = RateLimiter(burst, per_minute, clock=clock)
+    assert [limiter.take("a") for _ in range(burst)] == [0] * burst
+    assert limiter.take("a") == retry_after
