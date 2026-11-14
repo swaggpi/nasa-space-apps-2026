@@ -1,4 +1,7 @@
-"""Live checks against the IRSA TAP service and the public S3 bucket (opt-in: `pytest -m live`)."""
+"""Live checks against the IRSA archive services and the public S3 bucket (opt-in: `pytest -m live`)."""
+
+import csv
+import io
 
 import httpx
 import numpy as np
@@ -9,6 +12,8 @@ from spherex_viewer.grid import GRID_SHAPE, target_wcs
 from spherex_viewer.remote import S3_BASE, HttpRangeReader, read_window, s3_url
 
 pytestmark = pytest.mark.live
+
+TAP_URL = "https://irsa.ipac.caltech.edu/TAP/sync"
 
 WISE_0855 = (133.795129, -7.245147)
 DEEP_FIELD = (270.0, 66.56)
@@ -54,6 +59,26 @@ def test_wise_0855_discovery_returns_sorted_rows(wise_exposures):
     assert len(wise_exposures) >= 48
     mjds = [e.mjd for e in wise_exposures]
     assert mjds == sorted(mjds)
+
+
+def tap_exposures(client, ra_deg: float, dec_deg: float, detector: str) -> list[tuple[str, float]]:
+    """Run the reference TAP query (slow: a full scan, 15-70 s) and return (uri, mjd) rows."""
+    query = (
+        "SELECT a.uri, p.time_bounds_lower FROM spherex.artifact a JOIN spherex.plane p "
+        f"ON a.planeid = p.planeid WHERE 1 = CONTAINS(POINT('ICRS', {ra_deg!r}, {dec_deg!r}), "
+        f"p.poly) AND p.energy_bandpassname = 'SPHEREx-{detector}' ORDER BY p.time_bounds_lower"
+    )
+    response = client.get(TAP_URL, params={"QUERY": query, "FORMAT": "CSV"}, timeout=300.0)
+    assert response.status_code == 200
+    rows = list(csv.reader(io.StringIO(response.text)))
+    assert rows[0] == ["uri", "time_bounds_lower"]
+    return [(uri, float(mjd)) for uri, mjd in rows[1:]]
+
+
+def test_discovery_matches_tap_query(client, wise_exposures):
+    reference = tap_exposures(client, *WISE_0855, "D2")
+    assert [e.uri for e in wise_exposures] == [uri for uri, _ in reference]
+    assert max(abs(e.mjd - mjd) for e, (_, mjd) in zip(wise_exposures, reference)) < 1e-6
 
 
 def check_window(client, statuses, uri: str, position: tuple[float, float]) -> None:
