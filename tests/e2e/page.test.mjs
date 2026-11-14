@@ -2381,14 +2381,38 @@ function texturedWide(n, payload, served) {
     narrow.n_used);
 }
 
-/** Searches `plan` and waits until its surround has replaced the narrow frames. */
+// More than 120 planned exposures: a deep field, whose surround loads only when first used and
+// which never loads ahead.
+const DEEP_FRAMES = [
+  { label: "2025-05-06", n_available: 40, n_used: 40 },
+  { label: "2025-11-07", n_available: 40, n_used: 40 },
+  { label: "2026-04-20", n_available: 41, n_used: 41 },
+];
+
+/** Waits until the surround's pixels have replaced the "not loaded" fields of the wide grid. */
+async function waitForSurround(page) {
+  await page.waitForFunction((n) => {
+    const image = document.querySelector("#image");
+    return image.width === n && !image.classList.contains("pending");
+  }, WIDE);
+}
+
+/**
+ * Searches `plan` and waits until its surround has replaced the narrow frames; for a deep
+ * field it zooms out once to load it and back in. The view is then at 1x on the centre.
+ */
 async function openWithSurround({ plan = makePlan(THREE_FRAMES), ...options } = {}) {
   const { page, log } = await openPage({
     search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
     ...options,
   });
   await submit(page);
-  await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+  await finalStatus(page);
+  if (plan.frames.reduce((n, f) => n + f.uris.length, 0) > 120) {
+    await page.click("#zoom-out");
+    await page.click("#zoom-in");
+  }
+  await waitForSurround(page);
   await finalStatus(page);
   await page.evaluate(() => document.activeElement.blur());
   return { page, log, plan };
@@ -2476,12 +2500,13 @@ test("the surround replaces the frames with the picture unchanged and enables zo
       assert.equal(await waitForStatus(page, (t) => t.includes("surrounding")),
         `${done} Loading the surrounding area: frame 1 of 3…`);
       await selectFrame(page, 1);
-      assert.equal(await page.isDisabled("#zoom-out"), true);
+      assert.equal(await page.isDisabled("#zoom-out"), false);
       assert.equal(await page.isDisabled("#zoom-in"), false);
-      assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [SIZE, SIZE]);
+      assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [WIDE, WIDE]);
+      assert.equal(await page.$eval("#image", (el) => el.classList.contains("pending")), true);
       const before = await page.locator("#frame").screenshot();
       gate.release();
-      await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+      await waitForSurround(page);
       assert.equal(await finalStatus(page), done);
       assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [WIDE, WIDE]);
       assert.ok(before.equals(await page.locator("#frame").screenshot()), "picture changed");
@@ -2500,9 +2525,9 @@ test("the surround replaces the frames with the picture unchanged and enables zo
     }
   });
 
-test("moving and zooming inside the loaded area sends no request", { timeout: TIMEOUT },
-  async () => {
-    const { page, log } = await openWithSurround();
+test("in a deep field moving and zooming inside the loaded area sends no request",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround({ plan: makePlan(DEEP_FRAMES) });
     const sent = apiRequests(log).length;
     await page.keyboard.type("+");
     await press(page, "ArrowLeft", 6);
@@ -2519,9 +2544,9 @@ test("moving and zooming inside the loaded area sends no request", { timeout: TI
     assertCleanRun(log);
   });
 
-test("a key held at the edge searches the next area once, only after it rests",
+test("in a deep field a key held at the edge searches the next area once, only after it rests",
   { timeout: TIMEOUT }, async () => {
-    const plan = makePlan(THREE_FRAMES);
+    const plan = makePlan(DEEP_FRAMES);
     const gate = deferred();
     const { page, log } = await openWithSurround({
       plan,
@@ -2559,13 +2584,13 @@ test("a key held at the edge searches the next area once, only after it rests",
 
 test("the next area replaces the frames with the view, zoom and playback kept and a new link",
   { timeout: TIMEOUT }, async () => {
-    const first = makePlan(THREE_FRAMES);
+    const first = makePlan(DEEP_FRAMES);
     const east = offsetPosition(first.ra_deg, first.dec_deg, -SIZE, 0);
     const eastTexts = fieldTexts(east.ra, east.dec);
     const second = {
       ...makePlan([
-        { label: "2025-06-01", n_available: 9, n_used: 9 },
-        { label: "2025-12-01", n_available: 6, n_used: 6 },
+        { label: "2025-06-01", n_available: 90, n_used: 90 },
+        { label: "2025-12-01", n_available: 60, n_used: 60 },
       ]),
       ra_deg: east.ra, dec_deg: east.dec,
     };
@@ -2587,7 +2612,7 @@ test("the next area replaces the frames with the view, zoom and playback kept an
     await page.keyboard.type("+");
     await press(page, "ArrowLeft", 25);
     await page.waitForFunction((ra) => location.search.includes(ra), eastTexts.ra);
-    assert.equal(await finalStatus(page), `2 frames from 15 of 15 exposures. ${NO_DATA}`);
+    assert.equal(await finalStatus(page), `2 frames from 150 of 150 exposures. ${NO_DATA}`);
     const link = `?ra=${eastTexts.ra}&dec=${eastTexts.dec}&detector=D2`;
     assert.equal(await page.evaluate(() => location.search), link);
     assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
@@ -2672,31 +2697,203 @@ test("the example zooms in and moves inside its field without any request; the m
         `marker at ${g.cx},${g.cy}, expected ${x},${y}`);
       assert.ok(Math.abs(g.width - 6 * pixel) <= 1, `marker ${g.width} px, pixel ${pixel} px`);
     };
-    assert.equal(await page.isDisabled("#zoom-out"), true);
+    assert.equal(await page.isDisabled("#zoom-out"), false);
     assert.equal(await page.isDisabled("#zoom-in"), false);
     await assertMarker({ zoom: 1, cx: 29, cy: 29 });
-    await page.keyboard.type("-");
-    await press(page, "ArrowLeft", 3);
-    await press(page, "ArrowDown", 3);
-    await page.waitForTimeout(700);
-    await assertStage(page, { zoom: 1, cx: 29, cy: 29 }, SIZE);
-    assert.equal(await page.isDisabled("#zoom-out"), true);
-
+    await page.keyboard.type("+");
     await page.click("#zoom-in");
+    await page.click("#zoom-out");
     await page.click("#zoom-in");
-    assert.equal(await page.isDisabled("#zoom-out"), false);
     await page.evaluate(() => document.activeElement.blur());
     await assertMarker({ zoom: 4, cx: 29, cy: 29 });
     await press(page, "ArrowLeft", 3);
     await assertStage(page, { zoom: 4, cx: 23, cy: 29 }, SIZE);
     await assertMarker({ zoom: 4, cx: 23, cy: 29 });
-    await press(page, "ArrowLeft", 15);
-    await press(page, "ArrowUp", 15);
+    await press(page, "ArrowLeft", 7);
+    await press(page, "ArrowUp", 11);
     await page.waitForTimeout(700);
-    await assertStage(page, { zoom: 4, cx: 6.875, cy: 6.875 }, SIZE);
+    await assertStage(page, { zoom: 4, cx: 9, cy: 7 }, SIZE);
     assert.deepEqual(apiRequests(log), []);
     assert.equal(await page.$eval("#image", (el) => el.width), SIZE);
     assertCleanRun(log);
+  });
+
+/** The live search at the example's position: the stub example's coordinates, detector D6. */
+function examplePlan() {
+  const texts = fieldTexts(EXAMPLE.ra_deg, EXAMPLE.dec_deg);
+  return {
+    texts,
+    plan: { ...makePlan([...THREE_FRAMES, { label: "2026-08-01", n_available: 5, n_used: 5 }],
+      { detector: "D6" }), ra_deg: Number(texts.ra), dec_deg: Number(texts.dec) },
+  };
+}
+
+test("on the example the first arrow press past its field moves at once and loads the real "
+  + "surroundings with one search there; the example plays until they replace it",
+{ timeout: TIMEOUT }, async () => {
+  const { texts, plan } = examplePlan();
+  const frameGate = deferred();
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }),
+    frame: async (n) => {
+      await frameGate.promise;
+      return frameBody(pixels(n), plan.frames[n].n_used);
+    },
+    wide: texturedWide,
+  });
+  try {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await page.waitForTimeout(500);
+    assert.deepEqual(apiRequests(log), []);
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    await press(page, "ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 81, cy: 88 }, WIDE);
+    assert.equal(await page.$eval("#image", (el) => el.classList.contains("pending")), true);
+    // East of the example's field nothing is loaded yet: drawn plain (--panel), not checkered.
+    const shot = await renderedCanvas(page);
+    const i = 4 * (Math.round(shot.height / 2) * shot.width + 2);
+    assert.deepEqual(shot.data.slice(i, i + 3), [21, 25, 34]);
+    await waitForStatus(page, (t) => t.startsWith("Loading the example's surroundings"));
+    assert.equal(log.searches.length, 1);
+    const params = log.searches[0].searchParams;
+    assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
+      [texts.ra, texts.dec, "D6"]);
+    await press(page, "ArrowLeft", 12);
+    await page.click("#zoom-out");
+    await page.evaluate(() => document.activeElement.blur());
+    assert.equal(log.searches.length, 1);
+    assert.equal(await text(page, "#play"), "Pause");
+    const playing = (await sliderState(page)).value;
+    await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+      playing, { timeout: 2000 });
+    assert.equal((await sliderState(page)).max, 2);
+    assert.equal(await text(page, "#name"), EXAMPLE.name);
+    assert.equal(await page.isVisible("#marker-control"), true);
+    const view = { zoom: 1 / 2, cx: 58.5, cy: 88 };
+    await assertStage(page, view, WIDE);
+
+    frameGate.release();
+    await waitForSurround(page);
+    assert.equal(await finalStatus(page), `4 frames from 47 of 47 exposures. ${NO_DATA}`);
+    await assertStage(page, view, WIDE);
+    assert.equal((await sliderState(page)).max, 3);
+    assert.equal(log.searches.length, 1);
+    assert.equal(log.frames.length, 4);
+    assert.deepEqual(log.wides.map((p) => [p.ra_deg, p.dec_deg]),
+      Array(4).fill([plan.ra_deg, plan.dec_deg]));
+    assert.equal(await page.evaluate(() => location.search),
+      `?ra=${texts.ra}&dec=${texts.dec}&detector=D6`);
+    assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec"),
+      await page.inputValue("#detector")], [texts.ra, texts.dec, "D6"]);
+    assert.equal(await text(page, "#position"), formatPosition(plan.ra_deg, plan.dec_deg, "D6"));
+    assert.equal(await page.isVisible("#marker-control"), false);
+    assert.equal(await text(page, "#play"), "Pause");
+    assertCleanRun(log);
+  } finally {
+    frameGate.release();
+  }
+});
+
+test("on the example the first zoom-out zooms out at once and loads the surroundings with one "
+  + "search", { timeout: TIMEOUT }, async () => {
+  const { texts, plan } = examplePlan();
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+  });
+  await page.waitForTimeout(300);
+  assert.deepEqual(apiRequests(log), []);
+  await page.click("#zoom-out");
+  await assertStage(page, { zoom: 1 / 2, cx: 88, cy: 88 }, WIDE);
+  await waitForSurround(page);
+  assert.equal(await finalStatus(page), `4 frames from 47 of 47 exposures. ${NO_DATA}`);
+  assert.equal(log.searches.length, 1);
+  assert.deepEqual([log.searches[0].searchParams.get("ra"),
+    log.searches[0].searchParams.get("dec")], [texts.ra, texts.dec]);
+  assert.deepEqual([log.frames.length, log.wides.length], [4, 4]);
+  await page.click("#zoom-out");
+  await assertStage(page, { zoom: 1 / 3, cx: 88, cy: 88 }, WIDE);
+  assert.equal(await page.isDisabled("#zoom-out"), true);
+  assertCleanRun(log);
+});
+
+test("on the example an unavailable archive is reported and the example stays usable",
+  { timeout: TIMEOUT }, async () => {
+    const down = "The archive search failed. Try again later.";
+    const { page, log } = await openPage({
+      search: () => ({ status: 502, body: { detail: down } }),
+    });
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    await press(page, "ArrowRight");
+    assert.equal(await waitForStatus(page, (t) => t.startsWith("The surroundings")),
+      `The surroundings of the example could not be loaded from the archive: ${down}`);
+    assert.equal(log.searches.length, 1);
+    await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
+    await press(page, "ArrowLeft", 2);
+    await assertStage(page, { zoom: 1, cx: 81, cy: 88 }, WIDE);
+    assert.equal(await text(page, "#play"), "Pause");
+    const value = (await sliderState(page)).value;
+    await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
+      value, { timeout: 2000 });
+    await page.click("#play");
+    assert.equal(await text(page, "#name"), EXAMPLE.name);
+    assert.equal(await page.evaluate(() => location.search), "");
+    assert.deepEqual(await canvasPixels(page), exampleRGBA((await sliderState(page)).value));
+    await page.waitForTimeout(700);
+    assert.equal(log.searches.length, 1);
+    // A deliberate zoom-out tries again.
+    await page.click("#zoom-out");
+    const deadline = Date.now() + 5000;
+    while (log.searches.length < 2 && Date.now() < deadline) await page.waitForTimeout(50);
+    assert.equal(log.searches.length, 2);
+    await waitForStatus(page, (t) => t.startsWith("The surroundings"));
+    assertCleanRun(log);
+  });
+
+test("arrows and zoom-out act at once while the surround loads; it fills in without a jump",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const { page, log } = await openPage({
+      search: (url) => (url.searchParams.get("ra") === RA
+        ? { status: 200, body: plan } : { status: 500, body: { detail: "unexpected" } }),
+      frame: frameOk(plan),
+      wide: async (n, payload, served) => {
+        await gate.promise;
+        return texturedWide(n, payload, served);
+      },
+    });
+    try {
+      await page.setViewportSize({ width: 1366, height: 768 });
+      await submit(page);
+      await waitForStatus(page, (t) => t.includes("Loading the surrounding area"));
+      await page.evaluate(() => document.activeElement.blur());
+      await press(page, "ArrowLeft", 3);
+      await assertStage(page, { zoom: 1, cx: 67, cy: 88 }, WIDE);
+      await page.click("#zoom-out");
+      await assertStage(page, { zoom: 1 / 2, cx: 67, cy: 88 }, WIDE);
+      assert.ok((await statusText(page)).includes("Loading the surrounding area: frame 1 of 3"));
+      const before = await renderedCanvas(page);
+      const left = 4 * (Math.round(before.height / 2) * before.width + 2);
+      assert.deepEqual(before.data.slice(left, left + 3), [21, 25, 34]);
+      await page.evaluate(() => document.activeElement.blur());
+      await press(page, "ArrowUp");
+      await assertStage(page, { zoom: 1 / 2, cx: 67, cy: 73 }, WIDE);
+      await page.waitForTimeout(700);
+      assert.equal(log.searches.length, 1);
+      assert.equal(log.wides.length, 1);
+
+      gate.release();
+      await waitForSurround(page);
+      await assertStage(page, { zoom: 1 / 2, cx: 67, cy: 73 }, WIDE);
+      const after = await renderedCanvas(page);
+      assert.notDeepEqual(after.data.slice(left, left + 3), [21, 25, 34]);
+      assert.equal(log.searches.length, 1);
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
   });
 
 test("a surround refused twice leaves the loop as it was and Zoom out tries again",
@@ -2714,7 +2911,7 @@ test("a surround refused twice leaves the loop as it was and Zoom out tries agai
     assert.equal(await waitForStatus(page, (t) => t.includes("could not")),
       `${done} The surrounding area could not be loaded: ${busy}`);
     assert.equal(log.wides.length, 2);
-    assert.equal(await page.$eval("#image", (el) => el.width), SIZE);
+    assert.equal(await page.$eval("#image", (el) => el.classList.contains("pending")), true);
     assert.deepEqual(await canvasPixels(page),
       Array.from(toRGBA(pixels(0), computeStretch([0, 1, 2].map((n) => pixels(n))))));
     await page.click("#play");
@@ -2723,43 +2920,61 @@ test("a surround refused twice leaves the loop as it was and Zoom out tries agai
       before, { timeout: 2000 });
     assert.equal(await page.isDisabled("#zoom-out"), false);
     await page.click("#zoom-out");
-    await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+    await waitForSurround(page);
     assert.equal(await finalStatus(page), done);
     assert.equal(log.wides.length, 5);
     assert.equal(await text(page, "#play"), "Pause");
     assertCleanRun(log);
   });
 
-test("a search of more than 120 exposures loads its surround only at the first zoom-out",
-  { timeout: TIMEOUT }, async () => {
-    const plan = makePlan([
-      { label: "2025-05-06", n_available: 40, n_used: 40 },
-      { label: "2025-11-07", n_available: 40, n_used: 40 },
-      { label: "2026-04-20", n_available: 41, n_used: 41 },
-    ]);
+test("a search of more than 120 exposures loads its surround only when first used, and the "
+  + "first zoom-out or arrow past the field acts at once", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(DEEP_FRAMES);
+  for (const action of ["zoom-out", "arrow"]) {
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
     });
+    await page.setViewportSize({ width: 1366, height: 768 });
     await submit(page);
     assert.equal(await finalStatus(page), `3 frames from 121 of 121 exposures. ${NO_DATA}`);
     await page.waitForTimeout(800);
     assert.equal(log.wides.length, 0);
+    const narrow = await page.locator("#frame").screenshot();
     await page.click("#zoom-in");
+    await page.evaluate(() => document.activeElement.blur());
+    await press(page, "ArrowUp", 2);
+    await press(page, "ArrowDown", 2);
     await page.click("#zoom-out");
+    await page.evaluate(() => document.activeElement.blur());
     await page.waitForTimeout(300);
     assert.equal(log.wides.length, 0);
-    await page.click("#zoom-out");
-    await page.waitForFunction((n) => document.querySelector("#image").width === n, WIDE);
+    assert.equal(await page.$eval("#image", (el) => el.width), SIZE);
+    if (action === "zoom-out") {
+      await page.click("#zoom-out");
+      await assertStage(page, { zoom: 1 / 2, cx: 88, cy: 88 }, WIDE);
+    } else {
+      await press(page, "ArrowRight");
+      await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
+    }
+    assert.ok((await statusText(page)).includes("Loading the surrounding area: frame"));
+    await waitForSurround(page);
     assert.equal(log.wides.length, 3);
+    if (action === "zoom-out") await page.click("#zoom-in");
+    else await press(page, "ArrowLeft");
     await assertStage(page, { zoom: 1, cx: 88, cy: 88 }, WIDE);
+    await page.mouse.move(0, 0);
+    assert.ok(narrow.equals(await page.locator("#frame").screenshot()), "picture changed");
+    assert.equal(log.searches.length, 1);
     assertCleanRun(log);
-  });
+    await page.close();
+  }
+});
 
 test("the date label gives the range of exposures over the fields in view",
   { timeout: TIMEOUT }, async () => {
     const plan = makePlan([
-      { label: "2025-05-06", n_available: 24, n_used: 24 },
-      { label: "2025-11-07", n_available: 24, n_used: 24 },
+      { label: "2025-05-06", n_available: 61, n_used: 61 },
+      { label: "2025-11-07", n_available: 61, n_used: 61 },
     ]);
     const counts = [23, 23, 23, 24, 24, 24, 23, 23, 23];
     const { page, log } = await openWithSurround({
@@ -2777,7 +2992,7 @@ test("the date label gives the range of exposures over the fields in view",
     await page.evaluate(() => document.activeElement.blur());
     await press(page, "ArrowDown");
     assert.equal(await dateText(page), "2025-11-07 · 24 exposures");
-    assert.equal(await statusText(page), `2 frames from 48 of 48 exposures. ${NO_DATA}`);
+    assert.equal(await statusText(page), `2 frames from 122 of 122 exposures. ${NO_DATA}`);
     assertCleanRun(log);
   });
 
@@ -2801,4 +3016,291 @@ test("keys do nothing while the sky map is open; on a phone the timeline keeps i
     assert.ok(rects["#zoom-in"].bottom <= slider.top, "zoom buttons not above the timeline");
     assert.ok(rects["#zoom-in"].right <= width && scrollWidth <= width);
     assertCleanMapRun(log);
+  });
+
+/** The id of the focused element, "" for the page itself. */
+const focused = (page) => page.evaluate(() => document.activeElement?.id ?? "");
+
+test("after Play, a frame button or a zoom button the arrow keys move the view",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround({ plan: makePlan(DEEP_FRAMES) });
+    await page.click("#play");
+    await press(page, "ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 81, cy: 88 }, WIDE);
+    await page.click("#next");
+    assert.equal(await focused(page), "next");
+    await press(page, "ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 74, cy: 88 }, WIDE);
+    await page.click("#prev");
+    await press(page, "ArrowUp");
+    await assertStage(page, { zoom: 1, cx: 74, cy: 81 }, WIDE);
+    await page.click("#zoom-in");
+    await page.click("#zoom-in");
+    assert.equal(await page.isDisabled("#zoom-in"), true);
+    await press(page, "ArrowRight");
+    await assertStage(page, { zoom: 4, cx: 76, cy: 81 }, WIDE);
+    await page.click("#zoom-out");
+    await press(page, "ArrowDown");
+    await assertStage(page, { zoom: 2, cx: 76, cy: 85 }, WIDE);
+    assert.equal(await page.evaluate(() => window.scrollY), 0);
+    assert.equal(log.searches.length, 1);
+    assertCleanRun(log);
+  });
+
+test("Enter in a coordinate field searches and, once the search is accepted, leaves the field "
+  + "for Show so that the arrow keys look around", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(DEEP_FRAMES);
+  const { page, log } = await openPage({
+    search: (url) => (url.searchParams.get("ra") === "abc"
+      ? { status: 422, body: { detail: INVALID_RA } } : { status: 200, body: plan }),
+    frame: frameOk(plan), wide: texturedWide,
+  });
+  await page.fill("#ra", "abc");
+  await page.fill("#dec", DEC);
+  await page.press("#dec", "Enter");
+  assert.equal(await waitForStatus(page, (t) => t.startsWith("Error")), `Error: ${INVALID_RA}`);
+  assert.equal(await focused(page), "dec");
+  await page.fill("#ra", RA);
+  await page.press("#ra", "Enter");
+  await finalStatus(page);
+  assert.equal(await focused(page), "submit");
+  await press(page, "ArrowLeft");
+  await assertStage(page, { zoom: 1, cx: 81, cy: 88 }, WIDE);
+  assert.equal(await page.inputValue("#ra"), RA);
+  await waitForSurround(page);
+  assert.equal(log.searches.length, 2);
+  assertCleanRun(log);
+});
+
+test("after Search here the arrow keys move the view at once", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(DEEP_FRAMES);
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan), wide: texturedWide,
+  });
+  await openMap(page);
+  await clickMap(page, 25, 15);
+  await page.click("#sky-search");
+  await page.waitForFunction(() => document.querySelector("#date").textContent !== ""
+    && document.querySelector("#status").textContent.startsWith("Loading frame 2"));
+  assert.equal(await focused(page), "pick");
+  await press(page, "ArrowRight");
+  await assertStage(page, { zoom: 1, cx: 95, cy: 88 }, WIDE);
+  await finalStatus(page);
+  await waitForSurround(page);
+  await press(page, "ArrowRight");
+  await assertStage(page, { zoom: 1, cx: 102, cy: 88 }, WIDE);
+  assert.equal(log.searches.length, 1);
+  assertCleanMapRun(log);
+});
+
+/** A field of 59 x 59 values; every field of a wide grid repeats it, so all fields look alike. */
+// Multiples of 1/64 are exact in float32, so wide and narrow answers give the same stretch.
+const tiled = (x, y) => (((x % SIZE) * 7 + (y % SIZE) * 3) % 50) / 64;
+
+/** The search answer for any position: THREE_FRAMES at the position asked for. */
+function planAt(url) {
+  return { ...makePlan(THREE_FRAMES), ra_deg: Number(url.searchParams.get("ra")),
+    dec_deg: Number(url.searchParams.get("dec")) };
+}
+
+/** Stubs for searches anywhere, with every frame the tiled field (narrow) or its 3 x 3 tiling. */
+function tiledStubs(search) {
+  return {
+    search,
+    frame: (n, payload) => frameBody(Array.from({ length: SIZE * SIZE },
+      (_, i) => tiled(i % SIZE, Math.floor(i / SIZE))), payload.uris.length),
+    wide: (n, payload) => wideBody(Array.from({ length: WIDE * WIDE },
+      (_, i) => tiled(i % WIDE, Math.floor(i / WIDE))), payload.uris.length),
+  };
+}
+
+async function waitForCount(list, n, ms = 5000) {
+  const deadline = Date.now() + ms;
+  while (list.length < n && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  assert.equal(list.length, n);
+}
+
+function assertSamePicture(a, b) {
+  assert.deepEqual([a.width, a.height], [b.width, b.height]);
+  let differing = 0;
+  for (let i = 0; i < a.data.length; i += 4) {
+    const d = Math.max(...[0, 1, 2].map((k) => Math.abs(a.data[i + k] - b.data[i + k])));
+    assert.ok(d <= 16, `pixel ${i / 4} differs by ${d}`);
+    if (d > 0) differing += 1;
+  }
+  assert.ok(differing <= a.width * a.height / 1000, `${differing} pixels differ`);
+}
+
+const searchedAt = (url) => [url.searchParams.get("ra"), url.searchParams.get("dec"),
+  url.searchParams.get("detector")];
+
+test("moving left loads the area two fields further left ahead with one search; at the old "
+  + "edge the view runs on into it with no blank and no further search", { timeout: TIMEOUT },
+async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const gate = deferred();
+  const { page, log } = await openWithSurround({
+    plan,
+    ...tiledStubs(async (url) => {
+      if (url.searchParams.get("ra") === RA) return { status: 200, body: plan };
+      await gate.promise;
+      return { status: 200, body: planAt(url) };
+    }),
+  });
+  try {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    const start = await renderedCanvas(page);
+    await press(page, "ArrowLeft");
+    await waitForCount(log.searches, 2);
+    const east = offsetPosition(plan.ra_deg, plan.dec_deg, -2 * SIZE, 0);
+    const eastTexts = fieldTexts(east.ra, east.dec);
+    assert.deepEqual(searchedAt(log.searches[1]), [eastTexts.ra, eastTexts.dec, "D2"]);
+    await assertStage(page, { zoom: 1, cx: 81, cy: 88 }, WIDE);
+    for (let i = 0; i < 5; i++) await page.keyboard.down("ArrowLeft");
+    await page.keyboard.up("ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 46, cy: 88 }, WIDE);
+    await page.waitForTimeout(700);
+    assert.equal(log.searches.length, 2);
+
+    gate.release();
+    await waitForCount(log.wides, 6);
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures.`);
+    assert.equal(await page.evaluate(() => location.search),
+      `?ra=${encodeURIComponent(RA)}&dec=${encodeURIComponent(DEC)}&detector=D2`);
+    await assertStage(page, { zoom: 1, cx: 46, cy: 88 }, WIDE);
+    await press(page, "ArrowLeft", 2);
+    await assertStage(page, { zoom: 1, cx: 32, cy: 88 }, WIDE);
+    await press(page, "ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 147, cy: 88 }, WIDE);
+    assert.equal(await page.$eval("#image", (el) => el.classList.contains("pending")), false);
+    // The same sky, drawn at another place of the grid: the browser's resampling may differ in
+    // a few pixels by a few levels; a blank or another stretch would differ everywhere.
+    assertSamePicture(start, await renderedCanvas(page));
+    assert.equal(await page.evaluate(() => location.search),
+      `?ra=${eastTexts.ra}&dec=${eastTexts.dec}&detector=D2`);
+    assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
+      [eastTexts.ra, eastTexts.dec]);
+    await press(page, "ArrowLeft", 2);
+    await assertStage(page, { zoom: 1, cx: 133, cy: 88 }, WIDE);
+    await page.waitForTimeout(700);
+    assert.equal(log.searches.length, 2);
+    await press(page, "ArrowLeft", 3);
+    await waitForCount(log.searches, 3);
+    const further = offsetPosition(east.ra, east.dec, -2 * SIZE, 0);
+    assert.deepEqual(searchedAt(log.searches[2]).slice(0, 2),
+      [fieldTexts(further.ra, further.dec).ra, fieldTexts(further.ra, further.dec).dec]);
+    assertCleanRun(log);
+  } finally {
+    gate.release();
+  }
+});
+
+test("no preload starts while frames are loading; the first move after they are in starts one",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const stubs = tiledStubs((url) => (url.searchParams.get("ra") === RA
+      ? { status: 200, body: plan } : { status: 200, body: planAt(url) }));
+    const { page, log } = await openPage({
+      ...stubs,
+      frame: async (n, payload) => {
+        if (n === 2) await gate.promise;
+        return stubs.frame(n, payload);
+      },
+    });
+    try {
+      await submit(page);
+      await waitForStatus(page, (t) => t.startsWith("Loading frame 3"));
+      await page.evaluate(() => document.activeElement.blur());
+      await press(page, "ArrowLeft", 4);
+      await assertStage(page, { zoom: 1, cx: 60, cy: 88 }, WIDE);
+      await page.waitForTimeout(700);
+      assert.deepEqual([log.searches.length, log.wides.length], [1, 0]);
+      gate.release();
+      await waitForSurround(page);
+      await page.waitForTimeout(300);
+      assert.equal(log.searches.length, 1);
+      await press(page, "ArrowRight");
+      await waitForCount(log.searches, 2);
+      const west = offsetPosition(plan.ra_deg, plan.dec_deg, 2 * SIZE, 0);
+      assert.deepEqual(searchedAt(log.searches[1]),
+        [fieldTexts(west.ra, west.dec).ra, fieldTexts(west.ra, west.dec).dec, "D2"]);
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("a preload refused with 429 is reported once, moving keeps working, and it is tried again "
+  + "by itself only when the limit allows", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  let refused = null;
+  const { page, log } = await openWithSurround({
+    plan,
+    ...tiledStubs((url) => {
+      if (url.searchParams.get("ra") === RA) return { status: 200, body: plan };
+      if (refused === null) {
+        refused = Date.now();
+        return { status: 429, body: { detail: "Too many requests. Try again in 2 s." },
+          headers: { "Retry-After": "2" } };
+      }
+      return { status: 200, body: planAt(url) };
+    }),
+  });
+  await recordStatuses(page);
+  const done = "3 frames from 42 of 42 exposures.";
+  await press(page, "ArrowLeft");
+  const limit = `${done} The search limit is reached; loading further on continues in 2 s.`;
+  assert.equal(await waitForStatus(page, (t) => t.includes("limit")), limit);
+  await press(page, "ArrowLeft", 3);
+  await press(page, "ArrowUp", 2);
+  await assertStage(page, { zoom: 1, cx: 60, cy: 74 }, WIDE);
+  for (let i = 0; i < 10; i++) await page.keyboard.down("ArrowLeft");
+  await page.keyboard.up("ArrowLeft");
+  await page.waitForTimeout(500);
+  assert.ok(Date.now() - refused < 1900, "test too slow");
+  assert.equal(log.searches.length, 2);
+  await waitForCount(log.searches, 3);
+  assert.ok(Date.now() - refused >= 1900, `retried after ${Date.now() - refused} ms`);
+  await waitForCount(log.wides, 6);
+  await finalStatus(page);
+  const history = await statusHistory(page);
+  assert.equal(history.filter((t) => t === limit).length, 1, JSON.stringify(history));
+  await page.waitForTimeout(500);
+  assert.equal(log.searches.length, 3);
+  assertCleanRun(log);
+});
+
+test("each direction loads its own neighbour ahead; off centre across the move it goes diagonal",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const cases = { ArrowLeft: [-2, 0], ArrowRight: [2, 0], ArrowUp: [0, -2], ArrowDown: [0, 2] };
+    for (const [key, [dx, dy]] of Object.entries(cases)) {
+      const { page, log } = await openWithSurround({
+        plan,
+        ...tiledStubs((url) => (url.searchParams.get("ra") === RA
+          ? { status: 200, body: plan }
+          : { status: 502, body: { detail: "The archive search failed. Try again later." } })),
+      });
+      await press(page, key);
+      await waitForCount(log.searches, 2);
+      const c = offsetPosition(plan.ra_deg, plan.dec_deg, SIZE * dx, SIZE * dy);
+      assert.deepEqual(searchedAt(log.searches[1]),
+        [fieldTexts(c.ra, c.dec).ra, fieldTexts(c.ra, c.dec).dec, "D2"], key);
+      if (key === "ArrowUp") {
+        assert.equal(await waitForStatus(page, (t) => t.startsWith("The next area")),
+          "The next area could not be loaded: The archive search failed. Try again later.");
+        await press(page, "ArrowUp", 4);
+        await assertStage(page, { zoom: 1, cx: 88, cy: 53 }, WIDE);
+        await page.waitForTimeout(300);
+        assert.equal(log.searches.length, 2);
+        await press(page, "ArrowLeft");
+        await waitForCount(log.searches, 3);
+        const ne = offsetPosition(plan.ra_deg, plan.dec_deg, -2 * SIZE, -SIZE);
+        assert.deepEqual(searchedAt(log.searches[2]),
+          [fieldTexts(ne.ra, ne.dec).ra, fieldTexts(ne.ra, ne.dec).dec, "D2"]);
+      }
+      assertCleanRun(log);
+      await page.close();
+    }
   });

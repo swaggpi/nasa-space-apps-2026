@@ -27,16 +27,35 @@ the marker and the difference view, and always shows the search: "Pick on sky ma
 Dec fields, the detector with its wavelength range (D2 by default) and "Show".
 
 The − and + buttons beside the timeline, or the − and + keys, zoom the image while it plays,
-from 18′ to 1.5′ across; the arrow keys move the view (Left is east, Up is north). After the
-last frame of a search has loaded, the page loads the surrounding area: one 18′ frame (3×3
-fields) per visit, from the same exposures, about 2.6 times the archive bytes of the normal
-frames. For loops of more than 120 exposures it loads only at the first zoom-out or move. The
-surround uses each exposure's sky level from the central field, so the centre stays exactly as
-it was when the surround arrives; it has fewer exposures towards the edges (the label then
-shows a range such as `23–24 exposures`) and can show a faint brightness ramp (see
-Limitations). Holding an arrow key at the edge of the loaded area and resting for half a
-second searches the next 6′ field in that direction; the frames shown keep playing until it
-has loaded, and the address bar then names its centre.
+from 18′ to 1.5′ across; the arrow keys move the view (Left is east, Up is north). They act at
+once: after the last frame of a search has loaded, the page loads the surrounding area (one
+18′ frame, 3×3 fields, per visit, from the same exposures, about 2.6 times the archive bytes
+of the normal frames), and until it has arrived the fields around the centre are drawn plain
+grey ("not loaded yet", unlike the checkerboard of pixels without data) and fill in where
+they are, the view staying put. For loops of more than 120 exposures it loads only at the
+first zoom-out or move past the field. The surround uses each exposure's sky level from the
+central field, so the centre stays exactly as it was when the surround arrives; it has fewer
+exposures towards the edges (the label then shows a range such as `23–24 exposures`) and can
+show a faint brightness ramp (see Limitations). On the example, the first zoom-out or move
+past its field searches the archive at the example's position and detector, exactly as a
+search there; the example keeps playing until those frames replace it.
+
+Moving towards an edge loads the area further on ahead, one search and its 18′ frames: an
+arrow press that leaves the view within 1.5 fields (9′) of the edge it moves towards starts
+it, centred two fields (12′) on in that direction (one field when zoomed out to 12′; also one
+or two fields across when the view is that far off centre, so diagonally). The frames shown
+keep playing meanwhile; the new area replaces them when the view lies wholly inside it — at
+the latest at the old edge — with the sky in place, and the address bar and the RA/Dec
+fields then name its centre. One such load runs at a time, never while anything else loads,
+not in loops of more than 120 exposures, and not again in a direction where it failed; when
+the search limit is reached the status line says so once and loading resumes by itself when
+the limit allows. If nothing was loaded ahead, holding an arrow key at the edge and resting
+for half a second searches the next 6′ field in that direction.
+
+The arrow keys act on the page, its buttons and checkboxes, not while typing in RA or Dec,
+in the detector list, on the timeline (where they step frames) or with the sky map open.
+After a search from the RA/Dec fields with Enter has been accepted, the focus moves to
+"Show"; after "Search here" it returns to "Pick on sky map", so the keys look around at once.
 
 "Pick on sky map" replaces the image with a map of the sky (2MASS J, H, K colour images,
 near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
@@ -104,6 +123,11 @@ must only be reachable through the reverse proxy: publish it on the loopback int
 network when Caddy runs in a container.
 
 `GET /healthz` returns 200 `{"status":"ok"}` once the app is ready.
+
+The page's own files (HTML, scripts, stylesheet, `example.json`, the map library) are served
+with `Cache-Control: no-cache` besides `ETag` and `Last-Modified`: a browser revalidates each
+before use (a cheap 304 while unchanged), so after a redeployment it never runs an old
+script with a new page. API answers carry no caching headers.
 
 Everything that must survive a restart lives under `/data`: the on-disk cutout cache in
 `/data/cutouts`, created on first start. Mount a named volume or any host directory there.
