@@ -14,6 +14,10 @@ SEARCH_PER_MINUTE = 2.0
 # Each frame reads up to 24 exposures (~1.2 MB each): a few searches' frames, then one per 10 s.
 FRAME_BURST = 60
 FRAME_PER_MINUTE = 6.0
+# A wide frame (3 x 3 fields) reads up to 24 exposures of ~3.3 MB. Its own budget, so loading
+# the surroundings never uses up the budget of the frames a visitor waits for.
+WIDE_BURST = 40
+WIDE_PER_MINUTE = 6.0
 # With keys from `client_key` (at most 24 characters), 10,000 entries take about 2.5 MB.
 MAX_CLIENTS = 10_000
 # The one key shared by every client whose address is not a valid IP address.

@@ -26,6 +26,18 @@ and the date (or date range) and exposure count of the shown frame. The target p
 the marker and the difference view, and always shows the search: "Pick on sky map", the RA and
 Dec fields, the detector with its wavelength range (D2 by default) and "Show".
 
+The − and + buttons beside the timeline, or the − and + keys, zoom the image while it plays,
+from 18′ to 1.5′ across; the arrow keys move the view (Left is east, Up is north). After the
+last frame of a search has loaded, the page loads the surrounding area: one 18′ frame (3×3
+fields) per visit, from the same exposures, about 2.6 times the archive bytes of the normal
+frames. For loops of more than 120 exposures it loads only at the first zoom-out or move. The
+surround uses each exposure's sky level from the central field, so the centre stays exactly as
+it was when the surround arrives; it has fewer exposures towards the edges (the label then
+shows a range such as `23–24 exposures`) and can show a faint brightness ramp (see
+Limitations). Holding an arrow key at the edge of the loaded area and resting for half a
+second searches the next 6′ field in that direction; the frames shown keep playing until it
+has loaded, and the address bar then names its centre.
+
 "Pick on sky map" replaces the image with a map of the sky (2MASS J, H, K colour images,
 near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
 scroll, pinch or use −/+ to zoom between the whole sky and 2′. A click or tap selects a
@@ -96,6 +108,20 @@ network when Caddy runs in a container.
 Everything that must survive a restart lives under `/data`: the on-disk cutout cache in
 `/data/cutouts`, created on first start. Mount a named volume or any host directory there.
 
+## API
+
+- `GET /api/search?ra=…&dec=…&detector=D2` lists the frames of a position: per visit its date
+  label, exposure counts and exposure URIs.
+- `POST /api/frame` with `{"ra_deg": …, "dec_deg": …, "uris": [...]}` (one frame's URIs from
+  the search) answers `{"width": 59, "height": 59, "pixels": [...], "n_used": …}`: 3,481
+  values in MJy/sr, row by row with the first row north and the first column east, `null`
+  where there is no data. With `"fields": 3` it builds the frame and its surround, 3×3 fields
+  of 59 pixels, and answers `{"width": 177, "height": 177, "pixels_b64": …, "n_used": …,
+  "n_fields": [...]}`: `pixels_b64` is the base64 of 31,329 little-endian float32 values in the
+  same order (NaN where there is no data), `n_fields` the exposures with data in each field
+  (north row first, east column first) and `n_used` that of the central field. The central
+  59×59 pixels equal the 1-field frame. `fields` is 1 (the default) or 3.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -109,11 +135,14 @@ No secrets are needed: all data sources are public. Outbound HTTPS honours the s
 ## Limits
 
 - Per client address: 10 searches at once, then 2 per minute; 60 frame requests at once, then
-  6 per minute. Beyond that the server answers 429 with a `Retry-After` header.
-- At most 4 searches and 4 frame builds run at a time; a request that cannot start within
-  30 s (search) or 15 s (frame) gets 503.
+  6 per minute; separately, 40 wide frame requests (`"fields": 3`) at once, then 6 per minute.
+  Beyond that the server answers 429 with a `Retry-After` header.
+- At most 4 searches and 4 frame builds run at a time, and of the frame builds at most one
+  wide one; a request that cannot start within 30 s (search) or 15 s (frame; a wide frame
+  waits up to 15 s for the wide slot, then for a frame slot) gets 503.
 - The cutout cache is capped at `SPHEREX_CACHE_MAX_MB`; older cutouts are
-  removed when it is exceeded. A typical search adds about 0.7 MB, a deep field about 6 MB.
+  removed when it is exceeded. A typical search adds about 0.7 MB, a deep field about 6 MB;
+  its surround about 8 MB, a deep field's about 54 MB.
 
 ## Tests and validation
 
@@ -181,6 +210,11 @@ asked again after the wait it names. On a failed check or an unreachable server 
   46.5 elsewhere). In frames from more than five exposures, no pixel more than 9 px from the
   centre reaches half scale (64) in any of the checked loops, so the fainter field stars there
   stay below it.
+- **Surround**: it uses only exposures that cover the central field, with each exposure's
+  sky level from that field, so exposures thin out towards its edges and a frame from one or
+  two exposures can have empty patches there. One constant per exposure leaves the real sky
+  gradient: across 18′ the field medians differ by about one frame noise level, differently
+  per frame, so a faint brightness ramp can show (in the 6′ frame about a third of that).
 - **Exposure cap**: above 24 exposures per frame, exposures are picked evenly spaced in time
   order (every k-th exposure), not at evenly spaced clock times; this samples the detector's
   wavelength range more evenly.

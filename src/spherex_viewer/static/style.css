@@ -50,24 +50,39 @@ body {
   position: relative;
   width: var(--size);
   height: var(--size);
+  overflow: hidden;
+  border-radius: 4px;
 }
 
-/* Transparent (no-data) pixels show this checkerboard; each square covers two image pixels. */
+/* The whole loaded grid (--grid pixels per side), sized and placed by the view in percent of
+   the frame, so that the browser scales whole image pixels. */
+#stage {
+  --grid: 59;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Transparent (no-data) pixels show this checkerboard; each square covers two image pixels.
+   A tile starts at the central field's corner, so the surround's arrival does not shift it. */
 #image {
+  --checker: calc(100% * 4 / var(--grid));
+  --checker-at: calc(100% * (var(--grid) - 59) / (2 * (var(--grid) - 4)));
   display: block;
   width: 100%;
   height: 100%;
   image-rendering: pixelated;
-  border-radius: 4px;
-  background: repeating-conic-gradient(var(--nodata-a) 0 25%, var(--nodata-b) 0 50%) 0 0 /
-    calc(var(--size) * 4 / 59) calc(var(--size) * 4 / 59);
+  background: repeating-conic-gradient(var(--nodata-a) 0 25%, var(--nodata-b) 0 50%)
+    var(--checker-at) var(--checker-at) / var(--checker) var(--checker);
 }
 
 /* A ring six image pixels across, centred on the target's position. */
 #marker {
   position: absolute;
-  width: calc(100% * 6 / 59);
-  height: calc(100% * 6 / 59);
+  width: calc(100% * 6 / var(--grid));
+  height: calc(100% * 6 / var(--grid));
   border: 2px solid var(--marker);
   border-radius: 50%;
   transform: translate(-50%, -50%);
@@ -101,7 +116,9 @@ button {
 }
 
 #prev,
-#next {
+#next,
+#zoom-out,
+#zoom-in {
   width: 40px;
   padding: 0;
   font-size: 1.5rem;
@@ -313,6 +330,19 @@ select {
   margin: 28px auto 0;
   font-size: 0.75rem;
   color: var(--muted);
+}
+
+/* On a phone the timeline takes a second row of its own. */
+@media (max-width: 480px) {
+  #controls {
+    flex-wrap: wrap;
+  }
+
+  #slider {
+    order: 1;
+    flex-basis: 100%;
+    margin: 0;
+  }
 }
 
 @media (max-width: 760px) {

@@ -14,6 +14,8 @@ from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 from reproject import reproject_interp
 
+from .grid import FIELD_PIXELS
+
 FLAG_BITS: dict[str, int] = {
     "TRANSIENT": 0, "OVERFLOW": 1, "SUR_ERROR": 2, "NONFUNC": 6, "DICHROIC": 7,
     "MISSING_DATA": 9, "HOT": 10, "COLD": 11, "FULLSAMPLE": 12, "PHANMISS": 14,
@@ -44,7 +46,9 @@ class Window:
 
     ``image`` is float32 surface brightness in MJy/sr (NaN kept), ``flags`` the int32 flag
     bits, both (ny, nx). ``wcs`` is the full-detector celestial WCS including SIP, and
-    ``(x0, y0)`` is the 0-based detector pixel of ``image[0, 0]``.
+    ``(x0, y0)`` is the 0-based detector pixel of ``image[0, 0]``. ``core``, when set, is the
+    detector box ``(x0, x1, y0, y1)`` (half-open, inside the window) whose pixels alone give
+    the sky level.
     """
 
     image: np.ndarray
@@ -52,6 +56,7 @@ class Window:
     wcs: WCS
     x0: int
     y0: int
+    core: tuple[int, int, int, int] | None = None
 
 
 def check_flag_definitions(header: fits.Header) -> None:
@@ -88,20 +93,35 @@ def estimate_background(image: np.ndarray, flags: np.ndarray) -> float:
 def align(window: Window, target: WCS, target_shape: tuple[int, int]) -> np.ndarray:
     """Background-subtracted, bad-pixel-masked window resampled onto the target grid.
 
-    Bilinear interpolation through the full pixel-to-sky transform including SIP. Returns
-    float32 ``target_shape`` in MJy/sr; NaN where there is no valid data (reproject fills
-    target pixels outside the window, or next to a NaN input pixel, with NaN).
+    Bilinear interpolation through the full pixel-to-sky transform including SIP, one field of
+    ``FIELD_PIXELS`` x ``FIELD_PIXELS`` target pixels at a time: the iterative SIP inversion
+    then sees the same points for a field of a larger grid as for that field alone, so each
+    field is bit for bit the cutout of that field's grid. Returns float32 ``target_shape`` in
+    MJy/sr; NaN where there is no valid data (reproject fills target pixels outside the
+    window, or next to a NaN input pixel, with NaN). The sky level is estimated on
+    ``window.core`` when set, else on the whole window.
     """
-    background = estimate_background(window.image, window.flags)
+    if window.core is None:
+        background = estimate_background(window.image, window.flags)
+    else:
+        x0, x1, y0, y1 = window.core
+        rows = slice(y0 - window.y0, y1 - window.y0)
+        cols = slice(x0 - window.x0, x1 - window.x0)
+        background = estimate_background(window.image[rows, cols], window.flags[rows, cols])
     if not np.isfinite(background):
         return np.full(target_shape, np.nan, dtype=np.float32)
     image = window.image.astype(np.float64) - background
     image[(window.flags & BAD_FLAGS) != 0] = np.nan
     ny, nx = image.shape
     wcs = window.wcs[window.y0:window.y0 + ny, window.x0:window.x0 + nx]
-    data = reproject_interp((image, wcs), target, shape_out=target_shape, order="bilinear",
-                            return_footprint=False)
-    return data.astype(np.float32)
+    out = np.empty(target_shape, dtype=np.float32)
+    for y in range(0, target_shape[0], FIELD_PIXELS):
+        for x in range(0, target_shape[1], FIELD_PIXELS):
+            rows, cols = slice(y, y + FIELD_PIXELS), slice(x, x + FIELD_PIXELS)
+            field = out[rows, cols]
+            field[...] = reproject_interp((image, wcs), target[rows, cols], shape_out=field.shape,
+                                          order="bilinear", return_footprint=False)
+    return out
 
 
 def combine(cutouts: Sequence[np.ndarray]) -> np.ndarray:

@@ -11,9 +11,11 @@
   <main id="viewer">
     <section id="player" aria-label="Player">
       <div id="frame">
-        <canvas id="image" width="59" height="59" role="img"
-          aria-label="SPHEREx image of the selected frame, north up, east left"></canvas>
-        <div id="marker" aria-hidden="true" hidden></div>
+        <div id="stage">
+          <canvas id="image" width="59" height="59" role="img"
+            aria-label="SPHEREx image of the selected frame, north up, east left"></canvas>
+          <div id="marker" aria-hidden="true" hidden></div>
+        </div>
       </div>
       <div id="controls">
         <button id="prev" type="button" aria-label="Previous frame" disabled>&lsaquo;</button>
@@ -21,6 +23,10 @@
         <button id="next" type="button" aria-label="Next frame" disabled>&rsaquo;</button>
         <input id="slider" type="range" min="0" max="0" step="1" value="0" disabled
           aria-label="Timeline">
+        <button id="zoom-out" type="button" aria-label="Zoom out" title="Zoom out (− key)"
+          disabled>−</button>
+        <button id="zoom-in" type="button" aria-label="Zoom in" title="Zoom in (+ key)"
+          disabled>+</button>
       </div>
       <p id="date"></p>
       <div id="sky" hidden>

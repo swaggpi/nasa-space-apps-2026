@@ -1,11 +1,13 @@
 // Page logic for the SPHEREx viewer: the bundled example, search, progressive frame loading,
-// playback, the target marker, the difference view, result links and the sky map for picking
-// a search position.
+// playback, the target marker, the difference view, result links, the sky map for picking
+// a search position, and zooming and moving the view over the surrounding fields.
 
 import {
-  capNotice, computeStretch, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
-  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, parseExample, parseLink,
-  plural, previousIndex, retryDelay, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
+  FIELD_PIXELS, WIDE_PIXELS, ZOOM_LEVELS, capNotice, centrePixels, clampView, computeStretch,
+  countRange, decodePixels, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
+  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, offsetPosition, panStep,
+  parseExample, parseLink, plural, previousIndex, retryDelay, shouldPreload, stageBox,
+  toDifferenceRGBA, toRGBA, validFrameBody, validPlan, validWideBody, zoomStep,
 } from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
@@ -28,6 +30,11 @@ const MAP_FALLBACK = { ra: 266.405, dec: -28.936, fov: MAP_MAX_FOV_DEG };
 const SELECTION_COLOR = "rgb(255, 184, 28)";
 const DIFFERENCE_LABEL =
   "Difference between the selected frame and the other frames, north up, east left";
+// How long an arrow key must rest at the edge of the loaded area before the next one loads.
+const REST_MS = 500;
+const DEFAULT_VIEW = { zoom: 1, cx: (FIELD_PIXELS - 1) / 2, cy: (FIELD_PIXELS - 1) / 2 };
+// Arrow keys as grid steps: left is east, up is north.
+const ARROWS = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
 
 const form = document.getElementById("search");
 const raInput = document.getElementById("ra");
@@ -36,6 +43,9 @@ const detectorSelect = document.getElementById("detector");
 const statusLine = document.getElementById("status");
 const canvas = document.getElementById("image");
 const marker = document.getElementById("marker");
+const stage = document.getElementById("stage");
+const zoomOutButton = document.getElementById("zoom-out");
+const zoomInButton = document.getElementById("zoom-in");
 const prevButton = document.getElementById("prev");
 const playButton = document.getElementById("play");
 const nextButton = document.getElementById("next");
@@ -66,6 +76,15 @@ let shown = null;
 let map = null;
 let mapLoading = null;
 let selection = null;
+// The search answer behind the shown frames (null for the example), the loaded grid's size,
+// the view over it, whether a search, the surround or the next area is loading, and the
+// status text of the shown frames.
+let plan = null;
+let grid = FIELD_PIXELS;
+let view = DEFAULT_VIEW;
+let loading = false;
+let summary = "";
+let restTimer = null;
 
 function setStatus(text) {
   statusLine.textContent = text;
@@ -90,10 +109,18 @@ function stopPlayback() {
 
 function reset() {
   stopPlayback();
+  clearTimeout(restTimer);
   frames = [];
   stretch = null;
   current = 0;
+  plan = null;
+  grid = FIELD_PIXELS;
+  view = DEFAULT_VIEW;
+  summary = "";
+  canvas.width = grid;
+  canvas.height = grid;
   context.clearRect(0, 0, canvas.width, canvas.height);
+  applyView();
   enablePlayer(false);
   slider.max = "0";
   slider.value = "0";
@@ -114,6 +141,31 @@ function placeMarker(frame) {
   marker.style.top = `${top}%`;
 }
 
+/** Whether a zoom-out press would load the surrounding fields of the shown search. */
+function surroundLoadable() {
+  return plan !== null && grid === FIELD_PIXELS && !loading;
+}
+
+const atLowestZoom = () => view.zoom <= FIELD_PIXELS / grid;
+
+/** Places the stage for the view and updates the zoom buttons and the date label. */
+function applyView() {
+  const box = stageBox(view, grid);
+  stage.style.width = `${box.size}%`;
+  stage.style.height = `${box.size}%`;
+  stage.style.left = `${box.left}%`;
+  stage.style.top = `${box.top}%`;
+  stage.style.setProperty("--grid", String(grid));
+  const loaded = frames.length > 0;
+  zoomInButton.disabled = !loaded || view.zoom >= ZOOM_LEVELS.at(-1);
+  zoomOutButton.disabled = !loaded || (atLowestZoom() && !surroundLoadable());
+  if (!loaded) return;
+  const frame = frames[current];
+  const label = frameLabel(frame.dates, ...countRange(frame.nFields, view, grid));
+  slider.setAttribute("aria-valuetext", label);
+  dateLabel.textContent = label;
+}
+
 function show(index) {
   current = index;
   const frame = frames[index];
@@ -124,9 +176,8 @@ function show(index) {
   context.putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
   canvas.setAttribute("aria-label", drawDifference ? DIFFERENCE_LABEL : IMAGE_LABEL);
   slider.value = String(index);
-  slider.setAttribute("aria-valuetext", frame.label);
-  dateLabel.textContent = frame.label;
   placeMarker(frame);
+  applyView();
 }
 
 async function errorDetail(response) {
@@ -192,8 +243,10 @@ async function loadExample(signal) {
     return;
   }
   shown = { ra: data.ra_deg, dec: data.dec_deg };
-  frames = example.frames;
-  stretch = computeStretch(frames.map((f) => f.pixels));
+  frames = example.frames.map((f, i) => ({
+    ...f, dates: data.frames[i].label, nFields: [f.nUsed],
+  }));
+  stretch = computeStretch(frames.map(centrePixels));
   slider.max = String(frames.length - 1);
   markerControl.hidden = frames[0].marker === undefined;
   showTarget(example.name, example.position, example.hint);
@@ -206,7 +259,30 @@ function sentence(text) {
   return text.endsWith(".") ? text : `${text}.`;
 }
 
-async function loadFrames(plan, signal) {
+/** Status text for the loaded frames of a search, counting the central field's exposures. */
+function summarise(searched, used, failed, reason) {
+  return joinStatus(
+    `${plural(frames.length, "frame")} from ${used} of `
+      + `${plural(searched.n_exposures, "exposure")}.`,
+    capNotice(searched),
+    failed > 0 ? sentence(`${plural(failed, "frame")} could not be loaded: ${reason}`) : "",
+    noDataNote(frames.map((f) => ({ pixels: centrePixels(f) }))),
+  );
+}
+
+/** Asks for one frame of the wide grid; returns {result, pixels}, {reason} or null if aborted. */
+async function requestWide(searched, uris, signal, step) {
+  const outcome = await request("api/frame", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ra_deg: searched.ra_deg, dec_deg: searched.dec_deg, uris, fields: 3 }),
+  }, signal, validWideBody, step);
+  if (outcome === null || outcome.reason !== undefined) return outcome;
+  const pixels = decodePixels(outcome.body.pixels_b64, WIDE_PIXELS * WIDE_PIXELS);
+  return pixels === null ? { reason: UNEXPECTED } : { result: outcome.body, pixels };
+}
+
+async function loadFrames(signal) {
   const notice = capNotice(plan);
   const n = plan.frames.length;
   let used = 0;
@@ -231,26 +307,166 @@ async function loadFrames(plan, signal) {
       pixels: result.pixels,
       width: result.width,
       height: result.height,
-      label: frameLabel(planned.label, result.n_used),
+      dates: planned.label,
       nUsed: result.n_used,
+      nFields: [result.n_used],
+      uris: planned.uris,
     });
     used += result.n_used;
-    stretch = computeStretch(frames.map((f) => f.pixels));
+    stretch = computeStretch(frames.map(centrePixels));
     slider.max = String(frames.length - 1);
     if (frames.length === 1) enablePlayer(true);
     if (frames.length === 2) differenceToggle.disabled = false;
     show(frames.length === 1 ? 0 : current);
   }
+  loading = false;
   if (frames.length === 0) {
     setStatus(sentence(`No frame could be loaded: ${reason}`));
     return;
   }
-  setStatus(joinStatus(
-    `${plural(frames.length, "frame")} from ${used} of ${plural(plan.n_exposures, "exposure")}.`,
-    notice,
-    failed > 0 ? sentence(`${plural(failed, "frame")} could not be loaded: ${reason}`) : "",
-    noDataNote(frames),
-  ));
+  summary = summarise(plan, used, failed, reason);
+  setStatus(summary);
+  applyView();
+  if (shouldPreload(plan)) loadSurround(signal);
+}
+
+/**
+ * Loads the eight fields around the shown frames, one wide frame per loaded frame, and swaps
+ * them in at once with the picture on screen unchanged; on any failure nothing changes.
+ */
+async function loadSurround(signal) {
+  loading = true;
+  applyView();
+  const wide = [];
+  for (const [i, frame] of frames.entries()) {
+    const step = joinStatus(summary,
+      `Loading the surrounding area: frame ${i + 1} of ${frames.length}…`);
+    setStatus(step);
+    const outcome = await requestWide(plan, frame.uris, signal, step);
+    if (outcome === null || signal.aborted) return;
+    if (outcome.reason !== undefined) {
+      loading = false;
+      setStatus(joinStatus(summary,
+        sentence(`The surrounding area could not be loaded: ${outcome.reason}`)));
+      applyView();
+      return;
+    }
+    wide.push(outcome);
+  }
+  frames = frames.map((frame, i) => ({
+    ...frame, pixels: wide[i].pixels, width: WIDE_PIXELS, height: WIDE_PIXELS,
+    nFields: wide[i].result.n_fields,
+  }));
+  grid = WIDE_PIXELS;
+  view = { ...view, cx: view.cx + FIELD_PIXELS, cy: view.cy + FIELD_PIXELS };
+  canvas.width = grid;
+  canvas.height = grid;
+  loading = false;
+  setStatus(summary);
+  show(current);
+}
+
+/**
+ * Searches the area one field away in a direction and loads its wide frames; the old frames
+ * stay on screen until every answer is in, then the new ones replace them at once with the
+ * sky under the view in place.
+ */
+async function loadNextArea(dx, dy, signal) {
+  loading = true;
+  applyView();
+  const fail = (text) => {
+    loading = false;
+    setStatus(text);
+    applyView();
+  };
+  const centre = offsetPosition(plan.ra_deg, plan.dec_deg, FIELD_PIXELS * dx, FIELD_PIXELS * dy);
+  const texts = fieldTexts(centre.ra, centre.dec);
+  let step = "Searching the next area…";
+  setStatus(step);
+  const query = new URLSearchParams({ ra: texts.ra, dec: texts.dec, detector: plan.detector });
+  const outcome = await request("api/search?" + query, {}, signal, validPlan, step);
+  if (outcome === null || signal.aborted) return;
+  if (outcome.reason !== undefined) {
+    fail(sentence(`The next area could not be loaded: ${outcome.reason}`));
+    return;
+  }
+  const next = outcome.body;
+  if (next.frames.length === 0) {
+    fail(`No SPHEREx exposures cover the next area in ${next.detector}.`);
+    return;
+  }
+  const loaded = [];
+  let used = 0;
+  let failed = 0;
+  let reason = "";
+  for (const [i, planned] of next.frames.entries()) {
+    step = `Loading the next area: frame ${i + 1} of ${next.frames.length}…`;
+    setStatus(step);
+    const answer = await requestWide(next, planned.uris, signal, step);
+    if (answer === null || signal.aborted) return;
+    if (answer.reason !== undefined) {
+      failed += 1;
+      reason = answer.reason;
+      continue;
+    }
+    loaded.push({
+      pixels: answer.pixels, width: WIDE_PIXELS, height: WIDE_PIXELS, dates: planned.label,
+      nUsed: answer.result.n_used, nFields: answer.result.n_fields, uris: planned.uris,
+    });
+    used += answer.result.n_used;
+  }
+  if (loaded.length === 0) {
+    fail(sentence(`The next area could not be loaded: ${reason}`));
+    return;
+  }
+  frames = loaded;
+  plan = next;
+  stretch = computeStretch(frames.map(centrePixels));
+  view = clampView({
+    zoom: view.zoom, cx: view.cx - FIELD_PIXELS * dx, cy: view.cy - FIELD_PIXELS * dy,
+  }, grid);
+  current = Math.min(current, frames.length - 1);
+  slider.max = String(frames.length - 1);
+  if (frames.length < 2) differenceToggle.checked = false;
+  differenceToggle.disabled = frames.length < 2;
+  showTarget(`RA ${texts.ra}, Dec ${texts.dec}`,
+    formatPosition(next.ra_deg, next.dec_deg, next.detector), "");
+  shown = { ra: next.ra_deg, dec: next.dec_deg };
+  if (document.activeElement !== raInput && document.activeElement !== decInput) {
+    raInput.value = texts.ra;
+    decInput.value = texts.dec;
+  }
+  history.replaceState(null, "", linkQuery(texts.ra, texts.dec, next.detector));
+  loading = false;
+  summary = summarise(next, used, failed, reason);
+  setStatus(summary);
+  show(current);
+}
+
+/** Zooms the view one level in (+1) or out (-1), or loads the surround at the lowest zoom. */
+function zoom(direction) {
+  if (direction < 0 && atLowestZoom()) {
+    if (surroundLoadable()) loadSurround(controller.signal);
+    return;
+  }
+  view = clampView({ ...view, zoom: zoomStep(view.zoom, direction, grid) }, grid);
+  applyView();
+}
+
+/** Moves the view one step; pushing at the edge loads more once the key has rested. */
+function move(dx, dy) {
+  const step = panStep(view, dx, dy, grid);
+  clearTimeout(restTimer);
+  if (!step.pushed) {
+    view = step.view;
+    applyView();
+    return;
+  }
+  restTimer = setTimeout(() => {
+    if (plan === null || loading || !sky.hidden || frames.length === 0) return;
+    if (grid === FIELD_PIXELS) loadSurround(controller.signal);
+    else loadNextArea(dx, dy, controller.signal);
+  }, REST_MS);
 }
 
 async function search(ra, dec, detector) {
@@ -259,6 +475,7 @@ async function search(ra, dec, detector) {
   controller = new AbortController();
   const { signal } = controller;
   reset();
+  loading = true;
   showTarget(`RA ${ra.trim()}, Dec ${dec.trim()}`, "", "");
   const step = "Searching the SPHEREx archive…";
   setStatus(step);
@@ -266,17 +483,19 @@ async function search(ra, dec, detector) {
     signal, validPlan, step);
   if (outcome === null || signal.aborted) return;
   if (outcome.reason !== undefined) {
+    loading = false;
     setStatus(`Error: ${outcome.reason}`);
     return;
   }
-  const plan = outcome.body;
+  plan = outcome.body;
   shown = { ra: plan.ra_deg, dec: plan.dec_deg };
   positionLine.textContent = formatPosition(plan.ra_deg, plan.dec_deg, plan.detector);
   if (plan.frames.length === 0) {
+    loading = false;
     setStatus(`No SPHEREx exposures cover this position in ${plan.detector}.`);
     return;
   }
-  await loadFrames(plan, signal);
+  await loadFrames(signal);
 }
 
 /**
@@ -464,6 +683,24 @@ markerToggle.addEventListener("change", () => {
 
 differenceToggle.addEventListener("change", () => {
   if (frames.length > 0) show(current);
+});
+
+zoomInButton.addEventListener("click", () => zoom(1));
+zoomOutButton.addEventListener("click", () => zoom(-1));
+
+// Zoom and arrow keys act on the page, buttons and checkboxes, never while typing, choosing a
+// detector, stepping the timeline or using the sky map.
+document.addEventListener("keydown", (event) => {
+  if (frames.length === 0 || !sky.hidden || event.ctrlKey || event.altKey || event.metaKey
+    || event.defaultPrevented) return;
+  const target = event.target;
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest(
+    "input:not([type=checkbox]), select, textarea, #sky") !== null)) return;
+  if (event.key === "+" || event.key === "=") zoom(1);
+  else if (event.key === "-") zoom(-1);
+  else if (event.key in ARROWS) move(...ARROWS[event.key]);
+  else return;
+  event.preventDefault();
 });
 
 const detectors = Array.from(detectorSelect.options, (option) => option.value);

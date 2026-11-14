@@ -12,8 +12,9 @@ import synthetic
 from spherex_viewer import frames
 from spherex_viewer.cache import CutoutCache
 from spherex_viewer.frames import FrameBuilder, FrameError
-from spherex_viewer.grid import GRID_SHAPE
-from spherex_viewer.remote import s3_url
+from spherex_viewer.cutout import align
+from spherex_viewer.grid import GRID_SHAPE, target_wcs
+from spherex_viewer.remote import read_window, s3_url
 
 RA, DEC = 150.0, 20.0
 STAR = (RA + 5 * 6.15 / 3600 / np.cos(np.radians(DEC)), DEC + 4 * 6.15 / 3600)
@@ -238,3 +239,138 @@ def test_pool_reads_eight_exposures_at_once(cache, twelve_blobs):
         builder.close()
     assert entered == 8
     assert (outcome[0].n_used, outcome[0].n_failed) == (12, 0)
+
+
+WIDE_N = 300
+EDGE, NO_WEST, NO_NORTH, OFF_CENTRE, SURROUND_STAR = 400, 401, 402, 403, 404
+
+
+def centre_for(query_x: float, query_y: float) -> tuple[float, float]:
+    """Centre of an unrotated WIDE_N detector on which (RA, DEC) lies at pixel (x, y)."""
+    probe = synthetic.exposure_wcs((RA, DEC), n=WIDE_N, rot_deg=0.0, sip=False)
+    c = WIDE_N / 2 - 0.5
+    ra, dec = probe.all_pix2world(2 * c - query_x, 2 * c - query_y, 0)
+    return float(ra), float(dec)
+
+
+@pytest.fixture(scope="module")
+def wide_blobs() -> dict[str, bytes]:
+    """Detectors covering the wide grid, and some that cover parts of it."""
+    def exposure(i, centre=(RA, DEC), **kwargs):
+        kwargs = {"rot_deg": 0.0, "sip": False} | kwargs
+        return synthetic.make_exposure(centre, STAR, n=WIDE_N, seed=i, **kwargs)
+
+    blobs = {s3_url(make_uri(i)): exposure(i, rot_deg=rot, sip=i % 2 == 0)
+             for i, rot in enumerate(ROTATIONS)}
+    blobs[s3_url(make_uri(EDGE))] = exposure(EDGE, centre_for(20.0, 150.0), rot_deg=0.0)
+    blobs[s3_url(make_uri(NO_WEST))] = exposure(NO_WEST, centre_for(WIDE_N - 1 - 28, 149.5))
+    blobs[s3_url(make_uri(NO_NORTH))] = exposure(NO_NORTH, centre_for(149.5, WIDE_N - 1 - 28))
+    blobs[s3_url(make_uri(OFF_CENTRE))] = exposure(OFF_CENTRE, centre_for(-40.0, 149.5))
+    star = tuple(float(v) for v in target_wcs(RA, DEC, 3).all_pix2world(150.0, 30.0, 0))
+    blobs[s3_url(make_uri(SURROUND_STAR))] = synthetic.make_exposure(
+        (RA, DEC), star, n=WIDE_N, rot_deg=23.0, star_amp=5000.0, star_sigma=1.5,
+        seed=SURROUND_STAR)
+    blobs[s3_url(make_uri(ALL_BAD))] = exposure(
+        ALL_BAD, bad=[(x, y, 10) for y in range(WIDE_N) for x in range(WIDE_N)])
+    return blobs
+
+
+@pytest.fixture
+def wide_builder(cache, wide_blobs):
+    reader = synthetic.FakeRangeReader(wide_blobs)
+    builder = FrameBuilder(reader, cache)
+    yield builder, reader
+    builder.close()
+
+
+def test_wide_centre_is_the_narrow_frame(wide_builder):
+    builder, _ = wide_builder
+    uris = [make_uri(i) for i in [*range(len(ROTATIONS)), EDGE, SURROUND_STAR]]
+    narrow = builder.build(uris, RA, DEC)
+    wide = builder.build(uris, RA, DEC, 3)
+    assert wide.data.shape == (177, 177) and wide.data.dtype == np.float32
+    assert np.array_equal(wide.data[59:118, 59:118], narrow.data, equal_nan=True)
+    assert wide.n_used == narrow.n_used == 7
+    assert narrow.n_fields == (7,)
+    star_alone = builder.build([make_uri(SURROUND_STAR)], RA, DEC, 3).data
+    assert np.nanmax(star_alone) > 1000.0
+    assert np.nanmax(star_alone[59:118, 59:118]) < 10.0
+    assert np.array_equal(star_alone[59:118, 59:118],
+                          builder.build([make_uri(SURROUND_STAR)], RA, DEC).data, equal_nan=True)
+
+
+def test_wide_tiles_are_one_resampling(wide_builder):
+    builder, reader = wide_builder
+    uri = make_uri(0)
+    wide = builder.build([uri], RA, DEC, 3).data
+    target = target_wcs(RA, DEC, 3)
+    window = read_window(reader, s3_url(uri), target, (177, 177),
+                         (target_wcs(RA, DEC), GRID_SHAPE))
+    for row in range(3):
+        for col in range(3):
+            rows, cols = slice(59 * row, 59 * (row + 1)), slice(59 * col, 59 * (col + 1))
+            tile = align(window, target[rows, cols], GRID_SHAPE)
+            assert np.array_equal(wide[rows, cols], tile, equal_nan=True)
+
+
+def test_star_on_a_field_junction(cache):
+    star = tuple(float(v) for v in target_wcs(RA, DEC, 3).all_pix2world(58.5, 58.5, 0))
+    uris = [make_uri(i) for i in range(3)]
+    reader = synthetic.FakeRangeReader({
+        s3_url(uri): synthetic.make_exposure((RA, DEC), star, n=WIDE_N, rot_deg=rot,
+                                             noise=0.0, seed=i)
+        for i, (uri, rot) in enumerate(zip(uris, (0.0, 37.0, -80.0)))})
+    builder = FrameBuilder(reader, cache)
+    try:
+        wide = builder.build(uris, RA, DEC, 3).data
+    finally:
+        builder.close()
+    x, y = synthetic.fit_centroid(wide, 58.5, 58.5)
+    assert np.hypot(x - 58.5, y - 58.5) <= 0.05
+
+
+def test_n_fields_counts_partial_coverage(wide_builder):
+    builder, _ = wide_builder
+    no_west = builder.build([make_uri(NO_WEST)], RA, DEC, 3)
+    assert no_west.n_fields == (1, 1, 0) * 3
+    assert np.isnan(no_west.data[:, 118:]).all()
+    assert np.isfinite(no_west.data[:, :110]).all()
+    no_north = builder.build([make_uri(NO_NORTH)], RA, DEC, 3)
+    assert no_north.n_fields == (0, 0, 0) + (1, 1, 1) * 2
+    assert np.isnan(no_north.data[118:, :]).all()
+    both = builder.build([make_uri(0), make_uri(NO_WEST), make_uri(NO_NORTH)], RA, DEC, 3)
+    assert both.n_fields == (2, 2, 1, 3, 3, 2, 3, 3, 2)
+    assert both.n_used == 3
+
+
+def test_exposure_missing_the_central_field_is_not_used(wide_builder, cache):
+    builder, reader = wide_builder
+    alone = builder.build([make_uri(0)], RA, DEC, 3)
+    calls = len(reader.calls)
+    result = builder.build([make_uri(0), make_uri(OFF_CENTRE)], RA, DEC, 3)
+    assert len(reader.calls) == calls + 1
+    assert result.n_fields == alone.n_fields == (1,) * 9
+    assert np.array_equal(result.data, alone.data, equal_nan=True)
+    assert not cache.path(make_uri(OFF_CENTRE), RA, DEC, 3).exists()
+
+
+def test_wide_and_narrow_are_cached_separately(wide_builder, cache):
+    builder, reader = wide_builder
+    uris = [make_uri(i) for i in range(3)]
+    narrow = builder.build(uris, RA, DEC)
+    calls = len(reader.calls)
+    wide = builder.build(uris, RA, DEC, 3)
+    assert len(reader.calls) > calls
+    for uri in uris:
+        assert cache.get(uri, RA, DEC).shape == GRID_SHAPE
+        assert cache.get(uri, RA, DEC, 3).shape == (177, 177)
+    calls = len(reader.calls)
+    np.testing.assert_array_equal(builder.build(uris, RA, DEC).data, narrow.data)
+    np.testing.assert_array_equal(builder.build(uris, RA, DEC, 3).data, wide.data)
+    assert len(reader.calls) == calls
+
+
+def test_wide_frame_error_when_nothing_valid(wide_builder):
+    builder, _ = wide_builder
+    with pytest.raises(FrameError):
+        builder.build([make_uri(OFF_CENTRE), make_uri(ALL_BAD)], RA, DEC, 3)

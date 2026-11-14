@@ -366,13 +366,15 @@ def _read_flags(reader: RangeReader, url: str, flags_start: int,
     return decode_flag_rows(header, selected, heap, lo)[:, x0:x1].copy()
 
 
-def read_window(reader: RangeReader, url: str, target: WCS,
-                target_shape: tuple[int, int]) -> Window | None:
+def read_window(reader: RangeReader, url: str, target: WCS, target_shape: tuple[int, int],
+                core: tuple[WCS, tuple[int, int]] | None = None) -> Window | None:
     """Read the IMAGE and FLAGS pixels of ``url`` that cover the target grid.
 
     Four range reads; only the first when the target grid does not overlap the detector,
-    which returns None. Raises UnsupportedLayoutError for an unexpected layout or malformed
-    content and passes on the reader's RemoteReadError.
+    which returns None. With ``core`` (a grid inside the target grid and its shape), the
+    window's ``core`` is the detector box of that grid, and None is returned, also after the
+    first read only, when the exposure does not overlap it. Raises UnsupportedLayoutError for
+    an unexpected layout or malformed content and passes on the reader's RemoteReadError.
     """
     try:
         header, data_start = _read_image_header(reader, url)
@@ -381,8 +383,15 @@ def read_window(reader: RangeReader, url: str, target: WCS,
         box = footprint_window(wcs, detector_shape, target, target_shape)
         if box is None:
             return None
+        core_box = None
+        if core is not None:
+            core_box = footprint_window(wcs, detector_shape, *core)
+            if core_box is None:
+                return None
+            core_box = (max(core_box[0], box[0]), min(core_box[1], box[1]),
+                        max(core_box[2], box[2]), min(core_box[3], box[3]))
         image = _read_image(reader, url, data_start, detector_shape[1], box)
         flags = _read_flags(reader, url, data_start + data_length(header), detector_shape, box)
     except _MALFORMED as exc:
         raise UnsupportedLayoutError(f"malformed FITS content ({type(exc).__name__})") from exc
-    return Window(image=image, flags=flags, wcs=wcs, x0=box[0], y0=box[2])
+    return Window(image=image, flags=flags, wcs=wcs, x0=box[0], y0=box[2], core=core_box)

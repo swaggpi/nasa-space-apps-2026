@@ -1,6 +1,7 @@
 """Tests of the HTTP API: schema, validation, errors, limits, concurrency and rate limiting."""
 
 import asyncio
+import base64
 import json
 import threading
 import time
@@ -32,7 +33,9 @@ from spherex_viewer.app import (
     check_rate,
     create_app,
 )
+from spherex_viewer.cache import CutoutCache
 from spherex_viewer.discovery import DiscoveryError, Exposure
+from spherex_viewer.frames import FrameBuilder, FrameResult
 from spherex_viewer.ratelimit import RateLimiter
 from spherex_viewer.remote import s3_url
 
@@ -46,6 +49,7 @@ WAIT_S = 5.0
 SEARCH_KEYS = {"ra_deg", "dec_deg", "detector", "n_exposures", "cap", "capped", "frames"}
 FRAME_PLAN_KEYS = {"label", "n_available", "n_used", "capped", "uris"}
 FRAME_KEYS = {"width", "height", "pixels", "n_used"}
+WIDE_KEYS = {"width", "height", "pixels_b64", "n_used", "n_fields"}
 
 
 def make_uri(i: int) -> str:
@@ -786,3 +790,159 @@ def test_long_client_string_is_not_stored_as_a_key():
     limiter = RateLimiter(10, 1.0)
     check_rate(limiter, rate_request("x" * 16384))
     assert all(len(key) <= 24 for key in limiter._buckets)
+
+
+def wide_payload(uris: list[str]) -> dict:
+    return frame_payload(uris) | {"fields": 3}
+
+
+def decode_wide(body: dict) -> np.ndarray:
+    raw = base64.b64decode(body["pixels_b64"], validate=True)
+    return np.frombuffer(raw, dtype="<f4").reshape(body["height"], body["width"])
+
+
+def test_default_and_explicit_one_field_answer_exactly_as_before(tmp_path, blobs):
+    client, _ = make_client(tmp_path, blobs)
+    uris = [make_uri(i) for i in range(len(ROTATIONS))]
+    with client:
+        default = client.post("/api/frame", json=frame_payload(uris))
+        explicit = client.post("/api/frame", json=frame_payload(uris) | {"fields": 1})
+    assert default.status_code == explicit.status_code == 200
+    assert set(default.json()) == FRAME_KEYS
+    assert explicit.content == default.content
+
+
+def test_wide_frame_is_base64_float32_north_up_with_field_counts(tmp_path, blobs):
+    uris = [make_uri(i) for i in range(len(ROTATIONS))]
+    client, _ = make_client(tmp_path / "app", blobs)
+    with client:
+        response = client.post("/api/frame", json=wide_payload(uris))
+    builder = FrameBuilder(synthetic.FakeRangeReader(blobs), CutoutCache(tmp_path / "b", 10**8))
+    try:
+        built = builder.build(uris, RA, DEC, 3)
+    finally:
+        builder.close()
+    assert response.status_code == 200
+    body = strict_json(response.text)
+    assert set(body) == WIDE_KEYS
+    assert (body["width"], body["height"]) == (177, 177)
+    assert len(body["pixels_b64"]) == 167_088
+    pixels = decode_wide(body)
+    assert np.array_equal(pixels, built.data[::-1, :], equal_nan=True)
+    assert np.isnan(pixels).any() and np.isfinite(pixels).any()
+    assert np.isnan(pixels[-1, :]).all() and np.isfinite(pixels[0, :]).any()
+    assert body["n_fields"] == list(built.n_fields) and len(body["n_fields"]) == 9
+    assert body["n_fields"][4] == body["n_used"] == 3
+    assert body["n_fields"][3:] == [3, 3, 3, 0, 0, 0]
+
+
+@pytest.mark.parametrize("fields", ["2", "0", '"3"', "null", "[3]", "-3", "9"])
+def test_invalid_fields_gives_the_fixed_422(tmp_path, fields):
+    client, reader = make_client(tmp_path)
+    raw = '{"ra_deg": 150.0, "dec_deg": 20.0, "uris": ["%s"], "fields": %s}' % (make_uri(0),
+                                                                              fields)
+    with client:
+        response = client.post("/api/frame", content=raw.encode(),
+                               headers={"content-type": "application/json"})
+    assert response.status_code == 422
+    assert response.json() == {"detail": INVALID_REQUEST}
+    assert reader.calls == []
+
+
+def test_wide_frames_have_their_own_rate_limit(tmp_path, blobs):
+    client, _ = make_client(tmp_path, blobs)
+    bad = ["ibe/data/spherex/dr1/level2/x.txt"]
+    with client:
+        narrow = {client.post("/api/frame", json=frame_payload(bad)).status_code
+                  for _ in range(60)}
+        wide_after_narrow = client.post("/api/frame", json=wide_payload([make_uri(0)]))
+        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code for _ in range(39)}
+        limited = client.post("/api/frame", json=wide_payload([make_uri(0)]))
+    assert narrow == {422} and wide == {422}
+    assert wide_after_narrow.status_code == 200
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == "10"
+    assert limited.json() == {"detail": "Too many requests. Try again in 10 s."}
+
+    client, _ = make_client(tmp_path / "second", blobs)
+    with client:
+        wide = {client.post("/api/frame", json=wide_payload(bad)).status_code for _ in range(40)}
+        limited = client.post("/api/frame", json=wide_payload([make_uri(0)]))
+        narrow = client.post("/api/frame", json=frame_payload([make_uri(0)]))
+    assert wide == {422}
+    assert limited.status_code == 429 and limited.headers["retry-after"] == "10"
+    assert narrow.status_code == 200
+
+
+class GatedBuilder(Gate):
+    """Fake builder: wide builds wait for the gate; records the most wide builds at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.running = 0
+        self.most = 0
+        self.narrow = 0
+        self.count_lock = threading.Lock()
+
+    def build(self, uris, ra_deg, dec_deg, fields=1):
+        if fields == 1:
+            with self.count_lock:
+                self.narrow += 1
+            return FrameResult(np.zeros((59, 59), np.float32), 1, 0, (1,))
+        with self.count_lock:
+            self.running += 1
+            self.most = max(self.most, self.running)
+        try:
+            self.block()
+        finally:
+            with self.count_lock:
+                self.running -= 1
+        return FrameResult(np.zeros((177, 177), np.float32), 1, 0, (1,) * 9)
+
+
+def test_one_wide_build_at_a_time_beside_narrow_builds(tmp_path):
+    client, _ = make_client(tmp_path)
+    builder = GatedBuilder()
+    with client:
+        client.app.state.builder = builder
+        first = in_thread(lambda: client.post("/api/frame", json=wide_payload([make_uri(0)])))
+        builder.wait_entered(1)
+        second = in_thread(lambda: client.post("/api/frame", json=wide_payload([make_uri(1)])))
+        time.sleep(0.3)
+        entered_while_first_ran = builder.count
+        narrow = client.post("/api/frame", json=frame_payload([make_uri(2)]))
+        builder.opened.set()
+        responses = [finished(*first), finished(*second)]
+    assert entered_while_first_ran == 1
+    assert narrow.status_code == 200 and builder.narrow == 1
+    assert [r.status_code for r in responses] == [200, 200]
+    assert builder.count == 2 and builder.most == 1
+
+
+def test_waiting_wide_frame_gives_503_when_the_wide_slot_stays_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "FRAME_WAIT_S", 0.2)
+    client, _ = make_client(tmp_path)
+    builder = GatedBuilder()
+    with client:
+        client.app.state.builder = builder
+        first = in_thread(lambda: client.post("/api/frame", json=wide_payload([make_uri(0)])))
+        builder.wait_entered(1)
+        busy = client.post("/api/frame", json=wide_payload([make_uri(1)]))
+        builder.opened.set()
+        held = finished(*first)
+    assert busy.status_code == 503
+    assert busy.json() == {"detail": SERVER_BUSY}
+    assert held.status_code == 200
+    assert builder.count == 1
+
+
+def test_oversized_wide_request_gives_413(tmp_path):
+    client, reader = make_client(tmp_path)
+    raw = json.dumps(wide_payload([make_uri(0), "x" * 65 * 1024])).encode()
+    assert len(raw) > MAX_BODY_BYTES
+    with client:
+        response = client.post("/api/frame", content=raw,
+                               headers={"content-type": "application/json"})
+    assert response.status_code == 413
+    assert response.json() == {"detail": BODY_TOO_LARGE}
+    assert reader.calls == []

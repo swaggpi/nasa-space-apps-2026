@@ -13,27 +13,27 @@ from pathlib import Path
 import numpy as np
 
 from .cutout import CUTOUT_VERSION
-from .grid import GRID_SHAPE
+from .grid import FIELDS, grid_shape
 
 _EVICT_TO_FRACTION = 0.9
-_CUTOUT_BYTES = 4 * GRID_SHAPE[0] * GRID_SHAPE[1]
 _SUBDIR = re.compile(r"[0-9a-f]{2}")
 
 
-def _npy_header() -> bytes:
+def _npy_header(shape: tuple[int, int]) -> bytes:
     buf = io.BytesIO()
-    np.save(buf, np.zeros(GRID_SHAPE, dtype=np.float32), allow_pickle=False)
-    return buf.getvalue()[:-_CUTOUT_BYTES]
+    np.save(buf, np.zeros(shape, dtype=np.float32), allow_pickle=False)
+    return buf.getvalue()[:-4 * shape[0] * shape[1]]
 
 
-# The exact header np.save writes for a C-ordered float32 grid-shaped array.
-_NPY_HEADER = _npy_header()
+# The exact header np.save writes for a C-ordered float32 array of each grid's shape.
+_NPY_HEADERS = {fields: _npy_header(grid_shape(fields)) for fields in FIELDS}
 
 logger = logging.getLogger(__name__)
 
 
 class CutoutCache:
-    """Cache of float32 cutouts on the target grid, one ``.npy`` file per exposure and position.
+    """Cache of float32 cutouts on the target grids, one ``.npy`` file per exposure, position and
+    grid (``fields`` as in ``grid.grid_shape``).
 
     The total size of the cache files is kept at or below ``max_bytes``: when a ``put`` takes
     it above, the oldest files by modification time are deleted until it is at most 90 % of
@@ -49,35 +49,44 @@ class CutoutCache:
         self._lock = threading.Lock()
         self._total = sum(size for _, size, _ in self._files())
 
-    def path(self, uri: str, ra_deg: float, dec_deg: float) -> Path:
+    def path(self, uri: str, ra_deg: float, dec_deg: float, fields: int = 1) -> Path:
         """Return the cache file of the cutout of ``uri`` centred on (ra, dec) in degrees."""
-        key = hashlib.sha256(
-            f"v{CUTOUT_VERSION}|{uri}|{ra_deg!r}|{dec_deg!r}".encode()
-        ).hexdigest()
+        key_text = f"v{CUTOUT_VERSION}|{uri}|{ra_deg!r}|{dec_deg!r}"
+        if fields != 1:
+            key_text += f"|{fields}"
+        key = hashlib.sha256(key_text.encode()).hexdigest()
         return self.root / key[:2] / f"{key}.npy"
 
-    def get(self, uri: str, ra_deg: float, dec_deg: float) -> np.ndarray | None:
-        """Return the cached cutout; None unless the file is exactly what ``put`` writes.
+    def get(self, uri: str, ra_deg: float, dec_deg: float,
+            fields: int = 1) -> np.ndarray | None:
+        """Return the cached cutout; None unless the file is exactly what ``put`` writes for
+        the grid of ``fields``.
 
         The ``.npy`` header is compared byte for byte, never parsed, so nothing is unpickled.
         """
+        shape = grid_shape(fields)
+        header = _NPY_HEADERS[fields]
+        size = len(header) + 4 * shape[0] * shape[1]
         try:
-            with open(self.path(uri, ra_deg, dec_deg), "rb") as f:
-                raw = f.read(len(_NPY_HEADER) + _CUTOUT_BYTES + 1)
+            with open(self.path(uri, ra_deg, dec_deg, fields), "rb") as f:
+                raw = f.read(size + 1)
         except OSError:
             return None
-        if len(raw) != len(_NPY_HEADER) + _CUTOUT_BYTES or not raw.startswith(_NPY_HEADER):
+        if len(raw) != size or not raw.startswith(header):
             return None
-        return np.frombuffer(raw, dtype=np.float32, offset=len(_NPY_HEADER)).reshape(
-            GRID_SHAPE).copy()
+        return np.frombuffer(raw, dtype=np.float32, offset=len(header)).reshape(shape).copy()
 
-    def put(self, uri: str, ra_deg: float, dec_deg: float, cutout: np.ndarray) -> None:
+    def put(self, uri: str, ra_deg: float, dec_deg: float, cutout: np.ndarray,
+            fields: int = 1) -> None:
         """Store a cutout as float32, atomically (temporary file, then ``os.replace``).
 
-        Raises OSError when the file cannot be written. Evicts old files when the cache is
-        over its size cap; errors while evicting are logged, never raised.
+        Raises ValueError when ``cutout`` does not have the shape of the grid of ``fields``,
+        OSError when the file cannot be written. Evicts old files when the cache is over its
+        size cap; errors while evicting are logged, never raised.
         """
-        target = self.path(uri, ra_deg, dec_deg)
+        if cutout.shape != grid_shape(fields):
+            raise ValueError(f"cutout shape {cutout.shape} is not that of {fields} fields")
+        target = self.path(uri, ra_deg, dec_deg, fields)
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.stem, suffix=".tmp")
         try:

@@ -1,16 +1,18 @@
 """FastAPI application: search and frame endpoints, health check and the static page."""
 
 import asyncio
+import base64
 import json
 import logging
 import math
 import os
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -30,6 +32,8 @@ from .ratelimit import (
     FRAME_PER_MINUTE,
     SEARCH_BURST,
     SEARCH_PER_MINUTE,
+    WIDE_BURST,
+    WIDE_PER_MINUTE,
     RateLimiter,
     client_key,
 )
@@ -58,6 +62,9 @@ MAX_CONCURRENT_FRAMES = 4
 # A full frame takes about 1.5-3 s on the shared 8-thread pool, so 4 running builds clear
 # well within the wait.
 FRAME_WAIT_S = 15.0
+# A wide frame costs about twice the CPU and 2.6 times the archive bytes of a normal one; one
+# at a time leaves three frame slots and most of the core to the frames visitors wait for.
+MAX_CONCURRENT_WIDE_FRAMES = 1
 
 INVALID_REQUEST = "Invalid request."
 BODY_TOO_LARGE = "Request body too large."
@@ -76,13 +83,15 @@ Uri = Annotated[str, StringConstraints(max_length=MAX_URI_LENGTH)]
 
 
 class FrameRequest(BaseModel):
-    """Body of `POST /api/frame`: the search position (degrees) and one frame's exposure URIs."""
+    """Body of `POST /api/frame`: the search position (degrees), one frame's exposure URIs and
+    the grid: 1 field (the frame) or 3 x 3 fields (the frame and its surround)."""
 
     model_config = ConfigDict(strict=True)
 
     ra_deg: Annotated[float, Field(ge=0.0, lt=360.0, allow_inf_nan=False)]
     dec_deg: Annotated[float, Field(ge=-90.0, le=90.0, allow_inf_nan=False)]
     uris: Annotated[list[Uri], Field(min_length=1, max_length=EXPOSURE_CAP)]
+    fields: Literal[1, 3] = 1
 
 
 class BodyLimit:
@@ -218,6 +227,7 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
     max_bytes = cache_max_bytes()
     search_limiter = RateLimiter(SEARCH_BURST, SEARCH_PER_MINUTE)
     frame_limiter = RateLimiter(FRAME_BURST, FRAME_PER_MINUTE)
+    wide_limiter = RateLimiter(WIDE_BURST, WIDE_PER_MINUTE)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -236,6 +246,7 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
                     lambda ra, dec, detector: discovery.discover(client, ra, dec, detector))
                 app.state.search_slots = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
                 app.state.frame_slots = asyncio.Semaphore(MAX_CONCURRENT_FRAMES)
+                app.state.wide_slots = asyncio.Semaphore(MAX_CONCURRENT_WIDE_FRAMES)
                 yield
             finally:
                 builder.close()
@@ -299,17 +310,32 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
 
     @app.post("/api/frame")
     async def frame(request: Request, body: FrameRequest) -> dict:
-        check_rate(frame_limiter, request)
+        wide = body.fields == 3
+        check_rate(wide_limiter if wide else frame_limiter, request)
         if not all(is_valid_uri(uri) for uri in body.uris):
             raise HTTPException(status_code=422, detail="Invalid SPHEREx exposure URI.")
         uris = list(dict.fromkeys(body.uris))
         try:
-            async with slot(request.app.state.frame_slots, FRAME_WAIT_S, request):
+            async with AsyncExitStack() as stack:
+                if wide:
+                    await stack.enter_async_context(
+                        slot(request.app.state.wide_slots, FRAME_WAIT_S, request))
+                await stack.enter_async_context(
+                    slot(request.app.state.frame_slots, FRAME_WAIT_S, request))
                 result = await run_in_threadpool(request.app.state.builder.build,
-                                                 uris, body.ra_deg, body.dec_deg)
+                                                 uris, body.ra_deg, body.dec_deg, body.fields)
         except FrameError as exc:
             logger.warning("Frame at (%r, %r) failed: %s", body.ra_deg, body.dec_deg, exc)
             raise HTTPException(status_code=502, detail=FRAME_FAILED) from None
+        if wide:
+            north_up = np.ascontiguousarray(result.data[::-1, :], dtype="<f4")
+            return {
+                "width": result.data.shape[1],
+                "height": result.data.shape[0],
+                "pixels_b64": base64.b64encode(north_up.tobytes()).decode("ascii"),
+                "n_used": result.n_used,
+                "n_fields": list(result.n_fields),
+            }
         north_up = result.data[::-1, :].ravel().tolist()
         return {
             "width": GRID_SHAPE[1],

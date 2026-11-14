@@ -2,9 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  capNotice, computeStretch, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
-  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, parseExample, parseLink,
-  plural, previousIndex, retryDelay, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
+  PRELOAD_MAX_EXPOSURES, WIDE_PIXELS, ZOOM_LEVELS, capNotice, centrePixels, clampView,
+  computeStretch, countRange, decodePixels, difference, fieldCorners, fieldTexts, formatPosition,
+  frameLabel, isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote,
+  offsetPosition, panStep, parseExample, parseLink, plural, previousIndex, retryDelay,
+  shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody, validPlan, validWideBody,
+  zoomStep,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -502,4 +505,199 @@ test("parseLink uses the fallback for a missing or unknown detector", () => {
     { ra: "1", dec: "2", detector: "D2" });
   assert.deepEqual(parseLink("?ra=1&dec=2", DETECTORS, "D3"),
     { ra: "1", dec: "2", detector: "D3" });
+});
+
+// --- Zooming and moving over the loaded grid -----------------------------------------------
+
+const RAD = Math.PI / 180;
+
+/** A square frame of `size` pixels whose values are their indices, or `value(x, y)`. */
+function squareFrame(size, value = (x, y) => y * size + x) {
+  return {
+    pixels: Array.from({ length: size * size }, (_, i) => value(i % size, Math.floor(i / size))),
+    width: size, height: size, nUsed: 5,
+  };
+}
+
+/** A 177-px frame with the given 59-px pixels at its centre and `around(x, y)` elsewhere. */
+function wideAround(narrow, around) {
+  return squareFrame(WIDE_PIXELS, (x, y) => (x >= 59 && x < 118 && y >= 59 && y < 118
+    ? narrow[(y - 59) * 59 + (x - 59)] : around(x, y)));
+}
+
+function b64Float32(values) {
+  return Buffer.from(new Float32Array(values).buffer).toString("base64");
+}
+
+test("the zoom levels run from the loaded 18' surround to 1.5'; the wide grid is 3 fields", () => {
+  assert.deepEqual(ZOOM_LEVELS, [1 / 3, 1 / 2, 1, 2, 4]);
+  assert.equal(WIDE_PIXELS, 177);
+});
+
+test("clampView keeps the zoom and the view inside the loaded grid", () => {
+  assert.deepEqual(clampView({ zoom: 1, cx: 29, cy: 29 }, 59), { zoom: 1, cx: 29, cy: 29 });
+  assert.deepEqual(clampView({ zoom: 1 / 3, cx: 0, cy: 500 }, 177),
+    { zoom: 1 / 3, cx: 88, cy: 88 });
+  assert.deepEqual(clampView({ zoom: 1 / 3, cx: 29, cy: 29 }, 59), { zoom: 1, cx: 29, cy: 29 });
+  assert.deepEqual(clampView({ zoom: 1, cx: 0, cy: 200 }, 177), { zoom: 1, cx: 29, cy: 147 });
+  assert.deepEqual(clampView({ zoom: 8, cx: 29, cy: 29 }, 59), { zoom: 4, cx: 29, cy: 29 });
+});
+
+test("zoomStep moves one level and stops at the ends the grid allows", () => {
+  assert.equal(zoomStep(1, -1, 59), 1);
+  assert.equal(zoomStep(1, -1, 177), 1 / 2);
+  assert.equal(zoomStep(1 / 2, -1, 177), 1 / 3);
+  assert.equal(zoomStep(1 / 3, -1, 177), 1 / 3);
+  assert.equal(zoomStep(4, 1, 177), 4);
+  assert.equal(zoomStep(1, 1, 59), 2);
+});
+
+test("panStep moves an eighth of the view and reports a push only when nothing moved", () => {
+  let view = { zoom: 1, cx: 88, cy: 88 };
+  let n = 0;
+  let step;
+  do {
+    step = panStep(view, -1, 0, 177);
+    view = step.view;
+    n += 1;
+  } while (!step.pushed);
+  assert.deepEqual([view.cx, n], [29, 10]); // 8 steps of 7, one of 3, then the push
+  assert.equal(panStep({ zoom: 1, cx: 29, cy: 29 }, 1, 0, 59).pushed, true);
+  assert.equal(panStep({ zoom: 1 / 3, cx: 88, cy: 88 }, 0, 1, 177).pushed, true);
+  assert.equal(panStep({ zoom: 4, cx: 29, cy: 29 }, 1, 0, 59).view.cx, 31);
+  assert.equal(panStep({ zoom: 4, cx: 29, cy: 29 }, 1, 0, 59).pushed, false);
+});
+
+test("stageBox sizes and places the grid so that the view fills the frame", () => {
+  assert.deepEqual(stageBox({ zoom: 1, cx: 29, cy: 29 }, 59), { size: 100, left: -0, top: -0 });
+  assert.deepEqual(stageBox({ zoom: 1, cx: 88, cy: 88 }, 177),
+    { size: 300, left: -100, top: -100 });
+  assert.deepEqual(stageBox({ zoom: 1 / 3, cx: 88, cy: 88 }, 177),
+    { size: 100, left: -0, top: -0 });
+  assert.deepEqual(stageBox({ zoom: 4, cx: 29, cy: 29 }, 59), { size: 400, left: -150, top: -150 });
+});
+
+test("offsetPosition agrees with fieldCorners: the north-east corner is 29.5 px east and north",
+  () => {
+    for (const [ra, dec] of [[133.795129, -7.245147], [0.001, 89.2], [359.999, -45]]) {
+      const corner = fieldCorners(ra, dec)[0];
+      const o = offsetPosition(ra, dec, -29.5, -29.5);
+      assertClose(o.ra, corner[0], `ra at ${ra}, ${dec}`);
+      assertClose(o.dec, corner[1], `dec at ${ra}, ${dec}`);
+    }
+  });
+
+test("offsetPosition moves one field west and south by 59 pixels of 6.15 arcsec", () => {
+  const east = offsetPosition(133.795129, -7.245147, -59, 0);
+  const arcsec = (east.ra - 133.795129) * Math.cos(-7.245147 * RAD) * 3600;
+  assert.ok(Math.abs(arcsec - 59 * 6.15) < 0.01, `${arcsec}`);
+  const south = offsetPosition(133.795129, -7.245147, 0, 59);
+  assert.ok(Math.abs((-7.245147 - south.dec) * 3600 - 59 * 6.15) < 0.01, `${south.dec}`);
+  assert.ok(offsetPosition(0.001, 10, -59, 0).ra < 1);
+  assert.ok(offsetPosition(359.999, 10, 59, 0).ra > 359);
+});
+
+test("countRange spans the fields the view overlaps", () => {
+  const nf = [23, 23, 23, 24, 24, 24, 20, 23, 23];
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 88, cy: 88 }, 177), [24, 24]);
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 87, cy: 88 }, 177), [24, 24]);
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 88, cy: 81 }, 177), [23, 24]);
+  assert.deepEqual(countRange(nf, { zoom: 1 / 3, cx: 88, cy: 88 }, 177), [20, 24]);
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 29, cy: 147 }, 177), [20, 20]);
+  assert.deepEqual(countRange([7], { zoom: 2, cx: 20, cy: 20 }, 59), [7, 7]);
+});
+
+test("decodePixels reads little-endian float32 with no data as null, else gives null", () => {
+  const b64 = b64Float32([1.5, NaN, -2, Infinity]);
+  assert.deepEqual(decodePixels(b64, 4), [1.5, null, -2, null]);
+  assert.equal(decodePixels(b64, 3), null);
+  assert.equal(decodePixels("***", 4), null);
+  const bigEndian = Buffer.from([0x3f, 0xc0, 0, 0]).toString("base64");
+  assert.notDeepEqual(decodePixels(bigEndian, 1), [1.5]);
+});
+
+test("validWideBody accepts a wide frame answer and rejects answers the page cannot use", () => {
+  const good = {
+    width: 177, height: 177, pixels_b64: "AAAA", n_used: 24,
+    n_fields: [23, 23, 23, 24, 24, 24, 23, 23, 23],
+  };
+  assert.equal(validWideBody(good), true);
+  for (const [name, body] of [
+    ["null", null],
+    ["a list", [good]],
+    ["a narrow width", { ...good, width: 59 }],
+    ["a narrow height", { ...good, height: 59 }],
+    ["no n_used", { ...good, n_used: undefined }],
+    ["a negative n_used", { ...good, n_used: -1 }],
+    ["eight field counts", { ...good, n_fields: good.n_fields.slice(1) }],
+    ["a fractional field count", { ...good, n_fields: [...good.n_fields.slice(1), 1.5] }],
+    ["field counts that are not a list", { ...good, n_fields: "9" }],
+    ["no pixels_b64", { ...good, pixels_b64: undefined }],
+    ["pixels as a number list", { ...good, pixels_b64: [0] }],
+  ]) {
+    assert.equal(validWideBody(body), false, name);
+  }
+});
+
+test("centrePixels of a wide frame built around a narrow one returns the narrow pixels", () => {
+  const narrow = squareFrame(59, (x, y) => (x === 3 && y === 4 ? null : x * 100 + y));
+  const wide = wideAround(narrow.pixels, (x, y) => -x - y);
+  assert.deepEqual(centrePixels(wide), narrow.pixels);
+  assert.equal(centrePixels(narrow), narrow.pixels);
+});
+
+test("the stretch over the central fields of wide frames equals that of the narrow frames", () => {
+  const narrow = [1, 2].map((k) => squareFrame(59, (x, y) => ((x * 7 + y * 3 + k) % 50) / 100));
+  // A bright star in the surround must not change the stretch.
+  const wide = narrow.map((f) => wideAround(f.pixels, (x, y) => (x < 3 && y < 3 ? 80 : 0.2)));
+  assert.deepEqual(computeStretch(wide.map(centrePixels)),
+    computeStretch(narrow.map((f) => f.pixels)));
+});
+
+test("frameLabel gives an exposure range when the fields in view differ", () => {
+  assert.equal(frameLabel("2025-05-06", 23, 24), "2025-05-06 · 23–24 exposures");
+  assert.equal(frameLabel("2025-05-06", 24, 24), "2025-05-06 · 24 exposures");
+  assert.equal(frameLabel("2025-05-06", 1, 1), "2025-05-06 · 1 exposure");
+  assert.equal(frameLabel("2025-05-06", 0, 1), "2025-05-06 · 0–1 exposures");
+});
+
+test("shouldPreload loads the surround ahead for up to 120 planned exposures", () => {
+  assert.equal(PRELOAD_MAX_EXPOSURES, 120);
+  const sized = (counts) => plan(counts.map((n) => ({ n_available: n, n_used: n, capped: false })));
+  assert.equal(shouldPreload(sized([24, 24, 24, 24, 24])), true);
+  assert.equal(shouldPreload(sized([24, 24, 24, 24, 24, 1])), false);
+  assert.equal(shouldPreload(sized([])), true);
+});
+
+test("difference on 177-px frames takes the same per-pixel and neighbourhood steps", () => {
+  const frames = [0, 1, 2].map((k) => ({
+    ...squareFrame(177, (x, y) => (x === 100 && y === 90 && k === 1 ? null
+      : ((x * 3 + y * 5 + k * 11) % 17) / 10)),
+    nUsed: k + 1,
+  }));
+  const diff = difference(frames, 0);
+  assert.equal(diff.length, 177 * 177);
+  const raw = (p) => frames[0].pixels[p]
+    - (2 * frames[1].pixels[p] + 3 * frames[2].pixels[p]) / 5;
+  // An inside pixel: the mean of its 3x3 raw differences.
+  const [x, y] = [120, 40];
+  let sum = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) sum += raw((y + dy) * 177 + x + dx);
+  }
+  assertClose(diff[y * 177 + x], sum / 9, "inside");
+  // The corner pixel averages its 2x2 neighbourhood only.
+  const corner = [0, 1, 177, 178].reduce((a, p) => a + raw(p), 0) / 4;
+  assertClose(diff[0], corner, "corner");
+  // Where frame 1 has no data only frame 2 is subtracted.
+  const p = 90 * 177 + 100;
+  const d = frames[0].pixels[p] - frames[2].pixels[p];
+  const neighbours = [];
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const q = p + dy * 177 + dx;
+      neighbours.push(q === p ? d : raw(q));
+    }
+  }
+  assertClose(diff[p], neighbours.reduce((a, v) => a + v, 0) / 9, "no data in frame 1");
 });

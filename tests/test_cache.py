@@ -286,3 +286,67 @@ def test_eviction_and_size_count_skip_everything_outside_the_cache_layout(tmp_pa
     assert all(path.stat().st_size == 3 * size for path in foreign)
     assert (root / "ab" / "link.npy").is_symlink()
     assert (root / "cd").is_symlink()
+
+
+def _wide(seed: int = 0) -> np.ndarray:
+    data = np.random.default_rng(seed).normal(0.0, 0.02, (177, 177)).astype(np.float32)
+    data[:, :59] = np.nan
+    return data
+
+
+def test_narrow_key_is_unchanged(tmp_path):
+    path = CutoutCache(tmp_path, LARGE).path(URI, RA, DEC)
+    assert path.relative_to(tmp_path) == Path(
+        "ca", "ca6bc093ee18ee8c0165cf8e2f959e5d9d66f5a41d483303fb05cbcef679a911.npy")
+    assert CutoutCache(tmp_path, LARGE).path(URI, RA, DEC, 1) == path
+
+
+def test_wide_and_narrow_entries_coexist(tmp_path):
+    cache = CutoutCache(tmp_path, LARGE)
+    cache.put(URI, RA, DEC, _cutout())
+    cache.put(URI, RA, DEC, _wide(), 3)
+    assert cache.path(URI, RA, DEC, 3) != cache.path(URI, RA, DEC)
+    assert cache.path(URI, RA, DEC).stat().st_size == 14_052
+    assert cache.path(URI, RA, DEC, 3).stat().st_size == 125_444
+    np.testing.assert_array_equal(cache.get(URI, RA, DEC), _cutout())
+    np.testing.assert_array_equal(cache.get(URI, RA, DEC, 3), _wide())
+
+
+@pytest.mark.parametrize("content", [_npy(_cutout()), _npy(_wide())[:-1], _npy(_wide())[:5000],
+                                     _npy(_wide()) + b"\0", _npy(_wide().astype(">f4"))])
+def test_wide_get_accepts_only_a_wide_file(tmp_path, content):
+    cache = CutoutCache(tmp_path, LARGE)
+    path = cache.path(URI, RA, DEC, 3)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    assert cache.get(URI, RA, DEC, 3) is None
+
+
+def test_narrow_get_rejects_a_wide_file(tmp_path):
+    cache = CutoutCache(tmp_path, LARGE)
+    path = cache.path(URI, RA, DEC)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_npy(_wide()))
+    assert cache.get(URI, RA, DEC) is None
+
+
+@pytest.mark.parametrize(("shape", "fields"), [((177, 177), 1), ((59, 59), 3), ((177, 59), 3)])
+def test_put_of_a_wrong_shape_raises(tmp_path, shape, fields):
+    cache = CutoutCache(tmp_path, LARGE)
+    with pytest.raises(ValueError):
+        cache.put(URI, RA, DEC, np.zeros(shape, np.float32), fields)
+    assert _files(tmp_path) == []
+
+
+def test_eviction_holds_the_cap_with_mixed_sizes(tmp_path):
+    root = tmp_path / "cache"
+    cap = 3 * 125_444 + 4 * 14_052
+    cache = CutoutCache(root, cap)
+    for i in range(30):
+        fields = 3 if i % 3 == 0 else 1
+        cache.put(_uri(i), RA, DEC, _wide(i) if fields == 3 else _cutout(i), fields)
+        os.utime(cache.path(_uri(i), RA, DEC, fields), (1_000_000 + i, 1_000_000 + i))
+        assert _total_size(root) <= cap
+    assert cache.get(_uri(29), RA, DEC) is not None
+    assert cache.get(_uri(27), RA, DEC, 3) is not None
+    assert cache.get(_uri(0), RA, DEC, 3) is None
