@@ -110,3 +110,9 @@ def test_acknowledgement_in_readme():
 
 def test_static_files_are_not_rate_limited(client):
     assert {client.get("/").status_code for _ in range(80)} == {200}
+
+
+def test_root_can_be_embedded_in_a_frame(client):
+    response = client.get("/")
+    assert "x-frame-options" not in response.headers
+    assert "frame-ancestors" not in response.headers.get("content-security-policy", "")

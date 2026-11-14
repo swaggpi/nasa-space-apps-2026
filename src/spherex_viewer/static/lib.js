@@ -1,7 +1,7 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
 // status, date and position texts, frame stepping, marker placement, validation of the
-// bundled example and the sky-map selection. No DOM access; imported by app.js and by Node
-// tests.
+// bundled example and of API answers, the sky-map selection, the retry delay, the difference
+// view and result links. No DOM access; imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -153,11 +153,12 @@ const isString = (v) => typeof v === "string";
 const isNumber = (v) => typeof v === "number" && Number.isFinite(v);
 const isCount = (v) => Number.isInteger(v) && v >= 0;
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+const isPixels = (v, size) => Array.isArray(v) && v.length === size
+  && v.every((p) => p === null || isNumber(p));
 
 function validFrame(frame, size) {
   return isObject(frame) && isString(frame.label) && isCount(frame.n_used)
-    && Array.isArray(frame.pixels) && frame.pixels.length === size
-    && frame.pixels.every((v) => v === null || isNumber(v))
+    && isPixels(frame.pixels, size)
     && (frame.marker === undefined
       || (isObject(frame.marker) && isNumber(frame.marker.x) && isNumber(frame.marker.y)));
 }
@@ -168,7 +169,8 @@ function validFrame(frame, size) {
  * @param {unknown} data parsed JSON
  * @returns {{name: string, hint: string, position: string,
  *   frames: Array<{pixels: Array<number|null>, width: number, height: number, label: string,
- *   marker?: {x: number, y: number}}>} | null} null if the content does not match the schema
+ *   nUsed: number, marker?: {x: number, y: number}}>} | null} null if the content does not
+ *   match the schema
  */
 export function parseExample(data) {
   if (!isObject(data) || !isString(data.name) || !isString(data.hint) || !isNumber(data.ra_deg)
@@ -188,6 +190,7 @@ export function parseExample(data) {
       width,
       height,
       label: frameLabel(f.label, f.n_used),
+      nUsed: f.n_used,
       ...(f.marker === undefined ? {} : { marker: { x: f.marker.x, y: f.marker.y } }),
     })),
   };
@@ -245,4 +248,151 @@ export function fieldTexts(raDeg, decDeg) {
  */
 export function isClick(press, release) {
   return Math.hypot(release.x - press.x, release.y - press.y) <= CLICK_TOLERANCE_PX;
+}
+
+/**
+ * Seconds to wait before retrying a 429 or 503 answer, from its Retry-After header.
+ * A missing or non-numeric value (such as an HTTP date) gives 2; otherwise the value is
+ * rounded up and clamped to 1..30.
+ * @param {string | null} header
+ * @returns {number} whole seconds
+ */
+export function retryDelay(header) {
+  const seconds = header === null || header === "" ? Number.NaN : Number(header);
+  if (!Number.isFinite(seconds)) return 2;
+  return Math.min(Math.max(Math.ceil(seconds), 1), 30);
+}
+
+function validPlanFrame(frame) {
+  return isObject(frame) && isString(frame.label) && typeof frame.capped === "boolean"
+    && Array.isArray(frame.uris) && frame.uris.length > 0 && frame.uris.every(isString);
+}
+
+/**
+ * Checks a parsed api/search answer has the fields the page reads.
+ * @param {unknown} body parsed JSON
+ * @returns {boolean}
+ */
+export function validPlan(body) {
+  return isObject(body) && isNumber(body.ra_deg) && isNumber(body.dec_deg)
+    && isString(body.detector) && isCount(body.n_exposures) && isCount(body.cap)
+    && typeof body.capped === "boolean" && Array.isArray(body.frames)
+    && body.frames.every(validPlanFrame);
+}
+
+/**
+ * Checks a parsed api/frame answer: positive integer width and height, a non-negative
+ * exposure count `n_used`, and exactly width * height pixels, each null or a finite number.
+ * @param {unknown} body parsed JSON
+ * @returns {boolean}
+ */
+export function validFrameBody(body) {
+  return isObject(body) && isCount(body.width) && body.width > 0
+    && isCount(body.height) && body.height > 0 && isCount(body.n_used)
+    && isPixels(body.pixels, body.width * body.height);
+}
+
+/**
+ * Status-line sentence for loaded frames that contain no-data pixels, else "".
+ * @param {Array<{pixels: Array<number|null>}>} frames
+ * @returns {string}
+ */
+export function noDataNote(frames) {
+  return frames.some((f) => f.pixels.includes(null)) ? "Blue-grey pixels have no usable data." : "";
+}
+
+/**
+ * One frame minus the nUsed-weighted mean of the same pixel in the other frames, then
+ * averaged over the available pixels of its 3x3 neighbourhood.
+ * @param {Array<{pixels: Array<number|null>, width: number, height: number, nUsed: number}>}
+ *   frames equal-sized frames; null = no data
+ * @param {number} index the frame to compare with the others
+ * @returns {Array<number|null>} width * height values (MJy/sr); null where there is no
+ *   difference
+ */
+export function difference(frames, index) {
+  const { pixels, width, height } = frames[index];
+  const raw = new Array(pixels.length).fill(null);
+  for (let p = 0; p < pixels.length; p++) {
+    if (pixels[p] === null) continue;
+    let sum = 0;
+    let weight = 0;
+    for (let j = 0; j < frames.length; j++) {
+      const v = frames[j].pixels[p];
+      if (j === index || v === null) continue;
+      sum += frames[j].nUsed * v;
+      weight += frames[j].nUsed;
+    }
+    if (weight > 0) raw[p] = pixels[p] - sum / weight;
+  }
+  const out = new Array(pixels.length).fill(null);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (raw[y * width + x] === null) continue;
+      let sum = 0;
+      let count = 0;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(height - 1, y + 1); yy++) {
+        for (let xx = Math.max(0, x - 1); xx <= Math.min(width - 1, x + 1); xx++) {
+          const v = raw[yy * width + xx];
+          if (v === null) continue;
+          sum += v;
+          count += 1;
+        }
+      }
+      out[y * width + x] = sum / count;
+    }
+  }
+  return out;
+}
+
+/**
+ * Grey RGBA pixels for a difference: mid-grey for none, white brighter, black fainter, on
+ * the asinh scale of the direct image; null becomes fully transparent.
+ * @param {Array<number|null>} diff from difference
+ * @param {{lo: number, hi: number, soft: number}} stretch from computeStretch
+ * @returns {Uint8ClampedArray} length 4 * diff.length
+ */
+export function toDifferenceRGBA(diff, stretch) {
+  const { lo, hi, soft } = stretch;
+  const norm = Math.asinh((hi - lo) / soft);
+  const out = new Uint8ClampedArray(diff.length * 4);
+  for (let i = 0; i < diff.length; i++) {
+    const d = diff[i];
+    if (d === null) continue;
+    const t = Math.min(Math.max((Math.sign(d) * Math.asinh(Math.abs(d) / soft)) / norm, -1), 1);
+    const grey = Math.round(127.5 + 127.5 * t);
+    out[4 * i] = grey;
+    out[4 * i + 1] = grey;
+    out[4 * i + 2] = grey;
+    out[4 * i + 3] = 255;
+  }
+  return out;
+}
+
+/**
+ * Reads a result link from the page's query string.
+ * @param {string} search location.search, e.g. "?ra=1&dec=2&detector=D6"
+ * @param {Array<string>} detectors valid detector values
+ * @param {string} fallback detector used when the parameter is missing or not valid
+ * @returns {{ra: string, dec: string, detector: string} | null} ra and dec trimmed; null
+ *   unless both are present and non-empty
+ */
+export function parseLink(search, detectors, fallback) {
+  const params = new URLSearchParams(search);
+  const ra = (params.get("ra") ?? "").trim();
+  const dec = (params.get("dec") ?? "").trim();
+  if (ra === "" || dec === "") return null;
+  const detector = params.get("detector");
+  return { ra, dec, detector: detectors.includes(detector) ? detector : fallback };
+}
+
+/**
+ * Query string for a result link, e.g. "?ra=08h55m10.831s&dec=-7d14m42.53s&detector=D6".
+ * @param {string} ra
+ * @param {string} dec
+ * @param {string} detector
+ * @returns {string}
+ */
+export function linkQuery(ra, dec, detector) {
+  return "?" + new URLSearchParams({ ra: ra.trim(), dec: dec.trim(), detector });
 }

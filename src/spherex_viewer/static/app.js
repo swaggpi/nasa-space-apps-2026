@@ -1,13 +1,17 @@
 // Page logic for the SPHEREx viewer: the bundled example, search, progressive frame loading,
-// playback, the target marker and the sky map for picking a search position.
+// playback, the target marker, the difference view, result links and the sky map for picking
+// a search position.
 
 import {
-  capNotice, computeStretch, fieldCorners, fieldTexts, formatPosition, frameLabel, isClick,
-  joinStatus, markerPercent, nextIndex, parseExample, plural, previousIndex, toRGBA,
+  capNotice, computeStretch, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
+  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, parseExample, parseLink,
+  plural, previousIndex, retryDelay, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
 } from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
 const UNREACHABLE = "the server could not be reached";
+const UNEXPECTED = "the server sent an unexpected answer";
+const RETRIED_STATUSES = [429, 503];
 const EXAMPLE_URL = "./example.json";
 const EXAMPLE_FAILED = "The example could not be loaded; enter coordinates to search.";
 const ALADIN_URL = "./vendor/aladin.js";
@@ -22,12 +26,13 @@ const MAP_MAX_FOV_DEG = 359;
 // Shown when no position is known yet (the example failed): the Galactic centre, whole sky.
 const MAP_FALLBACK = { ra: 266.405, dec: -28.936, fov: MAP_MAX_FOV_DEG };
 const SELECTION_COLOR = "rgb(255, 184, 28)";
+const DIFFERENCE_LABEL =
+  "Difference between the selected frame and the other frames, north up, east left";
 
 const form = document.getElementById("search");
 const raInput = document.getElementById("ra");
 const decInput = document.getElementById("dec");
 const detectorSelect = document.getElementById("detector");
-const enterDisclosure = document.getElementById("enter");
 const statusLine = document.getElementById("status");
 const canvas = document.getElementById("image");
 const marker = document.getElementById("marker");
@@ -47,7 +52,9 @@ const skyMap = document.getElementById("sky-map");
 const skySelection = document.getElementById("sky-selection");
 const skySearch = document.getElementById("sky-search");
 const skyClose = document.getElementById("sky-close");
+const differenceToggle = document.getElementById("difference");
 const context = canvas.getContext("2d");
+const IMAGE_LABEL = canvas.getAttribute("aria-label");
 
 let controller = null;
 let frames = [];
@@ -90,9 +97,13 @@ function reset() {
   enablePlayer(false);
   slider.max = "0";
   slider.value = "0";
+  slider.removeAttribute("aria-valuetext");
   dateLabel.textContent = "";
   marker.hidden = true;
   markerControl.hidden = true;
+  differenceToggle.checked = false;
+  differenceToggle.disabled = true;
+  canvas.setAttribute("aria-label", IMAGE_LABEL);
 }
 
 function placeMarker(frame) {
@@ -106,9 +117,14 @@ function placeMarker(frame) {
 function show(index) {
   current = index;
   const frame = frames[index];
-  const image = new ImageData(toRGBA(frame.pixels, stretch), frame.width, frame.height);
-  context.putImageData(image, 0, 0);
+  const drawDifference = differenceToggle.checked;
+  const rgba = drawDifference
+    ? toDifferenceRGBA(difference(frames, index), stretch)
+    : toRGBA(frame.pixels, stretch);
+  context.putImageData(new ImageData(rgba, frame.width, frame.height), 0, 0);
+  canvas.setAttribute("aria-label", drawDifference ? DIFFERENCE_LABEL : IMAGE_LABEL);
   slider.value = String(index);
+  slider.setAttribute("aria-valuetext", frame.label);
   dateLabel.textContent = frame.label;
   placeMarker(frame);
 }
@@ -123,20 +139,36 @@ async function errorDetail(response) {
   return `${response.status} ${response.statusText}`.trim();
 }
 
+/** Resolves after `seconds`. */
+function pause(seconds) {
+  return new Promise((done) => { setTimeout(done, seconds * 1000); });
+}
+
 /**
- * Sends one request and reads its JSON body.
- * Returns {body} on success, {reason} on a network or HTTP failure, null once aborted;
- * any other error propagates.
+ * Sends one request and reads its JSON body, which `valid` must accept. A 429 or 503 answer
+ * is retried once after its Retry-After delay, with `step` restored as the status.
+ * Returns {body} on success, {reason} on a network, HTTP or content failure, null once
+ * aborted; any other error propagates.
  */
-async function request(url, options, signal) {
+async function request(url, options, signal, valid, step) {
   try {
-    const response = await fetch(url, { ...options, signal });
+    let response = await fetch(url, { ...options, signal });
+    if (RETRIED_STATUSES.includes(response.status)) {
+      const delay = retryDelay(response.headers.get("Retry-After"));
+      setStatus(`Waiting ${delay} s before continuing.`);
+      await pause(delay);
+      if (signal.aborted) return null;
+      setStatus(step);
+      response = await fetch(url, { ...options, signal });
+    }
     if (!response.ok) return { reason: await errorDetail(response) };
-    return { body: await response.json() };
+    const body = await response.json();
+    return valid(body) ? { body } : { reason: UNEXPECTED };
   } catch (err) {
     if (signal.aborted) return null;
     // fetch and body reads reject with TypeError when the network fails.
     if (err instanceof TypeError) return { reason: UNREACHABLE };
+    if (err instanceof SyntaxError) return { reason: UNEXPECTED };
     throw err;
   }
 }
@@ -166,6 +198,7 @@ async function loadExample(signal) {
   markerControl.hidden = frames[0].marker === undefined;
   showTarget(example.name, example.position, example.hint);
   enablePlayer(true);
+  differenceToggle.disabled = frames.length < 2;
   show(0);
 }
 
@@ -180,12 +213,13 @@ async function loadFrames(plan, signal) {
   let failed = 0;
   let reason = "";
   for (const [i, planned] of plan.frames.entries()) {
-    setStatus(joinStatus(`Loading frame ${i + 1} of ${n}…`, notice));
+    const step = joinStatus(`Loading frame ${i + 1} of ${n}…`, notice);
+    setStatus(step);
     const outcome = await request("api/frame", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ra_deg: plan.ra_deg, dec_deg: plan.dec_deg, uris: planned.uris }),
-    }, signal);
+    }, signal, validFrameBody, step);
     if (outcome === null || signal.aborted) return;
     if (outcome.reason !== undefined) {
       failed += 1;
@@ -198,11 +232,13 @@ async function loadFrames(plan, signal) {
       width: result.width,
       height: result.height,
       label: frameLabel(planned.label, result.n_used),
+      nUsed: result.n_used,
     });
     used += result.n_used;
     stretch = computeStretch(frames.map((f) => f.pixels));
     slider.max = String(frames.length - 1);
     if (frames.length === 1) enablePlayer(true);
+    if (frames.length === 2) differenceToggle.disabled = false;
     show(frames.length === 1 ? 0 : current);
   }
   if (frames.length === 0) {
@@ -213,6 +249,7 @@ async function loadFrames(plan, signal) {
     `${plural(frames.length, "frame")} from ${used} of ${plural(plan.n_exposures, "exposure")}.`,
     notice,
     failed > 0 ? sentence(`${plural(failed, "frame")} could not be loaded: ${reason}`) : "",
+    noDataNote(frames),
   ));
 }
 
@@ -223,9 +260,10 @@ async function search(ra, dec, detector) {
   const { signal } = controller;
   reset();
   showTarget(`RA ${ra.trim()}, Dec ${dec.trim()}`, "", "");
-  setStatus("Searching the SPHEREx archive…");
+  const step = "Searching the SPHEREx archive…";
+  setStatus(step);
   const outcome = await request("api/search?" + new URLSearchParams({ ra, dec, detector }), {},
-    signal);
+    signal, validPlan, step);
   if (outcome === null || signal.aborted) return;
   if (outcome.reason !== undefined) {
     setStatus(`Error: ${outcome.reason}`);
@@ -386,19 +424,18 @@ skyClose.addEventListener("click", () => {
 skySearch.addEventListener("click", () => {
   raInput.value = selection.ra;
   decInput.value = selection.dec;
+  history.replaceState(null, "", linkQuery(raInput.value, decInput.value, detectorSelect.value));
   search(raInput.value, decInput.value, detectorSelect.value);
 });
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
+  history.replaceState(null, "", linkQuery(raInput.value, decInput.value, detectorSelect.value));
   search(raInput.value, decInput.value, detectorSelect.value);
 });
 
-enterDisclosure.addEventListener("toggle", () => {
-  if (enterDisclosure.open) raInput.focus();
-});
-
 slider.addEventListener("input", () => {
+  stopPlayback();
   show(Number(slider.value));
 });
 
@@ -425,5 +462,18 @@ markerToggle.addEventListener("change", () => {
   if (frames.length > 0) placeMarker(frames[current]);
 });
 
-controller = new AbortController();
-loadExample(controller.signal);
+differenceToggle.addEventListener("change", () => {
+  if (frames.length > 0) show(current);
+});
+
+const detectors = Array.from(detectorSelect.options, (option) => option.value);
+const link = parseLink(location.search, detectors, detectorSelect.value);
+if (link === null) {
+  controller = new AbortController();
+  loadExample(controller.signal);
+} else {
+  raInput.value = link.ra;
+  decInput.value = link.dec;
+  detectorSelect.value = link.detector;
+  search(link.ra, link.dec, link.detector);
+}
