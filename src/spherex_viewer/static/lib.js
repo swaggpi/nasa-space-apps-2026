@@ -88,7 +88,7 @@ export function capNotice(plan) {
   const uses = k === 1 ? "uses" : "use";
   const their = k === 1 ? "its" : "their";
   return `Cap applied: ${k} of ${plan.frames.length} ${noun} ${uses} ${plan.cap} of ${their} `
-    + "exposures, evenly sampled in time.";
+    + "exposures, evenly spaced in time order.";
 }
 
 /**

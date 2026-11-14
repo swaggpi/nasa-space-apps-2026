@@ -130,14 +130,14 @@ test("toRGBA returns 4 bytes per pixel, R=G=B with alpha 255, and 0,0,0,0 for nu
 
 test("capNotice names how many frames were capped and the cap, in plural", () => {
   assert.equal(capNotice(plan([UNCAPPED, CAPPED, CAPPED])),
-    "Cap applied: 2 of 3 frames use 24 of their exposures, evenly sampled in time.");
+    "Cap applied: 2 of 3 frames use 24 of their exposures, evenly spaced in time order.");
 });
 
 test("capNotice uses the singular for one capped frame", () => {
   assert.equal(capNotice(plan([UNCAPPED, CAPPED, UNCAPPED])),
-    "Cap applied: 1 of 3 frames uses 24 of its exposures, evenly sampled in time.");
+    "Cap applied: 1 of 3 frames uses 24 of its exposures, evenly spaced in time order.");
   assert.equal(capNotice(plan([CAPPED])),
-    "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly sampled in time.");
+    "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly spaced in time order.");
 });
 
 test("capNotice is empty for a plan without a cap and for an empty plan", () => {

@@ -402,7 +402,8 @@ test("the cap notice for several capped frames appears while loading and when fi
       { label: "2025-06-01 \u2013 2025-06-29", n_available: 300, n_used: 24 },
       { label: "2025-07-01 \u2013 2025-07-29", n_available: 92, n_used: 24 },
     ]);
-    const notice = "Cap applied: 2 of 3 frames use 24 of their exposures, evenly sampled in time.";
+    const notice = "Cap applied: 2 of 3 frames use 24 of their exposures, "
+      + "evenly spaced in time order.";
     const gate = deferred();
     const reply = frameOk(plan);
     const { page, log } = await openPage({
@@ -431,7 +432,7 @@ test("the cap notice for one capped frame is in the singular", { timeout: TIMEOU
   });
   await submit(page);
   assert.equal(await finalStatus(page), "1 frame from 24 of 30 exposures. "
-    + "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly sampled in time.");
+    + "Cap applied: 1 of 1 frame uses 24 of its exposures, evenly spaced in time order.");
   assertCleanRun(log);
 });
 
