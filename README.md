@@ -23,8 +23,24 @@ motion and parallax; it agrees with the star's measured centre to within 0.15 pi
 The page shows the sky image with Play/Pause, previous and next frame and a timeline below it,
 and the date (or date range) and exposure count of the shown frame. The target panel beside it
 (below it on narrow screens) names what is shown, gives a short hint for the example, toggles
-the marker, and holds "Enter coordinates", which opens the RA/Dec search; the detector is under
-"Advanced settings" (D2 by default).
+the marker, and holds "Pick on sky map" and "Enter coordinates", which opens the RA/Dec search;
+the detector is under "Advanced settings" (D2 by default).
+
+"Pick on sky map" replaces the image with a map of the sky (2MASS J, H, K colour images,
+near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
+scroll, pinch or use −/+ to zoom between the whole sky and 2′. A click or tap selects a
+position: the map outlines the 6′ field around it that a search would fetch and shows its
+RA/Dec. "Search here" runs the search there with the chosen detector, exactly as if the
+coordinates had been typed; "Close map" returns without searching. Selecting alone never
+searches.
+
+The map uses [Aladin Lite](https://github.com/cds-astro/aladin-lite) 3.8.2 (CDS, Strasbourg),
+vendored unmodified as `src/spherex_viewer/static/vendor/aladin.js` with its licence (GNU LGPL
+v3, see `vendor/README.md`). The page loads it only when the map is first opened. The map's
+images come from the 2MASS colour HiPS that IRSA hosts: when the map is opened, the visitor's
+browser fetches them from `irsa.ipac.caltech.edu`; nothing else on the page leaves the server's
+origin. The library is 2.4 MB uncompressed (0.8 MB gzipped), so the reverse proxy should
+compress responses (Caddy: `encode gzip`).
 
 ## Run locally
 
@@ -125,3 +141,9 @@ This publication makes use of data products from the Spectro-Photometer for the 
 Universe, Epoch of Reionization and Ices Explorer (SPHEREx), which is a joint project of the Jet
 Propulsion Laboratory and the California Institute of Technology, and is funded by the National
 Aeronautics and Space Administration.
+
+The sky map shows data from the Two Micron All Sky Survey (2MASS), a joint project of the
+University of Massachusetts and the Infrared Processing and Analysis Center/California Institute
+of Technology, funded by NASA and the NSF, as a HiPS colour survey made by CDS (CNRS/Unistra,
+ODbL 1.0) and served by IRSA. The map is drawn with Aladin Lite (Boch & Fernique 2014, ASPC
+485, 277).

@@ -22,11 +22,14 @@ const BODY = [
   "section>div#controls",
   "div>button#prev", "div>button#play", "div>button#next", "div>input#slider",
   "section>p#date",
+  "section>div#sky", "div>div#sky-view", "div>div#sky-map", "div>p#sky-credit",
+  "div>div#sky-bar", "div>p#sky-selection", "div>button#sky-search", "div>button#sky-close",
   "main>aside#panel",
   "aside>h1#name",
   "aside>p#position",
   "aside>p#hint",
   "aside>label#marker-control", "label>input#show-marker",
+  "aside>button#pick",
   "aside>details#enter", "details>summary",
   "details>form#search",
   "form>label", "label>input#ra",
@@ -45,12 +48,25 @@ const ACK = "This publication makes use of data products from the Spectro-Photom
 const RA = "08h55m10.831s";
 const DEC = "-7d14m42.53s";
 const TIMEOUT = 30_000;
+const SKY_SURVEY = "https://irsa.ipac.caltech.edu/data/hips/CDS/2MASS/Color";
+// The keys Aladin needs from the survey's properties file, values as served by IRSA.
+const SKY_PROPERTIES = [
+  "creator_did = ivo://CDS/P/2MASS/color", "obs_title = 2MASS color J, H, K",
+  "dataproduct_type = image", "hips_frame = equatorial", "hips_order = 9",
+  "hips_order_min = 0", "hips_tile_width = 512", "hips_tile_format = jpeg",
+].join("\n");
+const MAP_HINT = "Click the map to select a position.";
+const MAP_FAILED = "The sky map could not be loaded; enter coordinates to search.";
+// The server's grid (src/spherex_viewer/grid.py): 59 pixels of 6.15 arcseconds per side.
+const FIELD_ARCSEC = 59 * 6.15;
 
 let server;
 let cacheDir;
 let baseUrl;
 let browser;
 let context;
+// A grey 512x512 JPEG with scattered stars, served for every stub sky tile.
+let skyTile;
 
 function freePort() {
   return new Promise((ok, fail) => {
@@ -170,33 +186,56 @@ function exampleRGBA(n) {
 const exampleOk = () => ({ status: 200, body: EXAMPLE });
 
 /**
- * Opens the page with `example.json`, `api/search` and `api/frame` stubbed. `example()`,
- * `search(url)` and `frame(n)` return {status, body} (body JSON-encoded unless `raw` is
- * given) or {abort: true}. Unless `wait` is false, returns once the example is shown or
- * its failure is reported.
+ * Stub sky survey: its properties file and one image for every tile; no coverage map
+ * (Moc.fits) and no all-sky preview (Allsky.jpg, a mosaic of a different size).
+ */
+function skyOk(url) {
+  if (url.endsWith("/properties")) return { status: 200, raw: SKY_PROPERTIES };
+  if (/\/Npix\d+\.jpg$/.test(url)) return { status: 200, jpeg: skyTile };
+  return { status: 404, raw: "Not Found" };
+}
+
+/**
+ * Opens the page with `example.json`, `api/search`, `api/frame` and the sky survey stubbed.
+ * `example()`, `search(url)`, `frame(n)` and `sky(url)` return {status, body} (body
+ * JSON-encoded unless `raw` or `jpeg` is given) or {abort: true}; any other foreign request
+ * is aborted and logged. `aladin` false fails the request for the map script. Unless `wait`
+ * is false, returns once the example is shown or its failure is reported.
  */
 async function openPage({
   search = unusedSearch, frame = () => ({ status: 200, body: {} }), example = exampleOk,
-  wait = true,
+  sky = skyOk, aladin = true, wait = true,
 }) {
   const origin = new URL(baseUrl).origin;
   const log = {
-    requests: [], foreign: [], searches: [], frames: [], unexpectedApi: [], errors: [],
-    examples: [], inFlight: 0, maxInFlight: 0,
+    requests: [], foreign: [], sky: [], scripts: [], searches: [], frames: [], unexpectedApi: [],
+    errors: [], examples: [], inFlight: 0, maxInFlight: 0,
   };
   const page = await context.newPage();
   page.on("request", (request) => log.requests.push(request.url()));
   page.on("pageerror", (error) => log.errors.push(String(error)));
-  const reply = (route, { status, body, raw, abort }) => (abort
-    ? route.abort("connectionfailed")
-    : route.fulfill({
+  const reply = (route, { status, body, raw, jpeg, abort }) => {
+    if (abort) return route.abort("connectionfailed");
+    if (jpeg !== undefined) {
+      return route.fulfill({
+        status, contentType: "image/jpeg", body: jpeg,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    return route.fulfill({
       status,
       contentType: raw === undefined ? "application/json" : "text/plain",
       body: raw ?? JSON.stringify(body),
-    }));
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+  };
   await page.route(() => true, async (route) => {
     const request = route.request();
     const url = new URL(request.url());
+    if (request.url().startsWith(`${SKY_SURVEY}/`)) {
+      log.sky.push(request.url());
+      return reply(route, await sky(request.url()));
+    }
     if (url.origin !== origin) {
       log.foreign.push(request.url());
       return route.abort();
@@ -224,6 +263,10 @@ async function openPage({
     if (url.pathname.startsWith("/api/")) {
       log.unexpectedApi.push(request.url());
       return reply(route, { status: 404, body: { detail: "stub" } });
+    }
+    if (url.pathname.startsWith("/vendor/")) {
+      log.scripts.push(request.url());
+      if (!aladin) return route.abort("connectionfailed");
     }
     return route.continue();
   });
@@ -298,9 +341,9 @@ async function canvasPixels(page) {
     el.getContext("2d").getImageData(0, 0, el.width, el.height).data));
 }
 
-/** RGBA bytes of the canvas as rendered on screen, with its size in CSS pixels. */
-async function renderedCanvas(page) {
-  const png = await page.locator("#image").screenshot();
+/** RGBA bytes of an element as rendered on screen, with its size in CSS pixels. */
+async function renderedCanvas(page, selector = "#image") {
+  const png = await page.locator(selector).screenshot();
   return page.evaluate(async (b64) => {
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
@@ -312,12 +355,46 @@ async function renderedCanvas(page) {
   }, png.toString("base64"));
 }
 
+/** No page error, no unexpected API call, and requests only to the page's origin. */
 function assertCleanRun(log) {
+  assertCleanMapRun(log);
+  assert.deepEqual(log.sky, []);
+  assert.deepEqual(log.scripts, []);
+}
+
+/** As assertCleanRun, but the sky survey at IRSA and the map script may be requested. */
+function assertCleanMapRun(log) {
   const origin = new URL(baseUrl).origin;
   assert.deepEqual(log.errors, []);
   assert.deepEqual(log.foreign, []);
   assert.deepEqual(log.unexpectedApi, []);
-  for (const url of log.requests) assert.equal(new URL(url).origin, origin, url);
+  for (const url of log.requests) {
+    assert.ok(new URL(url).origin === origin || url.startsWith(`${SKY_SURVEY}/`), url);
+  }
+}
+
+/** A grey JPEG sky tile (512x512, a few hundred stars), drawn by the browser. */
+async function makeSkyTile(chromiumBrowser) {
+  const page = await chromiumBrowser.newPage();
+  try {
+    const b64 = await page.evaluate(async () => {
+      const canvas = new OffscreenCanvas(512, 512);
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "rgb(12, 12, 12)";
+      ctx.fillRect(0, 0, 512, 512);
+      for (let i = 0; i < 400; i++) {
+        const grey = 90 + ((i * 37) % 160);
+        ctx.fillStyle = `rgb(${grey}, ${grey}, ${grey})`;
+        ctx.fillRect((i * 97) % 512, (i * 211) % 512, 2 + (i % 3), 2 + (i % 3));
+      }
+      const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.9 });
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      return btoa(Array.from(bytes, (b) => String.fromCharCode(b)).join(""));
+    });
+    return Buffer.from(b64, "base64");
+  } finally {
+    await page.close();
+  }
 }
 
 before(async () => {
@@ -338,6 +415,7 @@ before(async () => {
   try {
     await waitForHealth(`${baseUrl}healthz`, server, output);
     browser = await chromium.launch();
+    skyTile = await makeSkyTile(browser);
   } catch (error) {
     await stopServer(server);
     await rm(cacheDir, { recursive: true, force: true });
@@ -382,8 +460,16 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
       ["prev", "\u2039", "Previous frame"],
       ["play", "Play", null],
       ["next", "\u203a", "Next frame"],
+      ["sky-search", "Search here", null],
+      ["sky-close", "Close map", null],
+      ["pick", "Pick on sky map", null],
       ["submit", "Show", null],
     ]);
+    assert.equal(await page.isVisible("#pick"), true);
+    assert.equal(await page.isVisible("#sky"), false);
+    assert.equal(await page.getAttribute("#pick", "aria-expanded"), "false");
+    assert.equal(await page.getAttribute("#pick", "aria-controls"), "sky");
+    assert.ok((await page.getAttribute("#sky-map", "aria-label")).length > 0);
     assert.equal(await page.getAttribute("#ra", "type"), "text");
     assert.equal(await page.getAttribute("#dec", "type"), "text");
     assert.equal(await page.getAttribute("#show-marker", "type"), "checkbox");
@@ -1100,3 +1186,315 @@ test("play toggles looping playback through the loaded frames", { timeout: TIMEO
   assert.equal((await sliderState(page)).value, stopped);
   assertCleanRun(log);
 });
+
+// --- The sky map ---------------------------------------------------------------------------
+
+const SELECTION = /^RA (\d+\.\d{6})°, Dec (-?\d+\.\d{6})°$/;
+
+/** Opens the sky map with its button and waits until it accepts a selection. */
+async function openMap(page) {
+  await page.click("#pick");
+  await page.waitForFunction((hint) => document.querySelector("#sky-selection").textContent
+    === hint, MAP_HINT, { timeout: 20_000 });
+}
+
+/** The selected position shown under the map, in degrees, or null if none is selected. */
+async function selected(page) {
+  const match = SELECTION.exec(await text(page, "#sky-selection"));
+  return match === null ? null : { ra: Number(match[1]), dec: Number(match[2]), text: match };
+}
+
+/** The map's rectangle in CSS pixels of the viewport. */
+const mapRect = (page) => page.$eval("#sky-map", (el) => {
+  const r = el.getBoundingClientRect();
+  return { left: r.left, top: r.top, width: r.width, height: r.height };
+});
+
+const isAmber = (data, i) => data[i] > 220 && data[i + 1] > 140 && data[i + 1] < 220
+  && data[i + 2] < 100;
+
+/** Bounding box (viewport CSS pixels) of the drawn selection's amber pixels, or null. */
+async function selectionBox(page) {
+  const rect = await mapRect(page);
+  const shot = await renderedCanvas(page, "#sky-map");
+  let box = null;
+  for (let y = 0; y < shot.height; y++) {
+    for (let x = 0; x < shot.width; x++) {
+      if (!isAmber(shot.data, 4 * (y * shot.width + x))) continue;
+      box ??= { left: x, right: x, top: y, bottom: y };
+      box.left = Math.min(box.left, x);
+      box.right = Math.max(box.right, x);
+      box.top = Math.min(box.top, y);
+      box.bottom = Math.max(box.bottom, y);
+    }
+  }
+  if (box === null) return null;
+  return {
+    cx: rect.left + (box.left + box.right + 1) / 2,
+    cy: rect.top + (box.top + box.bottom + 1) / 2,
+    width: box.right - box.left + 1,
+    height: box.bottom - box.top + 1,
+  };
+}
+
+async function waitForSelectionBox(page) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const box = await selectionBox(page);
+    if (box !== null) return box;
+    await page.waitForTimeout(100);
+  }
+  throw new Error("no selection drawn on the map");
+}
+
+/** Clicks the map at an offset (CSS pixels) from its centre and returns the selection. */
+async function clickMap(page, dx, dy) {
+  const rect = await mapRect(page);
+  const x = rect.left + rect.width / 2 + dx;
+  const y = rect.top + rect.height / 2 + dy;
+  await page.mouse.click(x, y);
+  await page.waitForFunction((re) => new RegExp(re).test(
+    document.querySelector("#sky-selection").textContent), SELECTION.source);
+  return { x, y, ...(await selected(page)) };
+}
+
+test("the homepage requests neither the map script nor anything from another origin",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await page.waitForTimeout(1500);
+    assert.ok(log.requests.every((u) => !u.includes("/vendor/")), log.requests.join(" "));
+    assert.ok(log.requests.length > 0);
+    assertCleanRun(log);
+  });
+
+test("opening the map loads the script from the page's origin and tiles only from IRSA",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await openMap(page);
+    await page.waitForFunction(() => document.querySelector("#sky-map canvas") !== null);
+    const deadline = Date.now() + 10_000;
+    while (!log.sky.some((u) => u.endsWith(".jpg")) && Date.now() < deadline) {
+      await page.waitForTimeout(100);
+    }
+    assert.deepEqual(log.scripts, [new URL("vendor/aladin.js", baseUrl).href]);
+    assert.ok(log.sky.some((u) => u.endsWith(".jpg")), `no tile requested: ${log.sky}`);
+    assert.equal(await page.isVisible("#sky-map"), true);
+    assert.equal(await page.isVisible("#image"), false);
+    assert.equal(await page.isDisabled("#pick"), true);
+    assert.equal(await page.getAttribute("#pick", "aria-expanded"), "true");
+    assert.equal(await page.isDisabled("#sky-search"), true);
+    assertCleanMapRun(log);
+  });
+
+test("a click selects: the position under it is shown and the 6' field is outlined around it, "
+  + "without a search", { timeout: TIMEOUT }, async () => {
+  const { page, log } = await openPage({});
+  await openMap(page);
+  const rect = await mapRect(page);
+  // Two clicks 200 px apart give the map's scale; it opens at a 1.5 degree field of view.
+  const a = await clickMap(page, -100, 0);
+  const b = await clickMap(page, 100, 0);
+  const cosDec = Math.cos((EXAMPLE.dec_deg * Math.PI) / 180);
+  const degPerPx = Math.hypot((a.ra - b.ra) * cosDec, a.dec - b.dec) / 200;
+  assert.ok(Math.abs(degPerPx * rect.width - 1.5) < 0.05, `field of view ${degPerPx * rect.width}`);
+  // North up, east left, centred on the example.
+  assert.ok(a.ra > EXAMPLE.ra_deg && b.ra < EXAMPLE.ra_deg, `RA ${a.ra}, ${b.ra}`);
+  for (const p of [a, b]) {
+    assert.ok(Math.abs(p.dec - EXAMPLE.dec_deg) < 1.5 * degPerPx, `Dec ${p.dec}`);
+    assert.ok(Math.abs(Math.abs(p.ra - EXAMPLE.ra_deg) * cosDec - 100 * degPerPx)
+      < 1.5 * degPerPx, `RA ${p.ra}`);
+  }
+  const c = await clickMap(page, 30, -40);
+  assert.ok(Math.abs((EXAMPLE.ra_deg - c.ra) * cosDec - 30 * degPerPx) < 1.5 * degPerPx);
+  assert.ok(Math.abs(c.dec - EXAMPLE.dec_deg - 40 * degPerPx) < 1.5 * degPerPx);
+
+  const box = await waitForSelectionBox(page);
+  const side = FIELD_ARCSEC / 3600 / degPerPx;
+  assert.ok(Math.abs(box.cx - c.x) <= 1.5 && Math.abs(box.cy - c.y) <= 1.5,
+    `outline centred at ${box.cx},${box.cy}, click at ${c.x},${c.y}`);
+  for (const size of [box.width, box.height]) {
+    assert.ok(Math.abs(size - side) <= 2.5, `outline ${box.width}x${box.height}, field ${side}`);
+  }
+  assert.equal(await page.isDisabled("#sky-search"), false);
+  await page.waitForTimeout(500);
+  assert.deepEqual(log.searches, []);
+  assert.deepEqual(log.frames, []);
+  assert.equal(await page.inputValue("#ra"), "");
+  assert.equal(await page.isVisible("#sky"), true);
+  assertCleanMapRun(log);
+});
+
+test("dragging the map pans it and does not select", { timeout: TIMEOUT }, async () => {
+  const { page, log } = await openPage({});
+  await openMap(page);
+  const rect = await mapRect(page);
+  const x = rect.left + rect.width / 2;
+  const y = rect.top + rect.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x + 40, y + 25, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForTimeout(500);
+  assert.equal(await text(page, "#sky-selection"), MAP_HINT);
+  assert.equal(await page.isDisabled("#sky-search"), true);
+  assert.equal(await selectionBox(page), null);
+  // The sky moved with the pointer: the centre now shows a position east and north of before.
+  const after = await clickMap(page, 0, 0);
+  assert.ok(after.ra > EXAMPLE.ra_deg && after.dec > EXAMPLE.dec_deg,
+    `centre after drag ${after.ra}, ${after.dec}`);
+  assert.deepEqual(log.searches, []);
+  assertCleanMapRun(log);
+});
+
+test("zoomed out to the whole sky, a click off the sky selects nothing and a click on it does",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await openMap(page);
+    const rect = await mapRect(page);
+    await page.mouse.move(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    for (let i = 0; i < 30; i++) {
+      await page.mouse.wheel(0, 400);
+      await page.waitForTimeout(50);
+    }
+    await page.waitForTimeout(1000);
+    await page.mouse.click(rect.left + 5, rect.top + 5);
+    await page.waitForTimeout(300);
+    assert.equal(await text(page, "#sky-selection"), MAP_HINT);
+    assert.equal(await page.isDisabled("#sky-search"), true);
+    const centre = await clickMap(page, 0, 0);
+    assert.ok(Math.abs(centre.dec - EXAMPLE.dec_deg) < 1, `centre ${centre.ra}, ${centre.dec}`);
+    await waitForSelectionBox(page);
+    assert.deepEqual(log.searches, []);
+    assertCleanMapRun(log);
+  });
+
+test("Search here searches the selection with the current detector, closes the map and loads "
+  + "the frames", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES, { detector: "D4" });
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+  });
+  await openDisclosure(page, "advanced");
+  await page.selectOption("#detector", "D4");
+  await openMap(page);
+  const pick = await clickMap(page, 25, 15);
+  assert.deepEqual(log.searches, []);
+  await page.click("#sky-search");
+  assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+  assert.equal(log.searches.length, 1);
+  const params = log.searches[0].searchParams;
+  assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
+    [pick.text[1], pick.text[2], "D4"]);
+  assert.equal(await page.inputValue("#ra"), pick.text[1]);
+  assert.equal(await page.inputValue("#dec"), pick.text[2]);
+  assert.equal(await page.isVisible("#sky"), false);
+  assert.equal(await page.isVisible("#image"), true);
+  assert.equal(await page.isDisabled("#pick"), false);
+  assert.equal(await text(page, "#name"), `RA ${pick.text[1]}, Dec ${pick.text[2]}`);
+  assert.equal(log.frames.length, 3);
+  const loaded = [0, 1, 2].map((n) => pixels(n));
+  assert.deepEqual(await canvasPixels(page),
+    Array.from(toRGBA(loaded[0], computeStretch(loaded))));
+  assertCleanMapRun(log);
+});
+
+test("closing the map without searching leaves the page as it was; reopening starts afresh",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await openMap(page);
+    await clickMap(page, 20, 20);
+    await page.click("#sky-close");
+    assert.equal(await page.isVisible("#sky"), false);
+    for (const id of ["#image", "#play", "#slider", "#date"]) {
+      assert.equal(await page.isVisible(id), true, id);
+    }
+    assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+    assert.equal(await text(page, "#name"), "Test Star");
+    assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
+    assert.equal(await statusText(page), "");
+    assert.equal(await page.inputValue("#ra"), "");
+    assert.equal(await page.inputValue("#dec"), "");
+    assert.equal(await page.getAttribute("#pick", "aria-expanded"), "false");
+    assert.equal(await page.evaluate(() => document.activeElement?.id), "pick");
+
+    await page.click("#pick");
+    assert.equal(await text(page, "#sky-selection"), MAP_HINT);
+    assert.equal(await page.isDisabled("#sky-search"), true);
+    await page.waitForTimeout(300);
+    assert.equal(await selectionBox(page), null);
+    assert.equal(log.scripts.length, 1);
+    assert.deepEqual(log.searches, []);
+    assertCleanMapRun(log);
+  });
+
+for (const [name, options] of [
+  ["map script", { aladin: false }],
+  ["sky survey", { sky: () => ({ abort: true }) }],
+]) {
+  test(`a ${name} that cannot be loaded is reported once and typed search still works`,
+    { timeout: TIMEOUT }, async () => {
+      const plan = makePlan(THREE_FRAMES);
+      const { page, log } = await openPage({
+        ...options, search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      });
+      await page.click("#pick");
+      assert.equal(await waitForStatus(page, (t) => t !== ""), MAP_FAILED);
+      assert.equal(await page.isVisible("#sky"), false);
+      assert.equal(await page.isVisible("#image"), true);
+      assert.equal(await page.isDisabled("#pick"), false);
+      await page.waitForTimeout(500);
+      assert.equal(await statusText(page), MAP_FAILED);
+      assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+      await submit(page);
+      assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+      assert.equal(log.searches[0].searchParams.get("ra"), RA);
+      assertCleanMapRun(log);
+    });
+}
+
+test("at 1366x768 the open map and both of its buttons are in view, the panel beside it",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openPage({});
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await openMap(page);
+    await clickMap(page, 0, 0);
+    const parts = ["#sky-map", "#sky-selection", "#sky-search", "#sky-close"];
+    const { rects, width, height, scrollWidth } = await layout(page, [...parts, "#panel"]);
+    for (const s of parts) {
+      const r = rects[s];
+      assert.ok(r.left >= 0 && r.top >= 0 && r.right <= width && r.bottom <= height,
+        `${s} at ${JSON.stringify(r)} outside ${width}x${height}`);
+    }
+    const map = rects["#sky-map"];
+    assert.ok(map.right - map.left >= 500 && map.bottom - map.top >= 500,
+      `map only ${map.right - map.left}x${map.bottom - map.top}`);
+    assert.ok(rects["#sky-search"].top >= map.bottom, "buttons not below the map");
+    assert.ok(rects["#panel"].left >= map.right, "panel not beside the map");
+    assert.ok(scrollWidth <= width);
+    assertCleanMapRun(log);
+  });
+
+test("at 390x844 the map spans the width, a tap selects and nothing scrolls sideways",
+  { timeout: TIMEOUT }, async () => {
+    await context.close();
+    context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
+    const { page, log } = await openPage({});
+    await page.tap("#pick");
+    await page.waitForFunction((hint) => document.querySelector("#sky-selection").textContent
+      === hint, MAP_HINT, { timeout: 20_000 });
+    const rect = await mapRect(page);
+    await page.touchscreen.tap(rect.left + rect.width / 2 + 20, rect.top + rect.height / 2);
+    await page.waitForFunction((re) => new RegExp(re).test(
+      document.querySelector("#sky-selection").textContent), SELECTION.source);
+    await waitForSelectionBox(page);
+    const parts = ["#sky-map", "#sky-selection", "#sky-search", "#sky-close"];
+    const { rects, width, scrollWidth } = await layout(page, [...parts, "#panel"]);
+    for (const s of parts) {
+      assert.ok(rects[s].left >= 0 && rects[s].right <= width, `${s} wider than the screen`);
+    }
+    assert.equal(rects["#sky-map"].right - rects["#sky-map"].left, width - 32);
+    assert.ok(rects["#panel"].top >= rects["#sky-close"].bottom, "panel not below the map");
+    assert.ok(scrollWidth <= width, `page scrolls to ${scrollWidth} of ${width}`);
+    assert.deepEqual(log.searches, []);
+    assertCleanMapRun(log);
+  });
