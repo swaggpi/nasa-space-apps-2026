@@ -16,7 +16,10 @@ from spherex_viewer import app as app_module
 from spherex_viewer.app import (
     BODY_TOO_LARGE,
     FRAME_FAILED,
+    INVALID_DEC,
+    INVALID_RA,
     INVALID_REQUEST,
+    MAX_COORD_LENGTH,
     MAX_BODY_BYTES,
     MAX_CONCURRENT_FRAMES,
     MAX_CONCURRENT_SEARCHES,
@@ -261,6 +264,48 @@ def test_search_rejects_bad_input_with_fixed_422(tmp_path, params):
     assert set(body) == {"detail"} and isinstance(body["detail"], str)
     assert "<b>" not in response.text
     assert discover.calls == []
+
+
+@pytest.mark.parametrize(("field", "detail"), [("ra", INVALID_RA), ("dec", INVALID_DEC)],
+                         ids=["ra", "dec"])
+def test_search_rejects_over_long_coordinate_without_parsing(tmp_path, monkeypatch, field,
+                                                             detail):
+    parsed = []
+
+    def recording(parse):
+        def wrapper(text):
+            parsed.append(text)
+            return parse(text)
+        return wrapper
+
+    monkeypatch.setattr(app_module, "parse_ra", recording(app_module.parse_ra))
+    monkeypatch.setattr(app_module, "parse_dec", recording(app_module.parse_dec))
+    discover = CountingDiscover(SMALL_BIN)
+    client, _ = make_client(tmp_path, discover=discover)
+    long_value = "1" * 60000 + ("h" if field == "ra" else "d")
+    with client:
+        start = time.monotonic()
+        response = client.get("/api/search", params={**SEARCH, field: long_value})
+        elapsed = time.monotonic() - start
+    assert response.status_code == 422
+    assert response.json() == {"detail": detail}
+    assert long_value not in parsed
+    assert all(len(text) <= MAX_COORD_LENGTH for text in parsed)
+    assert elapsed < 1.0
+    assert discover.calls == []
+
+
+def test_search_accepts_30_character_sexagesimal(tmp_path):
+    ra, dec = "08h55m10.831" + "0" * 17 + "s", "-7d14m42.53" + "0" * 18 + "s"
+    assert len(ra) == len(dec) == 30
+    discover = CountingDiscover(SMALL_BIN)
+    client, _ = make_client(tmp_path, discover=discover)
+    with client:
+        response = client.get("/api/search", params={"ra": ra, "dec": dec})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ra_deg"] == pytest.approx(133.795129, abs=1e-6)
+    assert body["dec_deg"] == pytest.approx(-7.245147, abs=1e-6)
 
 
 def test_search_discovery_error_gives_generic_502(tmp_path):

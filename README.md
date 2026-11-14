@@ -27,14 +27,18 @@ Open http://localhost:8000/.
 ```sh
 docker build --platform linux/amd64 -t hack-demo .
 cp .env.example .env
-docker run --rm -p 127.0.0.1:8000:8000 --memory 512m --env-file .env -v hack-demo-data:/data hack-demo
+docker run --rm -p 8000:8000 --memory 512m --env-file .env -v hack-demo-data:/data hack-demo
 ```
 
 The container serves plain HTTP on `0.0.0.0:8000` (one uvicorn worker) and is meant to sit
 behind a TLS-terminating reverse proxy such as Caddy (e.g. `reverse_proxy localhost:8000` for
-the subdomain). It trusts `X-Forwarded-For` and `X-Forwarded-Proto` from any peer, and the rate
-limits are keyed by that forwarded address, so the container port must be reachable only
-through the proxy (publish it on `127.0.0.1` as above, never on a public interface).
+the subdomain).
+
+Note: the app trusts `X-Forwarded-For` from any peer (rate limits are keyed by it), so port 8000
+must only be reachable through the reverse proxy: publish it on the loopback interface with
+`-p 127.0.0.1:8000:8000` when Caddy runs on the host, or publish no port and share a Docker
+network when Caddy runs in a container.
+
 `GET /healthz` returns 200 `{"status":"ok"}` once the app is ready.
 
 Everything that must survive a restart lives under `/data`: the on-disk cutout cache in

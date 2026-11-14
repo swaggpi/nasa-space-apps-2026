@@ -35,6 +35,9 @@ CACHE_MAX_MB_ENV = "SPHEREX_CACHE_MAX_MB"
 DEFAULT_CACHE_MAX_MB = 1024
 
 MAX_URI_LENGTH = 300
+# astropy's angle parser takes time quadratic in input length (60,000 characters: ~19 s of CPU);
+# a precise sexagesimal value needs about 30.
+MAX_COORD_LENGTH = 64
 # A frame request with 24 URIs of 300 characters is about 8 kB.
 MAX_BODY_BYTES = 64 * 1024
 
@@ -50,6 +53,8 @@ BODY_TOO_LARGE = "Request body too large."
 SERVER_BUSY = "The server is busy. Try again in a moment."
 SEARCH_FAILED = "The archive search failed. Try again later."
 FRAME_FAILED = "No exposure of this frame could be loaded."
+INVALID_RA = "Invalid RA: use degrees from 0 to 360 or sexagesimal hours such as 08h55m10.831s."
+INVALID_DEC = "Invalid Dec: use degrees from -90 to +90 or sexagesimal such as -7d14m42.53s."
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -214,15 +219,17 @@ def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = No
     async def search(request: Request, ra: str, dec: str, detector: str = "D2") -> dict:
         check_rate(search_limiter, request)
         try:
+            if len(ra) > MAX_COORD_LENGTH:
+                raise CoordinateError(INVALID_RA)
             ra_deg = parse_ra(ra)
         except CoordinateError:
-            raise HTTPException(status_code=422, detail="Invalid RA: use degrees from 0 to 360 "
-                                "or sexagesimal hours such as 08h55m10.831s.") from None
+            raise HTTPException(status_code=422, detail=INVALID_RA) from None
         try:
+            if len(dec) > MAX_COORD_LENGTH:
+                raise CoordinateError(INVALID_DEC)
             dec_deg = parse_dec(dec)
         except CoordinateError:
-            raise HTTPException(status_code=422, detail="Invalid Dec: use degrees from -90 to "
-                                "+90 or sexagesimal such as -7d14m42.53s.") from None
+            raise HTTPException(status_code=422, detail=INVALID_DEC) from None
         if detector not in DETECTORS:
             raise HTTPException(status_code=422, detail="Unknown detector; use one of D1–D6.")
         try:
