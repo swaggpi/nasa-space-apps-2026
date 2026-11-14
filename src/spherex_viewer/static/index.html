@@ -23,6 +23,18 @@
           aria-label="Timeline">
       </div>
       <p id="date"></p>
+      <div id="sky" hidden>
+        <div id="sky-view">
+          <div id="sky-map" role="application"
+            aria-label="Sky map: drag to pan, scroll or pinch to zoom, click to select"></div>
+          <p id="sky-credit">2MASS J, H, K: UMass, IPAC/Caltech; HiPS: CDS</p>
+        </div>
+        <div id="sky-bar">
+          <p id="sky-selection"></p>
+          <button id="sky-search" type="button" disabled>Search here</button>
+          <button id="sky-close" type="button">Close map</button>
+        </div>
+      </div>
     </section>
     <aside id="panel" aria-label="Target">
       <h1 id="name"></h1>
@@ -30,6 +42,8 @@
       <p id="hint" hidden></p>
       <label id="marker-control" hidden><input id="show-marker" type="checkbox" checked>
         Show target marker</label>
+      <button id="pick" type="button" aria-controls="sky"
+        aria-expanded="false">Pick on sky map</button>
       <details id="enter">
         <summary>Enter coordinates</summary>
         <form id="search">

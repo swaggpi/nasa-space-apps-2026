@@ -1,6 +1,7 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
-// status, date and position texts, frame stepping, marker placement and validation of the
-// bundled example. No DOM access; imported by app.js and by Node tests.
+// status, date and position texts, frame stepping, marker placement, validation of the
+// bundled example and the sky-map selection. No DOM access; imported by app.js and by Node
+// tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -190,4 +191,58 @@ export function parseExample(data) {
       ...(f.marker === undefined ? {} : { marker: { x: f.marker.x, y: f.marker.y } }),
     })),
   };
+}
+
+/** Pixels per side of the common grid and its pixel scale (src/spherex_viewer/grid.py). */
+export const FIELD_PIXELS = 59;
+export const PIXEL_SCALE_ARCSEC = 6.15;
+
+/** Largest pointer movement, in CSS pixels, between press and release that is still a click. */
+export const CLICK_TOLERANCE_PX = 5;
+
+const RAD = Math.PI / 180;
+
+/**
+ * Sky corners of the tool's field centred on a position: the outer edges of the 59x59 grid of
+ * 6.15" pixels on the north-up gnomonic (TAN) plane, as the server resamples onto.
+ * @param {number} raDeg ICRS right ascension of the centre in degrees
+ * @param {number} decDeg ICRS declination of the centre in degrees
+ * @returns {Array<[number, number]>} [ra, dec] in degrees, 0 <= ra < 360, in the order
+ *   north-east, north-west, south-west, south-east
+ */
+export function fieldCorners(raDeg, decDeg) {
+  const half = ((FIELD_PIXELS / 2) * PIXEL_SCALE_ARCSEC / 3600) * RAD;
+  const dec0 = decDeg * RAD;
+  // (xi, eta): tangent-plane offsets, xi towards east, eta towards north.
+  return [[half, half], [-half, half], [-half, -half], [half, -half]].map(([xi, eta]) => {
+    const denom = Math.cos(dec0) - eta * Math.sin(dec0);
+    const ra = raDeg + Math.atan2(xi, denom) / RAD;
+    const dec = Math.atan2(Math.sin(dec0) + eta * Math.cos(dec0), Math.hypot(xi, denom)) / RAD;
+    return [((ra % 360) + 360) % 360, dec];
+  });
+}
+
+/**
+ * RA and Dec texts for the search fields, decimal degrees with six decimals (0.0036"), which
+ * the server reads as degrees.
+ * @param {number} raDeg ICRS right ascension in degrees, any value (wrapped into [0, 360))
+ * @param {number} decDeg ICRS declination in degrees (clamped to [-90, 90])
+ * @returns {{ra: string, dec: string}}
+ */
+export function fieldTexts(raDeg, decDeg) {
+  let ra = (((raDeg % 360) + 360) % 360).toFixed(6);
+  if (ra === "360.000000") ra = "0.000000";
+  const dec = Math.min(Math.max(decDeg, -90), 90).toFixed(6);
+  return { ra, dec: dec === "-0.000000" ? "0.000000" : dec };
+}
+
+/**
+ * Whether a press and release of the pointer on the map is a click (select) rather than a
+ * drag (pan).
+ * @param {{x: number, y: number}} press pointer position at press, CSS pixels
+ * @param {{x: number, y: number}} release pointer position at release, CSS pixels
+ * @returns {boolean}
+ */
+export function isClick(press, release) {
+  return Math.hypot(release.x - press.x, release.y - press.y) <= CLICK_TOLERANCE_PX;
 }
