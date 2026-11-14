@@ -8,7 +8,7 @@ import {
 
 const PLAY_INTERVAL_MS = 500;
 const UNREACHABLE = "the server could not be reached";
-const EXAMPLE_URL = "api/example.json";
+const EXAMPLE_URL = "./example.json";
 const EXAMPLE_FAILED = "The example could not be loaded; enter coordinates to search.";
 
 const form = document.getElementById("search");

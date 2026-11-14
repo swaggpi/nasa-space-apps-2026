@@ -258,8 +258,7 @@ def test_discover_sends_query_and_parses(no_sleep):
     assert f"{url.scheme}://{url.host}{url.path}" == SIA_URL
     assert list(url.params.multi_items()) == sia_params(133.795129, -7.245147, "D2")
     timeout = request.extensions["timeout"]
-    assert timeout["connect"] == 10
-    assert timeout["read"] == 60
+    assert timeout == {"connect": 5, "read": 10, "write": 5, "pool": 5}
     assert no_sleep == []
 
 
@@ -344,16 +343,75 @@ def test_discover_fails_after_five_gateway_errors(no_sleep):
     assert len(requests) == 5
 
 
-def test_discover_does_not_retry_after_the_window(no_sleep, monkeypatch):
-    clock = iter([0.0, 29.0, 29.5])
-    monkeypatch.setattr("time.monotonic", lambda: next(clock))
+class Clock:
+    """Simulated ``time.monotonic``/``time.sleep``; mock requests advance it to model stalls."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr("time.monotonic", lambda: clock.now)
+    monkeypatch.setattr("time.sleep", clock.sleep)
+    return clock
+
+
+def _stalling_client(clock, stall_s, outcome, requests):
+    """Each request takes ``stall_s`` simulated seconds, then ``outcome`` happens."""
+
+    def handler(request):
+        requests.append(clock.now)
+        clock.now += stall_s
+        if isinstance(outcome, Exception):
+            raise outcome
+        return httpx.Response(outcome, text=PROXY_ERROR)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("stall_s", [0.1, 4.0, 9.9, 16.0, 25.0])
+@pytest.mark.parametrize("outcome", [502, httpx.ReadTimeout("stalled")])
+def test_discover_ends_within_the_budget_when_every_attempt_fails(clock, stall_s, outcome):
     requests = []
-    responses = [httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"), (200, BODY)]
-    with _client(responses, requests) as client:
+    start = clock.now
+    with _stalling_client(clock, stall_s, outcome, requests) as client:
+        with pytest.raises(DiscoveryError):
+            discover(client, 133.795129, -7.245147, "D2")
+    assert clock.now - start <= 45
+    assert all(t - start <= 20 for t in requests)
+
+
+def test_discover_does_not_retry_after_the_last_start(clock):
+    requests = []
+    with _stalling_client(clock, 9.0, httpx.ReadTimeout("stalled"), requests) as client:
         with pytest.raises(DiscoveryError, match="could not be reached"):
             discover(client, 133.795129, -7.245147, "D2")
     assert len(requests) == 2
-    assert no_sleep == [1]
+    assert clock.sleeps == [1]
+
+
+def test_discover_stops_a_trickling_response_within_the_budget(clock):
+    class Trickle(httpx.SyncByteStream):
+        """A valid body whose every chunk arrives 9 s after the previous one (180 s in all)."""
+
+        def __iter__(self):
+            yield HEADER.encode() + b"\n"
+            for _ in range(20):
+                clock.now += 9.0
+                yield row(PREFIX + DR1_URI, 60801.1).encode() + b"\n"
+
+    start = clock.now
+    with _client([(200, Trickle())], []) as client:
+        with pytest.raises(DiscoveryError, match="too slowly"):
+            discover(client, 133.795129, -7.245147, "D2")
+    assert clock.now - start <= 45
 
 
 def test_discover_fails_at_once_on_400(no_sleep):
