@@ -2,12 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  PRELOAD_MAX_EXPOSURES, WIDE_PIXELS, ZOOM_LEVELS, capNotice, centrePixels, clampView,
+  AHEAD_PIXELS, PRELOAD_MAX_EXPOSURES, WIDE_PIXELS, ZOOM_LEVELS, aheadShift, capNotice, centrePixels, clampView,
   computeStretch, countRange, decodePixels, difference, fieldCorners, fieldTexts, formatPosition,
   frameLabel, isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote,
   offsetPosition, panStep, parseExample, parseLink, plural, previousIndex, retryDelay,
-  shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody, validPlan, validWideBody,
-  zoomStep,
+  shiftedView, shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
+  validWideBody, widenFrame, zoomStep,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -700,4 +700,116 @@ test("difference on 177-px frames takes the same per-pixel and neighbourhood ste
     }
   }
   assertClose(diff[p], neighbours.reduce((a, v) => a + v, 0) / 9, "no data in frame 1");
+});
+
+test("countRange leaves out fields not loaded yet; with none in view it gives null", () => {
+  const nf = [null, null, null, null, 17, null, null, null, null];
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 88, cy: 88 }, 177), [17, 17]);
+  assert.deepEqual(countRange(nf, { zoom: 1 / 3, cx: 88, cy: 88 }, 177), [17, 17]);
+  assert.deepEqual(countRange(nf, { zoom: 1, cx: 29, cy: 29 }, 177), [null, null]);
+  assert.equal(frameLabel("2025-08-15", null, null), "2025-08-15");
+  assert.equal(frameLabel("2025-08-15", 17, 17), "2025-08-15 \u00b7 17 exposures");
+});
+
+test("widenFrame puts a 59-px frame at the centre of the wide grid, nothing around it", () => {
+  const narrow = Array.from({ length: 59 * 59 }, (_, i) => (i === 7 ? null : i));
+  const frame = { pixels: narrow, width: 59, height: 59, nUsed: 5, nFields: [5], dates: "d",
+    marker: { x: 3.5, y: 40 } };
+  const wide = widenFrame(frame);
+  assert.deepEqual([wide.width, wide.height, wide.dates], [177, 177, "d"]);
+  assert.equal(wide.pixels.length, 177 * 177);
+  assert.deepEqual(centrePixels(wide), narrow);
+  assert.equal(wide.pixels.filter((v) => v !== null).length, 59 * 59 - 1);
+  assert.deepEqual(wide.nFields, [null, null, null, null, 5, null, null, null, null]);
+  assert.deepEqual(wide.marker, { x: 62.5, y: 99 });
+  assert.deepEqual(frame.marker, { x: 3.5, y: 40 });
+  assert.equal(frame.pixels, narrow);
+  const { marker, ...plain } = frame;
+  assert.equal("marker" in widenFrame(plain), false);
+});
+
+test("aheadShift loads two fields on in the direction of a press near the edge", () => {
+  const centre = { zoom: 1, cx: 88, cy: 88 };
+  const expected = { ArrowLeft: [-1, 0, -2, 0], ArrowRight: [1, 0, 2, 0],
+    ArrowUp: [0, -1, 0, -2], ArrowDown: [0, 1, 0, 2] };
+  for (const [key, [mx, my, dx, dy]] of Object.entries(expected)) {
+    const moved = panStep(centre, mx, my, 177).view;
+    assert.deepEqual(aheadShift(moved, 177, mx, my), { dx, dy }, key);
+  }
+  assert.equal(AHEAD_PIXELS, 88.5);
+  // More than 1.5 fields of room ahead (here after joining on, the view still on the
+  // trailing side): no preload yet. Zoomed in at 4x (a 15-px view) the edge is 6.875.
+  assert.equal(aheadShift({ zoom: 4, cx: 95.5, cy: 88 }, 177, -1, 0), null);
+  assert.deepEqual(aheadShift({ zoom: 4, cx: 95.375, cy: 88 }, 177, -1, 0), { dx: -2, dy: 0 });
+  assert.equal(aheadShift({ zoom: 1, cx: 118, cy: 88 }, 177, -1, 0), null);
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 117.5, cy: 88 }, 177, -1, 0), { dx: -2, dy: 0 });
+  // Zoomed out to 12', one field (more would not hold the view); at 18' none.
+  assert.deepEqual(aheadShift({ zoom: 1 / 2, cx: 80, cy: 88 }, 177, -1, 0), { dx: -1, dy: 0 });
+  assert.equal(aheadShift({ zoom: 1 / 3, cx: 88, cy: 88 }, 177, -1, 0), null);
+  // No preload on the 59 grid or without movement.
+  assert.equal(aheadShift({ zoom: 2, cx: 20, cy: 29 }, 59, -1, 0), null);
+  assert.equal(aheadShift(centre, 177, 0, 0), null);
+});
+
+test("aheadShift goes diagonal when the view is off centre across the press", () => {
+  // Up by more than a third of a field, then left: north-east; the view is held in y.
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 60 }, 177, -1, 0), { dx: -2, dy: -1 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 29 }, 177, -1, 0), { dx: -2, dy: -2 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 147 }, 177, -1, 0), { dx: -2, dy: 2 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 140, cy: 120 }, 177, 0, 1), { dx: 1, dy: 2 });
+  // Less than a third of a field off centre across: straight on.
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 70 }, 177, -1, 0), { dx: -2, dy: 0 });
+});
+
+test("shiftedView holds the view over the shifted area only when it fits there", () => {
+  const shift = { dx: -2, dy: 0 };
+  assert.equal(shiftedView({ zoom: 1, cx: 30, cy: 88 }, 177, shift), null);
+  assert.deepEqual(shiftedView({ zoom: 1, cx: 29, cy: 88 }, 177, shift),
+    { zoom: 1, cx: 147, cy: 88 });
+  // Zoomed in, the area joins on before the view reaches the old edge.
+  assert.deepEqual(shiftedView({ zoom: 2, cx: 43.75, cy: 88 }, 177, shift),
+    { zoom: 2, cx: 161.75, cy: 88 });
+  assert.equal(shiftedView({ zoom: 2, cx: 44, cy: 88 }, 177, shift), null);
+  assert.equal(shiftedView({ zoom: 1 / 2, cx: 58.5, cy: 88 }, 177, shift), null);
+  assert.deepEqual(shiftedView({ zoom: 1 / 2, cx: 58.5, cy: 88 }, 177, { dx: -1, dy: 0 }),
+    { zoom: 1 / 2, cx: 117.5, cy: 88 });
+  assert.deepEqual(shiftedView({ zoom: 1, cx: 29, cy: 29 }, 177, { dx: -2, dy: -2 }),
+    { zoom: 1, cx: 147, cy: 147 });
+  // Every preload direction holds the view once it has reached the edge it heads for.
+  for (const [mx, my] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+    let view = { zoom: 1, cx: 88, cy: 88 };
+    const shift = aheadShift(panStep(view, mx, my, 177).view, 177, mx, my);
+    for (let i = 0; i < 20; i++) view = panStep(view, mx, my, 177).view;
+    assert.ok(shiftedView(view, 177, shift) !== null, `${mx},${my}`);
+  }
+});
+
+/** Angular separation in arcseconds. */
+function separation([ra1, dec1], [ra2, dec2]) {
+  const h = Math.sin(((dec2 - dec1) * RAD) / 2) ** 2
+    + Math.cos(dec1 * RAD) * Math.cos(dec2 * RAD) * Math.sin(((ra2 - ra1) * RAD) / 2) ** 2;
+  return (2 * Math.asin(Math.sqrt(h))) / RAD * 3600;
+}
+
+test("the centre two fields ahead is 118 pixels away in the right direction, at the poles "
+  + "and across RA 0/360 too", () => {
+  const field = 59 * 6.15;
+  for (const [ra, dec] of [[133.795129, -7.245147], [0.01, 30], [359.99, -30], [45, 89.9],
+    [200, -89.95], [180, 0]]) {
+    for (const [dx, dy] of [[-2, 0], [2, 0], [0, -2], [0, 2], [-2, -1], [1, 2]]) {
+      const c = offsetPosition(ra, dec, 59 * dx, 59 * dy);
+      assert.ok(c.ra >= 0 && c.ra < 360 && Math.abs(c.dec) <= 90, `${ra},${dec} ${dx},${dy}`);
+      // On the tangent plane the offset is tan(r) = r * scale; at 12' the difference is < 0.001".
+      const expected = Math.atan(Math.hypot(dx, dy) * field / 3600 * RAD) / RAD * 3600;
+      const actual = separation([ra, dec], [c.ra, c.dec]);
+      assert.ok(Math.abs(actual - expected) < 1e-4, `${ra},${dec} ${dx},${dy}: ${actual}`);
+    }
+  }
+  // East from just west of RA 0 wraps to small RA; west from just east of it to near 360.
+  assert.ok(offsetPosition(359.99, 30, -118, 0).ra < 1);
+  assert.ok(offsetPosition(0.01, 30, 118, 0).ra > 359);
+  // Two fields north of a point 360" from the pole crosses it: RA turns by 180 degrees.
+  const over = offsetPosition(45, 89.9, 0, -118);
+  assert.ok(Math.abs(over.ra - 225) < 1e-9, `${over.ra}`);
+  assert.ok(Math.abs((90 - over.dec) * 3600 - (2 * field - 360)) < 0.01, `${over.dec}`);
 });

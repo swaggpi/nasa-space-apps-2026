@@ -3,11 +3,12 @@
 // a search position, and zooming and moving the view over the surrounding fields.
 
 import {
-  FIELD_PIXELS, WIDE_PIXELS, ZOOM_LEVELS, capNotice, centrePixels, clampView, computeStretch,
-  countRange, decodePixels, difference, fieldCorners, fieldTexts, formatPosition, frameLabel,
-  isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, offsetPosition, panStep,
-  parseExample, parseLink, plural, previousIndex, retryDelay, shouldPreload, stageBox,
-  toDifferenceRGBA, toRGBA, validFrameBody, validPlan, validWideBody, zoomStep,
+  FIELD_PIXELS, WIDE_PIXELS, ZOOM_LEVELS, aheadShift, capNotice, centrePixels, clampView,
+  computeStretch, countRange, decodePixels, difference, fieldCorners, fieldTexts,
+  formatPosition, frameLabel, isClick, joinStatus, linkQuery, markerPercent, nextIndex,
+  noDataNote, offsetPosition, panStep, parseExample, parseLink, plural, previousIndex,
+  retryDelay, shiftedView, shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody,
+  validPlan, validWideBody, widenFrame, zoomStep,
 } from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
@@ -40,6 +41,7 @@ const form = document.getElementById("search");
 const raInput = document.getElementById("ra");
 const decInput = document.getElementById("dec");
 const detectorSelect = document.getElementById("detector");
+const submitButton = document.getElementById("submit");
 const statusLine = document.getElementById("status");
 const canvas = document.getElementById("image");
 const marker = document.getElementById("marker");
@@ -76,15 +78,27 @@ let shown = null;
 let map = null;
 let mapLoading = null;
 let selection = null;
-// The search answer behind the shown frames (null for the example), the loaded grid's size,
-// the view over it, whether a search, the surround or the next area is loading, and the
-// status text of the shown frames.
+// The search answer behind the shown frames (null for the example), the example's position
+// and detector while it is shown, the loaded grid's size, whether the fields around the
+// centre of a wide grid hold data (until then they are drawn as not loaded), the view over
+// the grid, whether a search, the surround or the next area is loading, and the status text
+// of the shown frames.
 let plan = null;
+let example = null;
 let grid = FIELD_PIXELS;
+let surroundLoaded = false;
 let view = DEFAULT_VIEW;
 let loading = false;
 let summary = "";
 let restTimer = null;
+// Loading ahead: the next area once loaded but not yet joined on (the view not inside it), the
+// shift of a preload that failed (not tried again by itself), the time (ms) before which no
+// preload starts after the search limit was reached, its timer, and the last arrow press.
+let ahead = null;
+let aheadFailed = null;
+let aheadPausedUntil = 0;
+let aheadTimer = null;
+let lastMove = [0, 0];
 
 function setStatus(text) {
   statusLine.textContent = text;
@@ -110,11 +124,17 @@ function stopPlayback() {
 function reset() {
   stopPlayback();
   clearTimeout(restTimer);
+  clearTimeout(aheadTimer);
+  ahead = null;
+  aheadFailed = null;
+  aheadPausedUntil = 0;
   frames = [];
   stretch = null;
   current = 0;
   plan = null;
+  example = null;
   grid = FIELD_PIXELS;
+  surroundLoaded = false;
   view = DEFAULT_VIEW;
   summary = "";
   canvas.width = grid;
@@ -141,9 +161,14 @@ function placeMarker(frame) {
   marker.style.top = `${top}%`;
 }
 
-/** Whether a zoom-out press would load the surrounding fields of the shown search. */
-function surroundLoadable() {
-  return plan !== null && grid === FIELD_PIXELS && !loading;
+/** Whether the shown frames (a search's or the example's) can still be put on the wide grid. */
+function widenable() {
+  return frames.length > 0 && grid === FIELD_PIXELS && (plan !== null || example !== null);
+}
+
+/** Whether the wide grid's surrounding fields are missing and nothing is loading them. */
+function retryable() {
+  return frames.length > 0 && grid === WIDE_PIXELS && !surroundLoaded && !loading;
 }
 
 const atLowestZoom = () => view.zoom <= FIELD_PIXELS / grid;
@@ -156,9 +181,10 @@ function applyView() {
   stage.style.left = `${box.left}%`;
   stage.style.top = `${box.top}%`;
   stage.style.setProperty("--grid", String(grid));
+  canvas.classList.toggle("pending", grid === WIDE_PIXELS && !surroundLoaded);
   const loaded = frames.length > 0;
   zoomInButton.disabled = !loaded || view.zoom >= ZOOM_LEVELS.at(-1);
-  zoomOutButton.disabled = !loaded || (atLowestZoom() && !surroundLoadable());
+  zoomOutButton.disabled = !loaded || (atLowestZoom() && !widenable() && !retryable());
   if (!loaded) return;
   const frame = frames[current];
   const label = frameLabel(frame.dates, ...countRange(frame.nFields, view, grid));
@@ -197,13 +223,19 @@ function pause(seconds) {
 
 /**
  * Sends one request and reads its JSON body, which `valid` must accept. A 429 or 503 answer
- * is retried once after its Retry-After delay, with `step` restored as the status.
+ * is retried once after its Retry-After delay, with `step` restored as the status, unless
+ * `wait` is false: then it is a failure carrying that delay as `retryAfter` (seconds) and the
+ * HTTP `status`.
  * Returns {body} on success, {reason} on a network, HTTP or content failure, null once
  * aborted; any other error propagates.
  */
-async function request(url, options, signal, valid, step) {
+async function request(url, options, signal, valid, step, wait = true) {
   try {
     let response = await fetch(url, { ...options, signal });
+    if (!wait && RETRIED_STATUSES.includes(response.status)) {
+      const retryAfter = retryDelay(response.headers.get("Retry-After"));
+      return { reason: await errorDetail(response), retryAfter, status: response.status };
+    }
     if (RETRIED_STATUSES.includes(response.status)) {
       const delay = retryDelay(response.headers.get("Retry-After"));
       setStatus(`Waiting ${delay} s before continuing.`);
@@ -237,19 +269,20 @@ async function loadExample(signal) {
     data = null;
   }
   if (signal.aborted) return;
-  const example = data === null ? null : parseExample(data);
-  if (example === null) {
+  const parsed = data === null ? null : parseExample(data);
+  if (parsed === null) {
     setStatus(EXAMPLE_FAILED);
     return;
   }
   shown = { ra: data.ra_deg, dec: data.dec_deg };
-  frames = example.frames.map((f, i) => ({
+  example = { ra: data.ra_deg, dec: data.dec_deg, detector: data.detector };
+  frames = parsed.frames.map((f, i) => ({
     ...f, dates: data.frames[i].label, nFields: [f.nUsed],
   }));
   stretch = computeStretch(frames.map(centrePixels));
   slider.max = String(frames.length - 1);
   markerControl.hidden = frames[0].marker === undefined;
-  showTarget(example.name, example.position, example.hint);
+  showTarget(parsed.name, parsed.position, parsed.hint);
   enablePlayer(true);
   differenceToggle.disabled = frames.length < 2;
   show(0);
@@ -268,6 +301,28 @@ function summarise(searched, used, failed, reason) {
     failed > 0 ? sentence(`${plural(failed, "frame")} could not be loaded: ${reason}`) : "",
     noDataNote(frames.map((f) => ({ pixels: centrePixels(f) }))),
   );
+}
+
+/** Asks for one frame of the 59 grid; returns {body}, {reason} or null if aborted. */
+function requestNarrow(searched, uris, signal, step) {
+  return request("api/frame", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ra_deg: searched.ra_deg, dec_deg: searched.dec_deg, uris }),
+  }, signal, validFrameBody, step);
+}
+
+/** A loaded frame of the 59 grid from its api/frame answer and its planned frame. */
+function narrowFrame(result, planned) {
+  return {
+    pixels: result.pixels,
+    width: result.width,
+    height: result.height,
+    dates: planned.label,
+    nUsed: result.n_used,
+    nFields: [result.n_used],
+    uris: planned.uris,
+  };
 }
 
 /** Asks for one frame of the wide grid; returns {result, pixels}, {reason} or null if aborted. */
@@ -291,28 +346,17 @@ async function loadFrames(signal) {
   for (const [i, planned] of plan.frames.entries()) {
     const step = joinStatus(`Loading frame ${i + 1} of ${n}…`, notice);
     setStatus(step);
-    const outcome = await request("api/frame", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ra_deg: plan.ra_deg, dec_deg: plan.dec_deg, uris: planned.uris }),
-    }, signal, validFrameBody, step);
+    const outcome = await requestNarrow(plan, planned.uris, signal, step);
     if (outcome === null || signal.aborted) return;
     if (outcome.reason !== undefined) {
       failed += 1;
       reason = outcome.reason;
       continue;
     }
-    const result = outcome.body;
-    frames.push({
-      pixels: result.pixels,
-      width: result.width,
-      height: result.height,
-      dates: planned.label,
-      nUsed: result.n_used,
-      nFields: [result.n_used],
-      uris: planned.uris,
-    });
-    used += result.n_used;
+    const frame = narrowFrame(outcome.body, planned);
+    // The visitor may already have moved or zoomed out onto the wide grid.
+    frames.push(grid === WIDE_PIXELS ? widenFrame(frame) : frame);
+    used += frame.nUsed;
     stretch = computeStretch(frames.map(centrePixels));
     slider.max = String(frames.length - 1);
     if (frames.length === 1) enablePlayer(true);
@@ -327,14 +371,43 @@ async function loadFrames(signal) {
   summary = summarise(plan, used, failed, reason);
   setStatus(summary);
   applyView();
-  if (shouldPreload(plan)) loadSurround(signal);
+  if (grid === WIDE_PIXELS || shouldPreload(plan)) loadSurround(signal);
+}
+
+/**
+ * Puts the shown frames on the wide grid with the view and the picture in place; the fields
+ * around the centre are drawn as not loaded until their pixels arrive.
+ */
+function widen() {
+  frames = frames.map(widenFrame);
+  grid = WIDE_PIXELS;
+  surroundLoaded = false;
+  view = { ...view, cx: view.cx + FIELD_PIXELS, cy: view.cy + FIELD_PIXELS };
+  canvas.width = grid;
+  canvas.height = grid;
+  show(current);
+}
+
+/** Loads what the wide grid lacks: the search's surround, or the example's live search. */
+function loadAround() {
+  if (plan !== null) loadSurround(controller.signal);
+  else loadExampleArea(controller.signal);
+}
+
+/** Widens the grid at once and starts loading it, unless something else is loading. */
+function expand() {
+  widen();
+  // A search still loading its frames starts the surround once they are in.
+  if (!loading) loadAround();
 }
 
 /**
  * Loads the eight fields around the shown frames, one wide frame per loaded frame, and swaps
- * them in at once with the picture on screen unchanged; on any failure nothing changes.
+ * them in at once with the picture on screen unchanged; on any failure the fields stay not
+ * loaded.
  */
 async function loadSurround(signal) {
+  if (grid === FIELD_PIXELS) widen();
   loading = true;
   applyView();
   const wide = [];
@@ -354,24 +427,20 @@ async function loadSurround(signal) {
     wide.push(outcome);
   }
   frames = frames.map((frame, i) => ({
-    ...frame, pixels: wide[i].pixels, width: WIDE_PIXELS, height: WIDE_PIXELS,
-    nFields: wide[i].result.n_fields,
+    ...frame, pixels: wide[i].pixels, nFields: wide[i].result.n_fields,
   }));
-  grid = WIDE_PIXELS;
-  view = { ...view, cx: view.cx + FIELD_PIXELS, cy: view.cy + FIELD_PIXELS };
-  canvas.width = grid;
-  canvas.height = grid;
+  surroundLoaded = true;
   loading = false;
   setStatus(summary);
   show(current);
 }
 
 /**
- * Searches the area one field away in a direction and loads its wide frames; the old frames
- * stay on screen until every answer is in, then the new ones replace them at once with the
- * sky under the view in place.
+ * Replaces the bundled example by a search at its position and detector, as if the visitor
+ * had searched there: one search, its frames, then their surround. The example keeps showing
+ * and playing, the sky in place, until the search's frames are in; on a failure it stays.
  */
-async function loadNextArea(dx, dy, signal) {
+async function loadExampleArea(signal) {
   loading = true;
   applyView();
   const fail = (text) => {
@@ -379,13 +448,98 @@ async function loadNextArea(dx, dy, signal) {
     setStatus(text);
     applyView();
   };
-  const centre = offsetPosition(plan.ra_deg, plan.dec_deg, FIELD_PIXELS * dx, FIELD_PIXELS * dy);
+  const failed = (reason) => sentence(`The surroundings of the example could not be loaded `
+    + `from the archive: ${reason}`);
+  const texts = fieldTexts(example.ra, example.dec);
+  let step = "Searching the SPHEREx archive for the example's surroundings…";
+  setStatus(step);
+  const query = new URLSearchParams({ ra: texts.ra, dec: texts.dec, detector: example.detector });
+  const outcome = await request("api/search?" + query, {}, signal, validPlan, step);
+  if (outcome === null || signal.aborted) return;
+  if (outcome.reason !== undefined) {
+    fail(failed(outcome.reason));
+    return;
+  }
+  const searched = outcome.body;
+  if (searched.frames.length === 0) {
+    fail(`No SPHEREx exposures cover the example's surroundings in ${searched.detector}.`);
+    return;
+  }
+  const loaded = [];
+  let used = 0;
+  let lost = 0;
+  let reason = "";
+  for (const [i, planned] of searched.frames.entries()) {
+    step = `Loading the example's surroundings: frame ${i + 1} of ${searched.frames.length}…`;
+    setStatus(step);
+    const answer = await requestNarrow(searched, planned.uris, signal, step);
+    if (answer === null || signal.aborted) return;
+    if (answer.reason !== undefined) {
+      lost += 1;
+      reason = answer.reason;
+      continue;
+    }
+    loaded.push(widenFrame(narrowFrame(answer.body, planned)));
+    used += answer.body.n_used;
+  }
+  if (loaded.length === 0) {
+    fail(failed(reason));
+    return;
+  }
+  frames = loaded;
+  plan = searched;
+  example = null;
+  stretch = computeStretch(frames.map(centrePixels));
+  current = Math.min(current, frames.length - 1);
+  slider.max = String(frames.length - 1);
+  if (frames.length < 2) differenceToggle.checked = false;
+  differenceToggle.disabled = frames.length < 2;
+  markerControl.hidden = true;
+  positionLine.textContent = formatPosition(searched.ra_deg, searched.dec_deg, searched.detector);
+  shown = { ra: searched.ra_deg, dec: searched.dec_deg };
+  if (![raInput, decInput, detectorSelect].includes(document.activeElement)) {
+    raInput.value = texts.ra;
+    decInput.value = texts.dec;
+    detectorSelect.value = searched.detector;
+  }
+  history.replaceState(null, "", linkQuery(texts.ra, texts.dec, searched.detector));
+  loading = false;
+  summary = summarise(searched, used, lost, reason);
+  setStatus(summary);
+  show(current);
+  loadSurround(signal);
+}
+
+/**
+ * Searches the area `shift` whole fields away ({dx, dy}: right = west, down = south) and
+ * loads its wide frames; the frames shown stay on screen and keep playing meanwhile. With
+ * `early` it is a preload: answered 429 or 503, it waits for the server's delay and tries again
+ * by itself; once loaded it joins on as soon as the view lies inside it. Otherwise (the view
+ * rests at the edge) it joins on at once.
+ */
+async function loadNextArea(shift, early, signal) {
+  loading = true;
+  ahead = null;
+  applyView();
+  const fail = (text) => {
+    loading = false;
+    if (early) aheadFailed = shift;
+    setStatus(text);
+    applyView();
+  };
+  const centre = offsetPosition(plan.ra_deg, plan.dec_deg,
+    FIELD_PIXELS * shift.dx, FIELD_PIXELS * shift.dy);
   const texts = fieldTexts(centre.ra, centre.dec);
   let step = "Searching the next area…";
   setStatus(step);
   const query = new URLSearchParams({ ra: texts.ra, dec: texts.dec, detector: plan.detector });
-  const outcome = await request("api/search?" + query, {}, signal, validPlan, step);
+  const outcome = await request("api/search?" + query, {}, signal, validPlan, step, !early);
   if (outcome === null || signal.aborted) return;
+  if (outcome.retryAfter !== undefined) {
+    loading = false;
+    pauseAhead(outcome.retryAfter, outcome.status === 429);
+    return;
+  }
   if (outcome.reason !== undefined) {
     fail(sentence(`The next area could not be loaded: ${outcome.reason}`));
     return;
@@ -419,11 +573,32 @@ async function loadNextArea(dx, dy, signal) {
     fail(sentence(`The next area could not be loaded: ${reason}`));
     return;
   }
-  frames = loaded;
+  loading = false;
+  const area = { shift, plan: next, frames: loaded, texts, used, failed, reason };
+  if (!early) {
+    join(area);
+    return;
+  }
+  ahead = area;
+  setStatus(summary);
+  applyView();
+  joinAhead();
+}
+
+/**
+ * Replaces the frames by those of a loaded next area with the sky under the view in place
+ * (the view clamped into the area), and makes the link and RA/Dec fields name its centre.
+ */
+function join(area) {
+  const { shift, texts } = area;
+  const next = area.plan;
+  ahead = null;
+  aheadFailed = null;
+  frames = area.frames;
   plan = next;
   stretch = computeStretch(frames.map(centrePixels));
   view = clampView({
-    zoom: view.zoom, cx: view.cx - FIELD_PIXELS * dx, cy: view.cy - FIELD_PIXELS * dy,
+    zoom: view.zoom, cx: view.cx - FIELD_PIXELS * shift.dx, cy: view.cy - FIELD_PIXELS * shift.dy,
   }, grid);
   current = Math.min(current, frames.length - 1);
   slider.max = String(frames.length - 1);
@@ -437,35 +612,88 @@ async function loadNextArea(dx, dy, signal) {
     decInput.value = texts.dec;
   }
   history.replaceState(null, "", linkQuery(texts.ra, texts.dec, next.detector));
-  loading = false;
-  summary = summarise(next, used, failed, reason);
+  summary = summarise(next, area.used, area.failed, area.reason);
   setStatus(summary);
   show(current);
 }
 
-/** Zooms the view one level in (+1) or out (-1), or loads the surround at the lowest zoom. */
-function zoom(direction) {
-  if (direction < 0 && atLowestZoom()) {
-    if (surroundLoadable()) loadSurround(controller.signal);
-    return;
-  }
-  view = clampView({ ...view, zoom: zoomStep(view.zoom, direction, grid) }, grid);
-  applyView();
+/** Joins the preloaded area on once the view lies entirely inside it. */
+function joinAhead() {
+  if (ahead !== null && shiftedView(view, grid, ahead.shift) !== null) join(ahead);
 }
 
-/** Moves the view one step; pushing at the edge loads more once the key has rested. */
+/**
+ * Starts loading ahead after an arrow press moved the view by (mx, my), when the view nears
+ * an edge of the loaded area and nothing else loads (one preload at a time; none in deep
+ * fields, none after a failure in the same direction, none before the search limit allows).
+ */
+function considerAhead(mx, my) {
+  lastMove = [mx, my];
+  if (loading || plan === null || !surroundLoaded || !shouldPreload(plan) || !sky.hidden
+    || Date.now() < aheadPausedUntil) return;
+  const shift = aheadShift(view, grid, mx, my);
+  if (shift === null || (shift.dx === 0 && shift.dy === 0)) return;
+  const same = (other) => other !== null && other.dx === shift.dx && other.dy === shift.dy;
+  if (same(ahead?.shift ?? null) || same(aheadFailed)) return;
+  loadNextArea(shift, true, controller.signal);
+}
+
+/**
+ * Says once that the search limit is reached (or the server is busy) and tries again, by
+ * itself, after the server's delay.
+ */
+function pauseAhead(seconds, limited) {
+  aheadPausedUntil = Date.now() + seconds * 1000;
+  const cause = limited ? "The search limit is reached" : "The server is busy";
+  setStatus(joinStatus(summary, `${cause}; loading further on continues in ${seconds} s.`));
+  applyView();
+  clearTimeout(aheadTimer);
+  aheadTimer = setTimeout(() => {
+    aheadPausedUntil = 0;
+    if (!loading) setStatus(summary);
+    considerAhead(...lastMove);
+  }, seconds * 1000);
+}
+
+/**
+ * Zooms the view one level in (+1) or out (-1). Zooming out of the 6' field widens the grid
+ * at once and starts loading it; a zoom-out press (not a held key) while the surround is
+ * missing tries again.
+ */
+function zoom(direction, repeated = false) {
+  if (direction < 0 && atLowestZoom() && widenable()) expand();
+  else if (direction < 0 && !repeated && retryable()) loadAround();
+  view = clampView({ ...view, zoom: zoomStep(view.zoom, direction, grid) }, grid);
+  applyView();
+  joinAhead();
+}
+
+/**
+ * Moves the view one step. Leaving the 6' field widens the grid at once and starts loading
+ * it; nearing the wide grid's edge loads the area further on ahead; pushing at the edge until
+ * the key has rested loads the missing surround again or, if none was loaded ahead, the next
+ * area.
+ */
 function move(dx, dy) {
-  const step = panStep(view, dx, dy, grid);
   clearTimeout(restTimer);
+  let step = panStep(view, dx, dy, grid);
+  if (step.pushed && widenable()) {
+    expand();
+    step = panStep(view, dx, dy, grid);
+  }
   if (!step.pushed) {
     view = step.view;
     applyView();
+    joinAhead();
+    considerAhead(dx, dy);
     return;
   }
   restTimer = setTimeout(() => {
-    if (plan === null || loading || !sky.hidden || frames.length === 0) return;
-    if (grid === FIELD_PIXELS) loadSurround(controller.signal);
-    else loadNextArea(dx, dy, controller.signal);
+    if (loading || !sky.hidden || frames.length === 0 || Date.now() < aheadPausedUntil) return;
+    if (retryable()) loadAround();
+    else if (plan !== null && grid === WIDE_PIXELS) {
+      loadNextArea({ dx, dy }, false, controller.signal);
+    }
   }, REST_MS);
 }
 
@@ -488,6 +716,10 @@ async function search(ra, dec, detector) {
     return;
   }
   plan = outcome.body;
+  // The search is accepted: leave the coordinate field so that the arrow keys look around.
+  if (document.activeElement === raInput || document.activeElement === decInput) {
+    submitButton.focus({ preventScroll: true });
+  }
   shown = { ra: plan.ra_deg, dec: plan.dec_deg };
   positionLine.textContent = formatPosition(plan.ra_deg, plan.dec_deg, plan.detector);
   if (plan.frames.length === 0) {
@@ -645,6 +877,8 @@ skySearch.addEventListener("click", () => {
   decInput.value = selection.dec;
   history.replaceState(null, "", linkQuery(raInput.value, decInput.value, detectorSelect.value));
   search(raInput.value, decInput.value, detectorSelect.value);
+  // The map, and this button in it, are now hidden; the keys act from where the map was opened.
+  pickButton.focus({ preventScroll: true });
 });
 
 form.addEventListener("submit", (event) => {
@@ -697,7 +931,7 @@ document.addEventListener("keydown", (event) => {
   if (target instanceof HTMLElement && (target.isContentEditable || target.closest(
     "input:not([type=checkbox]), select, textarea, #sky") !== null)) return;
   if (event.key === "+" || event.key === "=") zoom(1);
-  else if (event.key === "-") zoom(-1);
+  else if (event.key === "-") zoom(-1, event.repeat);
   else if (event.key in ARROWS) move(...ARROWS[event.key]);
   else return;
   event.preventDefault();

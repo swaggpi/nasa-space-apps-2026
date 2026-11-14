@@ -116,3 +116,43 @@ def test_root_can_be_embedded_in_a_frame(client):
     response = client.get("/")
     assert "x-frame-options" not in response.headers
     assert "frame-ancestors" not in response.headers.get("content-security-policy", "")
+
+
+def static_paths() -> list[str]:
+    """Every served path of the static directory, the page itself as `/`."""
+    files_ = sorted(p for p in STATIC_DIR.rglob("*") if p.is_file())
+    return ["/"] + ["/" + p.relative_to(STATIC_DIR).as_posix() for p in files_]
+
+
+def test_static_paths_include_the_page_its_scripts_style_example_and_map_library():
+    assert {"/", "/index.html", "/app.js", "/lib.js", "/style.css", "/example.json",
+            "/vendor/aladin.js"} <= set(static_paths())
+
+
+@pytest.mark.parametrize("path", static_paths())
+def test_every_static_file_must_be_revalidated_before_reuse(client, path):
+    response = client.get(path)
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["etag"]
+    assert response.headers["last-modified"]
+
+
+@pytest.mark.parametrize("path", ["/", "/app.js", "/lib.js", "/style.css", "/example.json",
+                                  "/vendor/aladin.js"])
+def test_unchanged_static_file_answers_304_with_the_header(client, path):
+    first = client.get(path)
+    for condition in ({"If-None-Match": first.headers["etag"]},
+                      {"If-Modified-Since": first.headers["last-modified"]}):
+        response = client.get(path, headers=condition)
+        assert response.status_code == 304
+        assert response.content == b""
+        assert response.headers["cache-control"] == "no-cache"
+        assert response.headers["etag"] == first.headers["etag"]
+
+
+def test_changed_static_file_is_sent_again(client):
+    response = client.get("/app.js", headers={"If-None-Match": '"stale"'})
+    assert response.status_code == 200
+    assert response.text == (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert response.headers["cache-control"] == "no-cache"

@@ -8,16 +8,18 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 # Each search is one archive query of about 1 s, up to 20 s while the gateway rejects
-# requests: a few positions at once, then one per 30 s.
-SEARCH_BURST = 10
-SEARCH_PER_MINUTE = 2.0
-# Each frame reads up to 24 exposures (~1.2 MB each): a few searches' frames, then one per 10 s.
-FRAME_BURST = 60
-FRAME_PER_MINUTE = 6.0
+# requests: a visitor looking around quickly, then one position per 10 s. What all visitors
+# together make the server do stays bounded by the server-wide slots (app.py).
+SEARCH_BURST = 30
+SEARCH_PER_MINUTE = 6.0
+# Each frame reads up to 24 exposures (~1.2 MB each): several searches' frames, then about
+# one per 3 s.
+FRAME_BURST = 180
+FRAME_PER_MINUTE = 18.0
 # A wide frame (3 x 3 fields) reads up to 24 exposures of ~3.3 MB. Its own budget, so loading
 # the surroundings never uses up the budget of the frames a visitor waits for.
-WIDE_BURST = 40
-WIDE_PER_MINUTE = 6.0
+WIDE_BURST = 120
+WIDE_PER_MINUTE = 18.0
 # With keys from `client_key` (at most 24 characters), 10,000 entries take about 2.5 MB.
 MAX_CLIENTS = 10_000
 # The one key shared by every client whose address is not a valid IP address.
