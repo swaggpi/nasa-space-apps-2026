@@ -17,4 +17,6 @@ RUN --mount=type=bind,source=src,target=/app/src,rw \
 
 EXPOSE 8000
 
-CMD ["uvicorn", "spherex_viewer.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--workers", "1", "--timeout-graceful-shutdown", "8"]
+# 100 connections: far above one page load (a browser opens at most 6) and the 8 work slots,
+# far below the ~5,000 stalled uploads that exhaust 512 MB.
+CMD ["uvicorn", "spherex_viewer.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--workers", "1", "--timeout-graceful-shutdown", "8", "--limit-concurrency", "100"]
