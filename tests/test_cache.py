@@ -275,6 +275,7 @@ def test_eviction_and_size_count_skip_everything_outside_the_cache_layout(tmp_pa
         os.utime(path, (1, 1))
     (root / "cd").symlink_to(outside, target_is_directory=True)
     (root / "ab" / "link.npy").symlink_to(outside / "linked.npy")
+    os.utime(root / "ab" / "link.npy", (1, 1), follow_symlinks=False)
 
     cache = CutoutCache(root, int(2.5 * size))
     _fill(cache, range(2))

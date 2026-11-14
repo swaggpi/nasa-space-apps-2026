@@ -106,7 +106,7 @@ class BodyLimit:
             await self._reject(send, 413, BODY_TOO_LARGE)
             return
         try:
-            async with asyncio.timeout(None):
+            async with asyncio.timeout(self.read_s):
                 body = await self._read_body(receive)
         except TimeoutError:
             await self._reject(send, 408, BODY_TIMEOUT)
