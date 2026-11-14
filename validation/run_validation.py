@@ -355,8 +355,13 @@ def detector_span(dets: list[str]) -> str:
 
 def summary_line(target: Target, results: list[DetectorResult]) -> str:
     frames = [(d.detector, f) for d in results for f in d.frames]
+    failed = [d.detector for d in results if d.error]
+    note = (f" Discovery failed in {detector_span(failed)} (see failures); this line covers the "
+            "other detectors only." if failed else "")
     if not frames:
-        return f"- **{target.name}**: no SPHEREx exposures were found in any detector."
+        return (f"- **{target.name}**: no frames: "
+                + ("archive discovery failed in every detector." if len(failed) == len(results)
+                   else "no SPHEREx exposures were found." + note))
     by_verdict = {v: sorted({d for d, f in frames if f.verdict == v})
                   for v in ("visible", "saturated core", "not detected")}
     counts = {v: sum(f.verdict == v for _, f in frames) for v in by_verdict}
@@ -365,7 +370,7 @@ def summary_line(target: Target, results: list[DetectorResult]) -> str:
             f"{max(labels)[-10:]}): ")
     if counts["visible"] + counts["saturated core"] == 0:
         return text + ("the tool shows nothing at the expected position in any frame of any "
-                       "detector (not detected in all frames).")
+                       "detector (not detected in all frames)." + note)
     parts = []
     if counts["visible"]:
         parts.append(f"a source at the expected position in {counts['visible']} frames "
@@ -395,7 +400,7 @@ def summary_line(target: Target, results: list[DetectorResult]) -> str:
                  f"{detector_span([k for k, v in status.items() if v == 'yes'])}; not measurable "
                  "(fewer than two frames without no-data pixels in the aperture) in: "
                  f"{detector_span([k for k, v in status.items() if v == 'n/a'])} (see caveats).")
-    return text
+    return text + note
 
 
 def variability(det: DetectorResult) -> tuple[str, str]:

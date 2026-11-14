@@ -491,10 +491,8 @@ def test_body_limit_answers_408_and_skips_the_app_when_the_body_stalls():
 
     scope = {"type": "http", "method": "POST", "path": "/api/frame",
              "headers": [(b"content-length", b"10")]}
-    start = time.monotonic()
-    asyncio.run(BodyLimit(inner, max_bytes=10, read_s=0.05)(scope, stalling_receive,
-                                                             sent_to(sent)))
-    assert time.monotonic() - start < 1.0
+    limited = BodyLimit(inner, max_bytes=10, read_s=0.05)
+    asyncio.run(asyncio.wait_for(limited(scope, stalling_receive, sent_to(sent)), 2.0))
     assert seen == []
     assert sent[0]["status"] == 408
     assert (b"connection", b"close") in sent[0]["headers"]

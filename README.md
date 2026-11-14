@@ -9,6 +9,11 @@ north-up grid centred on the position, and co-adds them into one frame per visit
 days). The page plays the frames like a short video with one common brightness stretch, so
 moving or changing objects stand out.
 
+Searches use IRSA's Simple Image Access service across all SPHEREx collections, so new releases
+appear automatically; a search normally answers in about a second. IRSA's gateway sometimes
+rejects requests briefly; the tool retries for up to about 10 s and then reports the archive as
+unavailable — try again a moment later.
+
 The homepage opens on a precomputed example, `src/spherex_viewer/static/example.json`:
 Barnard's Star in detector D6, three real SPHEREx frames from August 2025 to August 2026, so it
 plays without an archive search. It is built by `.venv/bin/python scripts/build_example.py` with
@@ -29,7 +34,8 @@ Requires Python 3.12 or newer.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
-SPHEREX_CACHE_DIR=./cache uvicorn spherex_viewer.app:create_app --factory --port 8000
+SPHEREX_CACHE_DIR=./cache uvicorn spherex_viewer.app:create_app --factory --port 8000 \
+    --limit-concurrency 100
 ```
 
 Open http://localhost:8000/.

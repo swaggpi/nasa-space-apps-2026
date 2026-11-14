@@ -51,7 +51,8 @@ MAX_BODY_BYTES = 64 * 1024
 BODY_READ_S = 10.0
 
 MAX_CONCURRENT_SEARCHES = 4
-# TAP answers took 2.7-32 s, so a queued search waits about one slow answer before giving up.
+# Discovery normally answers in about a second and `discover` bounds it at 45 s, so a queued
+# search normally waits a few seconds and gives up before an unresponsive archive frees a slot.
 SEARCH_WAIT_S = 30.0
 MAX_CONCURRENT_FRAMES = 4
 # A full frame takes ~3 s on the shared 4-thread pool, so 4 running builds clear in ~12 s.
@@ -207,7 +208,7 @@ def check_rate(limiter: RateLimiter, request: Request) -> None:
 
 def create_app(*, cache_dir: Path | None = None, reader: RangeReader | None = None,
                discover: Callable[[float, float, str], list[Exposure]] | None = None) -> FastAPI:
-    """Create the app. `None` arguments select the env-var cache dir, S3 reader and TAP discovery.
+    """Create the app. `None` arguments select the env-var cache dir, S3 reader and archive search.
 
     Raises `ValueError` when `SPHEREX_CACHE_MAX_MB` is invalid.
     """
