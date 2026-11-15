@@ -14,8 +14,6 @@ from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 from reproject import reproject_interp
 
-from .grid import FIELD_PIXELS
-
 FLAG_BITS: dict[str, int] = {
     "TRANSIENT": 0, "OVERFLOW": 1, "SUR_ERROR": 2, "NONFUNC": 6, "DICHROIC": 7,
     "MISSING_DATA": 9, "HOT": 10, "COLD": 11, "FULLSAMPLE": 12, "PHANMISS": 14,
@@ -93,13 +91,10 @@ def estimate_background(image: np.ndarray, flags: np.ndarray) -> float:
 def align(window: Window, target: WCS, target_shape: tuple[int, int]) -> np.ndarray:
     """Background-subtracted, bad-pixel-masked window resampled onto the target grid.
 
-    Bilinear interpolation through the full pixel-to-sky transform including SIP, one field of
-    ``FIELD_PIXELS`` x ``FIELD_PIXELS`` target pixels at a time: the iterative SIP inversion
-    then sees the same points for a field of a larger grid as for that field alone, so each
-    field is bit for bit the cutout of that field's grid. Returns float32 ``target_shape`` in
-    MJy/sr; NaN where there is no valid data (reproject fills target pixels outside the
-    window, or next to a NaN input pixel, with NaN). The sky level is estimated on
-    ``window.core`` when set, else on the whole window.
+    Bilinear interpolation through the full pixel-to-sky transform including SIP. Returns
+    float32 ``target_shape`` in MJy/sr; NaN where there is no valid data (reproject fills
+    target pixels outside the window, or next to a NaN input pixel, with NaN). The sky level
+    is estimated on ``window.core`` when set, else on the whole window.
     """
     if window.core is None:
         background = estimate_background(window.image, window.flags)
@@ -114,14 +109,9 @@ def align(window: Window, target: WCS, target_shape: tuple[int, int]) -> np.ndar
     image[(window.flags & BAD_FLAGS) != 0] = np.nan
     ny, nx = image.shape
     wcs = window.wcs[window.y0:window.y0 + ny, window.x0:window.x0 + nx]
-    out = np.empty(target_shape, dtype=np.float32)
-    for y in range(0, target_shape[0], FIELD_PIXELS):
-        for x in range(0, target_shape[1], FIELD_PIXELS):
-            rows, cols = slice(y, y + FIELD_PIXELS), slice(x, x + FIELD_PIXELS)
-            field = out[rows, cols]
-            field[...] = reproject_interp((image, wcs), target[rows, cols], shape_out=field.shape,
-                                          order="bilinear", return_footprint=False)
-    return out
+    data = reproject_interp((image, wcs), target, shape_out=target_shape, order="bilinear",
+                            return_footprint=False)
+    return data.astype(np.float32)
 
 
 def combine(cutouts: Sequence[np.ndarray]) -> np.ndarray:

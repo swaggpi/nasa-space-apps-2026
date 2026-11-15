@@ -174,9 +174,9 @@ function validFrame(frame, size) {
  * Markers must be present in every frame or in none.
  * @param {unknown} data parsed JSON
  * @returns {{name: string, hint: string, position: string,
- *   frames: Array<{pixels: Array<number|null>, width: number, height: number, label: string,
- *   nUsed: number, marker?: {x: number, y: number}}>} | null} null if the content does not
- *   match the schema
+ *   frames: Array<{pixels: Array<number|null>, width: number, height: number, dates: string,
+ *   nUsed: number, nFields: number[], marker?: {x: number, y: number}}>} | null} null if the
+ *   content does not match the schema; `nFields` holds the one field's exposure count
  */
 export function parseExample(data) {
   if (!isObject(data) || !isString(data.name) || !isString(data.hint) || !isNumber(data.ra_deg)
@@ -195,8 +195,9 @@ export function parseExample(data) {
       pixels: f.pixels,
       width,
       height,
-      label: frameLabel(f.label, f.n_used),
+      dates: f.label,
       nUsed: f.n_used,
+      nFields: [f.n_used],
       ...(f.marker === undefined ? {} : { marker: { x: f.marker.x, y: f.marker.y } }),
     })),
   };

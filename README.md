@@ -34,9 +34,9 @@ of the normal frames), and until it has arrived the fields around the centre are
 grey ("not loaded yet", unlike the checkerboard of pixels without data) and fill in where
 they are, the view staying put. For loops of more than 120 exposures it loads only at the
 first zoom-out or move past the field. The surround uses each exposure's sky level from the
-central field, so the centre stays exactly as it was when the surround arrives; it has fewer
-exposures towards the edges (the label then shows a range such as `23–24 exposures`) and can
-show a faint brightness ramp (see Limitations). On the example, the first zoom-out or move
+central field, so the picture in the centre does not change when the surround arrives; it
+has fewer exposures towards the edges (the label then shows a range such as `23–24 exposures`)
+and can show a faint brightness ramp (see Limitations). On the example, the first zoom-out or move
 past its field searches the archive at the example's position and detector, exactly as a
 search there; the example keeps playing until those frames replace it.
 
@@ -47,13 +47,17 @@ or two fields across when the view is that far off centre, so diagonally). The f
 keep playing meanwhile; the new area replaces them when the view lies wholly inside it — at
 the latest at the old edge — with the sky in place, and the address bar and the RA/Dec
 fields then name its centre. One such load runs at a time, never while anything else loads,
-not in loops of more than 120 exposures, and not again in a direction where it failed; when
-the search limit is reached the status line says so once and loading resumes by itself when
-the limit allows. If nothing was loaded ahead, holding an arrow key at the edge and resting
-for half a second searches the next 6′ field in that direction.
+not in loops of more than 120 exposures, and not again for the area of the last one that
+failed; when the search limit is reached the status line says so once and loading resumes by
+itself when the limit allows. At the edge itself, holding an arrow key and resting for half a
+second searches the next 6′ field in that direction, unless something is loading or the
+search limit pauses loading.
 
 The arrow keys act on the page, its buttons and checkboxes, not while typing in RA or Dec,
-in the detector list, on the timeline (where they step frames) or with the sky map open.
+in the detector list, on the timeline (where they step frames; − and + still zoom) or with
+the sky map open. A key the page cannot use keeps its usual effect, so the arrow keys scroll
+the page then: an arrow at the edge of the loaded area while something loads or the search
+limit pauses loading, and − or + at the end of the zoom range.
 After a search from the RA/Dec fields with Enter has been accepted, the focus moves to
 "Show"; after "Search here" it returns to "Pick on sky map", so the keys look around at once.
 
@@ -144,7 +148,8 @@ Everything that must survive a restart lives under `/data`: the on-disk cutout c
   "n_fields": [...]}`: `pixels_b64` is the base64 of 31,329 little-endian float32 values in the
   same order (NaN where there is no data), `n_fields` the exposures with data in each field
   (north row first, east column first) and `n_used` that of the central field. The central
-  59×59 pixels equal the 1-field frame. `fields` is 1 (the default) or 3.
+  59×59 pixels equal the 1-field frame to float32 rounding (below 1e-5 MJy/sr, with the same
+  no-data pixels). `fields` is 1 (the default) or 3.
 
 ## Configuration
 
@@ -162,15 +167,16 @@ No secrets are needed: all data sources are public. Outbound HTTPS honours the s
   18 per minute; separately, 120 wide frame requests (`"fields": 3`) at once, then 18 per
   minute. Beyond that the server answers 429 with a `Retry-After` header. These are three times
   the earlier limits, so the most one visitor can make the server fetch from the archive is
-  three times as much (in a burst about 0.2 GB of frames and 1 GB of wide frames, then about
-  0.5 and 1.5 GB per minute); the total load of all visitors stays bounded by the server-wide
+  three times as much (with 24 exposures per frame at about 0.9 MB, or 2.2 MB for a wide
+  frame, per exposure: in a burst about 3.8 GB of frames and 6.5 GB of wide frames, then about
+  0.4 and 1 GB per minute); the total load of all visitors stays bounded by the server-wide
   limits below, which are unchanged.
 - At most 4 searches and 4 frame builds run at a time, and of the frame builds at most one
   wide one; a request that cannot start within 30 s (search) or 15 s (frame; a wide frame
   waits up to 15 s for the wide slot, then for a frame slot) gets 503.
 - The cutout cache is capped at `SPHEREX_CACHE_MAX_MB`; older cutouts are
   removed when it is exceeded. A typical search adds about 0.7 MB, a deep field about 6 MB;
-  its surround about 8 MB, a deep field's about 54 MB.
+  its surround about 6 MB, a deep field's about 54 MB.
 
 ## Tests and validation
 
@@ -243,6 +249,15 @@ asked again after the wait it names. On a failed check or an unreachable server 
   two exposures can have empty patches there. One constant per exposure leaves the real sky
   gradient: across 18′ the field medians differ by about one frame noise level, differently
   per frame, so a faint brightness ramp can show (in the 6′ frame about a third of that).
+- **Next area**: every step beyond the loaded area is a new search plus its 18′ frames. A
+  step straight back north or south returns to the same position and its frames are served
+  from the cache; after an east, west or diagonal step the way back usually ends slightly off
+  (the step follows the tangent plane of the area it starts from and is rounded to six
+  decimals: about 0.05″ after a one-field and 0.2″ after a two-field east or west step at
+  Dec 5°, 1″ and 4″ at Dec 60°), and its frames are then built again. Each area is north up
+  at its own centre, so near the celestial poles neighbouring areas are turned against each
+  other and the picture turns when the next area arrives (about 1.15° per field of east or
+  west step at Dec ±85°, much more closer to the pole).
 - **Exposure cap**: above 24 exposures per frame, exposures are picked evenly spaced in time
   order (every k-th exposure), not at evenly spaced clock times; this samples the detector's
   wavelength range more evenly.

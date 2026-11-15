@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 import synthetic
-from spherex_viewer import frames
+from spherex_viewer import cutout, frames
 from spherex_viewer.cache import CutoutCache
 from spherex_viewer.frames import FrameBuilder, FrameError
 from spherex_viewer.cutout import align
@@ -283,20 +283,30 @@ def wide_builder(cache, wide_blobs):
     builder.close()
 
 
+def assert_same_pixels(actual, expected):
+    """Equal up to float32 rounding of one resampling and with exactly the same no-data pixels.
+
+    The SIP inversion of the larger grid can round differently: measured on real frames at most
+    7.6e-6 MJy/sr at a 36.9 MJy/sr pixel (relative 2e-7), so the bound is relative."""
+    assert actual.shape == expected.shape
+    assert np.array_equal(np.isnan(actual), np.isnan(expected))
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
 def test_wide_centre_is_the_narrow_frame(wide_builder):
     builder, _ = wide_builder
     uris = [make_uri(i) for i in [*range(len(ROTATIONS)), EDGE, SURROUND_STAR]]
     narrow = builder.build(uris, RA, DEC)
     wide = builder.build(uris, RA, DEC, 3)
     assert wide.data.shape == (177, 177) and wide.data.dtype == np.float32
-    assert np.array_equal(wide.data[59:118, 59:118], narrow.data, equal_nan=True)
+    assert_same_pixels(wide.data[59:118, 59:118], narrow.data)
     assert wide.n_used == narrow.n_used == 7
     assert narrow.n_fields == (7,)
     star_alone = builder.build([make_uri(SURROUND_STAR)], RA, DEC, 3).data
     assert np.nanmax(star_alone) > 1000.0
     assert np.nanmax(star_alone[59:118, 59:118]) < 10.0
-    assert np.array_equal(star_alone[59:118, 59:118],
-                          builder.build([make_uri(SURROUND_STAR)], RA, DEC).data, equal_nan=True)
+    assert_same_pixels(star_alone[59:118, 59:118],
+                       builder.build([make_uri(SURROUND_STAR)], RA, DEC).data)
 
 
 def test_wide_tiles_are_one_resampling(wide_builder):
@@ -310,7 +320,20 @@ def test_wide_tiles_are_one_resampling(wide_builder):
         for col in range(3):
             rows, cols = slice(59 * row, 59 * (row + 1)), slice(59 * col, 59 * (col + 1))
             tile = align(window, target[rows, cols], GRID_SHAPE)
-            assert np.array_equal(wide[rows, cols], tile, equal_nan=True)
+            assert_same_pixels(wide[rows, cols], tile)
+
+
+def test_wide_align_reprojects_each_exposure_once(wide_builder, monkeypatch):
+    _, reader = wide_builder
+    target = target_wcs(RA, DEC, 3)
+    window = read_window(reader, s3_url(make_uri(0)), target, (177, 177),
+                         (target_wcs(RA, DEC), GRID_SHAPE))
+    calls = []
+    real = cutout.reproject_interp
+    monkeypatch.setattr(cutout, "reproject_interp",
+                        lambda *args, **kwargs: calls.append(1) or real(*args, **kwargs))
+    assert align(window, target, (177, 177)).shape == (177, 177)
+    assert len(calls) == 1
 
 
 def test_star_on_a_field_junction(cache):
@@ -341,6 +364,21 @@ def test_n_fields_counts_partial_coverage(wide_builder):
     both = builder.build([make_uri(0), make_uri(NO_WEST), make_uri(NO_NORTH)], RA, DEC, 3)
     assert both.n_fields == (2, 2, 1, 3, 3, 2, 3, 3, 2)
     assert both.n_used == 3
+
+
+def test_n_used_counts_the_central_field_not_all_used_exposures(cache):
+    full = np.ones((177, 177), np.float32)
+    corner = np.full((177, 177), np.nan, np.float32)
+    corner[118:, :59] = 1.0  # north-east field only
+    cache.put(make_uri(0), RA, DEC, full, 3)
+    cache.put(make_uri(1), RA, DEC, corner, 3)
+    builder = FrameBuilder(synthetic.FakeRangeReader({}), cache)
+    try:
+        result = builder.build([make_uri(0), make_uri(1)], RA, DEC, 3)
+    finally:
+        builder.close()
+    assert result.n_fields == (2, 1, 1, 1, 1, 1, 1, 1, 1)
+    assert result.n_used == 1
 
 
 def test_exposure_missing_the_central_field_is_not_used(wide_builder, cache):

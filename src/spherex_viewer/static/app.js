@@ -223,13 +223,13 @@ function pause(seconds) {
 
 /**
  * Sends one request and reads its JSON body, which `valid` must accept. A 429 or 503 answer
- * is retried once after its Retry-After delay, with `step` restored as the status, unless
- * `wait` is false: then it is a failure carrying that delay as `retryAfter` (seconds) and the
- * HTTP `status`.
+ * is retried once after its Retry-After delay, shown after `before` (for loads behind shown
+ * frames, their summary), with `step` restored as the status, unless `wait` is false: then it
+ * is a failure carrying that delay as `retryAfter` (seconds) and the HTTP `status`.
  * Returns {body} on success, {reason} on a network, HTTP or content failure, null once
  * aborted; any other error propagates.
  */
-async function request(url, options, signal, valid, step, wait = true) {
+async function request(url, options, signal, valid, step, wait = true, before = "") {
   try {
     let response = await fetch(url, { ...options, signal });
     if (!wait && RETRIED_STATUSES.includes(response.status)) {
@@ -238,7 +238,7 @@ async function request(url, options, signal, valid, step, wait = true) {
     }
     if (RETRIED_STATUSES.includes(response.status)) {
       const delay = retryDelay(response.headers.get("Retry-After"));
-      setStatus(`Waiting ${delay} s before continuing.`);
+      setStatus(joinStatus(before, `Waiting ${delay} s before continuing.`));
       await pause(delay);
       if (signal.aborted) return null;
       setStatus(step);
@@ -276,9 +276,7 @@ async function loadExample(signal) {
   }
   shown = { ra: data.ra_deg, dec: data.dec_deg };
   example = { ra: data.ra_deg, dec: data.dec_deg, detector: data.detector };
-  frames = parsed.frames.map((f, i) => ({
-    ...f, dates: data.frames[i].label, nFields: [f.nUsed],
-  }));
+  frames = parsed.frames;
   stretch = computeStretch(frames.map(centrePixels));
   slider.max = String(frames.length - 1);
   markerControl.hidden = frames[0].marker === undefined;
@@ -331,7 +329,7 @@ async function requestWide(searched, uris, signal, step) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ra_deg: searched.ra_deg, dec_deg: searched.dec_deg, uris, fields: 3 }),
-  }, signal, validWideBody, step);
+  }, signal, validWideBody, step, true, summary);
   if (outcome === null || outcome.reason !== undefined) return outcome;
   const pixels = decodePixels(outcome.body.pixels_b64, WIDE_PIXELS * WIDE_PIXELS);
   return pixels === null ? { reason: UNEXPECTED } : { result: outcome.body, pixels };
@@ -524,7 +522,7 @@ async function loadNextArea(shift, early, signal) {
   const fail = (text) => {
     loading = false;
     if (early) aheadFailed = shift;
-    setStatus(text);
+    setStatus(joinStatus(summary, text));
     applyView();
   };
   const centre = offsetPosition(plan.ra_deg, plan.dec_deg,
@@ -533,7 +531,8 @@ async function loadNextArea(shift, early, signal) {
   let step = "Searching the next area…";
   setStatus(step);
   const query = new URLSearchParams({ ra: texts.ra, dec: texts.dec, detector: plan.detector });
-  const outcome = await request("api/search?" + query, {}, signal, validPlan, step, !early);
+  const outcome = await request("api/search?" + query, {}, signal, validPlan, step, !early,
+    summary);
   if (outcome === null || signal.aborted) return;
   if (outcome.retryAfter !== undefined) {
     loading = false;
@@ -658,21 +657,40 @@ function pauseAhead(seconds, limited) {
 /**
  * Zooms the view one level in (+1) or out (-1). Zooming out of the 6' field widens the grid
  * at once and starts loading it; a zoom-out press (not a held key) while the surround is
- * missing tries again.
+ * missing tries again. Returns whether the view changed or a load started.
  */
 function zoom(direction, repeated = false) {
-  if (direction < 0 && atLowestZoom() && widenable()) expand();
-  else if (direction < 0 && !repeated && retryable()) loadAround();
-  view = clampView({ ...view, zoom: zoomStep(view.zoom, direction, grid) }, grid);
+  let acted = false;
+  if (direction < 0 && atLowestZoom() && widenable()) {
+    expand();
+    acted = true;
+  } else if (direction < 0 && !repeated && retryable()) {
+    loadAround();
+    acted = true;
+  }
+  const level = zoomStep(view.zoom, direction, grid);
+  if (level === view.zoom) return acted;
+  view = clampView({ ...view, zoom: level }, grid);
   applyView();
   joinAhead();
+  return true;
+}
+
+/**
+ * Whether a push at the edge of the loaded area, once the key has rested, would load something:
+ * the missing surround again or the next area, when nothing loads, the map is closed and the
+ * search limit allows.
+ */
+function restLoadable() {
+  return !loading && sky.hidden && Date.now() >= aheadPausedUntil
+    && (retryable() || (plan !== null && grid === WIDE_PIXELS));
 }
 
 /**
  * Moves the view one step. Leaving the 6' field widens the grid at once and starts loading
  * it; nearing the wide grid's edge loads the area further on ahead; pushing at the edge until
  * the key has rested loads the missing surround again or, if none was loaded ahead, the next
- * area.
+ * area. Returns whether the view moved or a load started or was scheduled.
  */
 function move(dx, dy) {
   clearTimeout(restTimer);
@@ -686,15 +704,19 @@ function move(dx, dy) {
     applyView();
     joinAhead();
     considerAhead(dx, dy);
-    return;
+    return true;
   }
+  if (!restLoadable()) return false;
+  const pushedView = view;
+  const pushedFrames = frames;
   restTimer = setTimeout(() => {
-    if (loading || !sky.hidden || frames.length === 0 || Date.now() < aheadPausedUntil) return;
+    // A change of the view or the frames (a zoom, a commit, a join, a new search) or a load
+    // started since the push cancels it.
+    if (view !== pushedView || frames !== pushedFrames || !restLoadable()) return;
     if (retryable()) loadAround();
-    else if (plan !== null && grid === WIDE_PIXELS) {
-      loadNextArea({ dx, dy }, false, controller.signal);
-    }
+    else loadNextArea({ dx, dy }, false, controller.signal);
   }, REST_MS);
+  return true;
 }
 
 async function search(ra, dec, detector) {
@@ -792,6 +814,8 @@ function select(raDeg, decDeg) {
 }
 
 function showMap(open) {
+  // A push at the edge made before the map opened loads nothing once it has rested.
+  if (open) clearTimeout(restTimer);
   sky.hidden = !open;
   document.body.classList.toggle("picking", open);
   pickButton.disabled = open;
@@ -923,18 +947,23 @@ zoomInButton.addEventListener("click", () => zoom(1));
 zoomOutButton.addEventListener("click", () => zoom(-1));
 
 // Zoom and arrow keys act on the page, buttons and checkboxes, never while typing, choosing a
-// detector, stepping the timeline or using the sky map.
+// detector or using the sky map; on the timeline only the zoom keys (its arrows step frames).
+// A key the page does not use (a zoom limit; a push at the edge while something loads or the
+// search limit pauses loading) keeps its default, so the arrow keys then scroll the page.
 document.addEventListener("keydown", (event) => {
   if (frames.length === 0 || !sky.hidden || event.ctrlKey || event.altKey || event.metaKey
     || event.defaultPrevented) return;
+  const zoomKey = event.key === "+" || event.key === "=" || event.key === "-";
   const target = event.target;
-  if (target instanceof HTMLElement && (target.isContentEditable || target.closest(
-    "input:not([type=checkbox]), select, textarea, #sky") !== null)) return;
-  if (event.key === "+" || event.key === "=") zoom(1);
-  else if (event.key === "-") zoom(-1, event.repeat);
-  else if (event.key in ARROWS) move(...ARROWS[event.key]);
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest(zoomKey
+    ? "input:not([type=checkbox]):not([type=range]), select, textarea, #sky"
+    : "input:not([type=checkbox]), select, textarea, #sky") !== null)) return;
+  let acted;
+  if (event.key === "+" || event.key === "=") acted = zoom(1);
+  else if (event.key === "-") acted = zoom(-1, event.repeat);
+  else if (event.key in ARROWS) acted = move(...ARROWS[event.key]);
   else return;
-  event.preventDefault();
+  if (acted) event.preventDefault();
 });
 
 const detectors = Array.from(detectorSelect.options, (option) => option.value);

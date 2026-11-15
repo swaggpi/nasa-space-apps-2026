@@ -215,7 +215,7 @@ function example({ marker = true, frames = 2 } = {}) {
   };
 }
 
-test("parseExample converts a valid example to page frames with labels and markers", () => {
+test("parseExample converts a valid example to page frames with dates, counts and markers", () => {
   const parsed = parseExample(example());
   assert.deepEqual(parsed, {
     name: "Barnard's Star",
@@ -223,9 +223,9 @@ test("parseExample converts a valid example to page frames with labels and marke
     position: "RA 269.4463\u00b0, Dec +4.7682\u00b0 \u00b7 D6",
     frames: [
       { pixels: [0.1, null, 0.3, 0], width: 2, height: 2,
-        label: "2025-01-01 \u00b7 1 exposure", nUsed: 1, marker: { x: 0.5, y: 1 } },
+        dates: "2025-01-01", nUsed: 1, nFields: [1], marker: { x: 0.5, y: 1 } },
       { pixels: [0.1, null, 0.3, 1], width: 2, height: 2,
-        label: "2025-02-01 \u00b7 2 exposures", nUsed: 2, marker: { x: 1.5, y: 1 } },
+        dates: "2025-02-01", nUsed: 2, nFields: [2], marker: { x: 1.5, y: 1 } },
     ],
   });
 });

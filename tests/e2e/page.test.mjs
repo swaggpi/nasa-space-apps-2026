@@ -410,7 +410,7 @@ async function waitForStatus(page, predicate) {
 }
 
 const finished = (text) => !text.startsWith("Searching") && !text.startsWith("Loading")
-  && !text.startsWith("Waiting") && !text.includes("Loading the surrounding area");
+  && !text.includes("Waiting") && !text.includes("Loading the surrounding area");
 
 async function finalStatus(page) {
   return waitForStatus(page, (text) => text !== "" && finished(text));
@@ -2559,7 +2559,12 @@ test("in a deep field a key held at the edge searches the next area once, only a
     try {
       await press(page, "ArrowLeft", 9);
       await assertStage(page, { zoom: 1, cx: 29, cy: 88 }, WIDE);
-      for (let i = 0; i < 20; i++) await page.keyboard.down("ArrowLeft");
+      // Held for longer than the rest time: every push restarts it, so nothing is searched.
+      for (let i = 0; i < 16; i++) {
+        await page.keyboard.down("ArrowLeft");
+        await page.waitForTimeout(60);
+      }
+      assert.equal(log.searches.length, 1);
       await page.keyboard.up("ArrowLeft");
       await page.waitForTimeout(300);
       assert.equal(log.searches.length, 1);
@@ -2582,6 +2587,145 @@ test("in a deep field a key held at the edge searches the next area once, only a
     }
   });
 
+/** Records, for every key press on the page, the key and whether the page used it. */
+async function recordKeyDefaults(page) {
+  await page.evaluate(() => {
+    window.keyDefaults = [];
+    window.addEventListener("keydown", (e) => window.keyDefaults.push([e.key, e.defaultPrevented]));
+  });
+}
+
+const keyDefaults = (page) => page.evaluate(() => window.keyDefaults.splice(0));
+
+test("a push at the edge is cancelled by a move, a zoom or the sky map within the rest time",
+  { timeout: TIMEOUT }, async () => {
+    const { page, log } = await openWithSurround({ plan: makePlan(DEEP_FRAMES) });
+    await recordKeyDefaults(page);
+    await press(page, "ArrowLeft", 9);
+    await assertStage(page, { zoom: 1, cx: 29, cy: 88 }, WIDE);
+    await press(page, "ArrowLeft");
+    // The push is used (a load is scheduled), so the page keeps the key.
+    assert.deepEqual((await keyDefaults(page)).at(-1), ["ArrowLeft", true]);
+    await page.waitForTimeout(100);
+    // North: the view stays at the eastern edge, so only the cancelled timer prevents a search.
+    await press(page, "ArrowUp");
+    await assertStage(page, { zoom: 1, cx: 29, cy: 81 }, WIDE);
+    await page.waitForTimeout(900);
+    assert.equal(log.searches.length, 1);
+
+    // A zoom within the rest time: zoomed in, the view is no longer at the edge.
+    await press(page, "ArrowLeft");
+    await page.keyboard.type("+");
+    await assertStage(page, { zoom: 2, cx: 29, cy: 81 }, WIDE);
+    await page.waitForTimeout(900);
+    assert.equal(log.searches.length, 1);
+
+    // The sky map opened and closed within the rest time.
+    await page.keyboard.type("-");
+    await press(page, "ArrowLeft");
+    await assertStage(page, { zoom: 1, cx: 29, cy: 81 }, WIDE);
+    await page.click("#pick");
+    await page.click("#sky-close");
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.waitForTimeout(900);
+    assert.equal(log.searches.length, 1);
+    assertCleanMapRun(log);
+  });
+
+test("a push at the edge while the surround loads is not used and loads nothing after it",
+  { timeout: TIMEOUT }, async () => {
+    const plan = makePlan(THREE_FRAMES);
+    const gate = deferred();
+    const { page, log } = await openPage({
+      search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+      wide: async (n, payload, served) => {
+        if (n === 2) await gate.promise;
+        return texturedWide(n, payload, served);
+      },
+    });
+    try {
+      await submit(page);
+      // The last wide frame is held, so the surround is still loading during the presses.
+      await page.waitForFunction(() => document.querySelector("#status").textContent
+        .includes("Loading the surrounding area: frame 3 of 3"));
+      await page.evaluate(() => document.activeElement.blur());
+      await page.setViewportSize({ width: 700, height: 400 });
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await recordKeyDefaults(page);
+      await press(page, "ArrowDown", 9);
+      await assertStage(page, { zoom: 1, cx: 88, cy: 147 }, WIDE);
+      assert.equal(await page.evaluate(() => window.scrollY), 0);
+      await press(page, "ArrowDown");
+      assert.deepEqual((await keyDefaults(page)).at(-1), ["ArrowDown", false]);
+      gate.release();
+      await waitForSurround(page);
+      await page.waitForTimeout(900);
+      assert.equal(log.searches.length, 1);
+      assert.equal(log.wides.length, 3);
+      assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+      assert.ok(await page.evaluate(() => window.scrollY) > 0, "ArrowDown did not scroll");
+      assertCleanRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
+test("the next area keeps the loaded detector, clamps the frame, unticks Difference for one "
+  + "frame, leaves a focused RA field alone and moves the map's centre", { timeout: TIMEOUT },
+  async () => {
+    const first = makePlan(THREE_FRAMES);
+    // Loaded ahead, two fields on.
+    const east = offsetPosition(first.ra_deg, first.dec_deg, -2 * SIZE, 0);
+    const eastTexts = fieldTexts(east.ra, east.dec);
+    const second = {
+      ...makePlan([{ label: "2025-06-01", n_available: 9, n_used: 9 }]),
+      ra_deg: east.ra, dec_deg: east.dec,
+    };
+    const gate = deferred();
+    const { page, log } = await openWithSurround({
+      plan: first,
+      search: (url) => ({ status: 200, body: url.searchParams.get("ra") === RA ? first : second }),
+      wide: async (n, payload, served) => {
+        if (payload.ra_deg === first.ra_deg) return texturedWide(n, payload, served);
+        await gate.promise;
+        return wideBody(widePixels(pixels(n), () => 0.3), payload.uris.length);
+      },
+    });
+    try {
+      await selectFrame(page, 2);
+      await page.check("#difference");
+      await page.selectOption("#detector", "D6");
+      await page.evaluate(() => document.activeElement.blur());
+      await press(page, "ArrowLeft", 10);
+      await page.waitForFunction(() => document.querySelector("#status").textContent
+        .startsWith("Loading the next area"));
+      assert.equal(log.searches.length, 2);
+      assert.equal(log.searches[1].searchParams.get("detector"), "D2");
+      const typed = (await page.inputValue("#ra")) + "9";
+      await page.focus("#ra");
+      await page.keyboard.type("9");
+      gate.release();
+      await page.waitForFunction((ra) => location.search.includes(ra), eastTexts.ra);
+      assert.equal(await finalStatus(page), `1 frame from 9 of 9 exposures. ${NO_DATA}`);
+      const slider = await sliderState(page);
+      assert.deepEqual([slider.value, slider.max], [0, 0]);
+      assert.equal(await page.isChecked("#difference"), false);
+      assert.equal(await page.isDisabled("#difference"), true);
+      assert.equal(await page.inputValue("#ra"), typed);
+      assert.equal(await page.inputValue("#dec"), DEC);
+      assert.equal(await page.inputValue("#detector"), "D6");
+
+      await openMap(page);
+      const centre = await clickMap(page, 0, 0);
+      const cosDec = Math.cos((east.dec * Math.PI) / 180);
+      assert.ok(Math.abs((centre.ra - east.ra) * cosDec) < 0.01
+        && Math.abs(centre.dec - east.dec) < 0.01, `centre ${centre.ra}, ${centre.dec}`);
+      assertCleanMapRun(log);
+    } finally {
+      gate.release();
+    }
+  });
+
 test("the next area replaces the frames with the view, zoom and playback kept and a new link",
   { timeout: TIMEOUT }, async () => {
     const first = makePlan(DEEP_FRAMES);
@@ -2595,6 +2739,9 @@ test("the next area replaces the frames with the view, zoom and playback kept an
       ra_deg: east.ra, dec_deg: east.dec,
     };
     let searches = 0;
+    // Central fields of the next area's frames, by plan index; its surround has a bright patch
+    // that must not enter the stretch.
+    const centres = [];
     const { page, log } = await openWithSurround({
       plan: first,
       search: () => {
@@ -2603,9 +2750,12 @@ test("the next area replaces the frames with the view, zoom and playback kept an
         if (searches === 2) return { status: 200, body: second };
         return { status: 502, body: { detail: "The archive could not be reached." } };
       },
-      wide: (n, payload, served) => (payload.ra_deg === first.ra_deg
-        ? texturedWide(n, payload, served)
-        : wideBody(widePixels(pixels(n), () => 0.3), payload.uris.length)),
+      wide: (n, payload, served) => {
+        if (payload.ra_deg === first.ra_deg) return texturedWide(n, payload, served);
+        centres[planIndex(second, payload)] = pixels(n);
+        return wideBody(widePixels(pixels(n), (x, y) => (x < 12 && y < 12 ? 80 : 0.3)),
+          payload.uris.length);
+      },
     });
     await page.click("#play");
     await page.evaluate(() => document.activeElement.blur());
@@ -2627,10 +2777,16 @@ test("the next area replaces the frames with the view, zoom and playback kept an
     const value = (await sliderState(page)).value;
     await page.waitForFunction((v) => document.querySelector("#slider").value !== String(v),
       value, { timeout: 2000 });
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    const shownFrame = (await sliderState(page)).value;
+    assert.deepEqual(await canvasPixels(page),
+      Array.from(toRGBA(centres[shownFrame], computeStretch(centres))));
 
+    const summary = `2 frames from 150 of 150 exposures. ${NO_DATA}`;
     await press(page, "ArrowLeft", 20);
-    assert.equal(await waitForStatus(page, (t) => t.startsWith("The next area")),
-      "The next area could not be loaded: The archive could not be reached.");
+    assert.equal(await waitForStatus(page, (t) => t.includes("The next area")),
+      `${summary} The next area could not be loaded: The archive could not be reached.`);
     assert.equal(log.searches.length, 3);
     assert.equal(await page.evaluate(() => location.search), link);
     assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
@@ -2671,13 +2827,81 @@ test("arrows on the focused timeline step frames; on the Difference box they mov
     assert.equal((await sliderState(page)).value, 1);
     assert.equal(await dateText(page), "2025-11-07 – 2025-11-10 · 19 exposures");
     await assertStage(page, view, WIDE);
+    // The zoom keys have no meaning of their own on the timeline, so they zoom there.
+    await page.keyboard.type("+");
+    await assertStage(page, { ...view, zoom: 2 }, WIDE);
+    await page.keyboard.type("-");
+    await assertStage(page, view, WIDE);
+    assert.equal((await sliderState(page)).value, 1);
     await page.focus("#difference");
     await press(page, "ArrowLeft");
     await assertStage(page, { ...view, cx: 81 }, WIDE);
     assert.equal(await page.isChecked("#difference"), false);
-    assert.equal(await page.evaluate(() => window.scrollX), 0);
+
+    // On the page itself an arrow that moves the view does not scroll the page.
+    await page.setViewportSize({ width: 700, height: 400 });
+    await page.evaluate(() => {
+      document.activeElement.blur();
+      window.scrollTo(0, 0);
+    });
+    assert.ok(await page.evaluate(() => document.documentElement.scrollHeight > innerHeight + 100));
+    await press(page, "ArrowDown", 2);
+    await page.waitForTimeout(300);
+    const moved = { ...view, cx: 81, cy: 102 };
+    await assertStage(page, moved, WIDE);
+    assert.equal(await page.evaluate(() => window.scrollY), 0);
+    // These moves loaded ahead; the keys below must send nothing more.
+    const sent = log.searches.length;
+    // Keys with Ctrl, Alt or Meta belong to the browser (Ctrl+- and Ctrl++ zoom the page).
+    for (const key of ["Control+ArrowLeft", "Alt+ArrowLeft", "Meta+ArrowLeft", "Control+ArrowUp",
+      "Control+Minus", "Control+Equal", "Alt+Minus", "Meta+Equal"]) await press(page, key);
+    await page.waitForTimeout(700);
+    await assertStage(page, moved, WIDE);
+    assert.equal(log.searches.length, sent);
     assertCleanRun(log);
   });
+
+test("on the example the arrow keys move the view and scroll the page only where the view "
+  + "cannot use them; a zoom key at its limit keeps its default", { timeout: TIMEOUT },
+async () => {
+  const { plan } = examplePlan();
+  const gate = deferred();
+  const { page, log } = await openPage({
+    search: async () => {
+      await gate.promise;
+      return { status: 200, body: plan };
+    },
+    frame: (n) => frameBody(pixels(n), plan.frames[n].n_used), wide: texturedWide,
+  });
+  try {
+    await page.setViewportSize({ width: 700, height: 400 });
+    assert.ok(await page.evaluate(() => document.documentElement.scrollHeight > innerHeight + 100));
+    await page.evaluate(() => document.activeElement.blur());
+    await recordKeyDefaults(page);
+    await page.keyboard.type("++");
+    await page.keyboard.type("+");
+    assert.deepEqual(await keyDefaults(page), [["+", true], ["+", true], ["+", false]]);
+    await page.keyboard.type("--");
+    // The first move past the example's field widens the grid and searches its surroundings.
+    await press(page, "ArrowDown", 9);
+    await assertStage(page, { zoom: 1, cx: 88, cy: 147 }, WIDE);
+    assert.equal(await page.evaluate(() => window.scrollY), 0);
+    assert.equal(log.searches.length, 1);
+    // At the edge, with the search held, the view cannot use the key: the page scrolls.
+    await press(page, "ArrowDown", 2);
+    await page.waitForTimeout(300);
+    const scrolled = await page.evaluate(() => window.scrollY);
+    assert.ok(scrolled > 0, "ArrowDown did not scroll the page");
+    // Away from the edge the key moves the view again and the page stays.
+    await press(page, "ArrowUp");
+    await assertStage(page, { zoom: 1, cx: 88, cy: 140 }, WIDE);
+    assert.equal(await page.evaluate(() => window.scrollY), scrolled);
+    assert.equal(log.searches.length, 1);
+    assertCleanRun(log);
+  } finally {
+    gate.release();
+  }
+});
 
 test("the example zooms in and moves inside its field without any request; the marker stays",
   { timeout: TIMEOUT }, async () => {
@@ -2906,10 +3130,17 @@ test("a surround refused twice leaves the loop as it was and Zoom out tries agai
         ? { status: 503, body: { detail: busy }, headers: { "Retry-After": "1" } }
         : texturedWide(n, payload, served)),
     });
+    await recordStatuses(page);
     await submit(page);
     const done = `3 frames from 42 of 42 exposures. ${NO_DATA}`;
-    assert.equal(await waitForStatus(page, (t) => t.includes("could not")),
-      `${done} The surrounding area could not be loaded: ${busy}`);
+    const failed = `${done} The surrounding area could not be loaded: ${busy}`;
+    assert.equal(await waitForStatus(page, (t) => t.includes("could not")), failed);
+    // The wait for the refused surround keeps the summary of the shown frames in front.
+    const history = await statusHistory(page);
+    assert.deepEqual(history.slice(history.indexOf(done)), [done,
+      `${done} Loading the surrounding area: frame 1 of 3…`,
+      `${done} Waiting 1 s before continuing.`,
+      `${done} Loading the surrounding area: frame 1 of 3…`, failed]);
     assert.equal(log.wides.length, 2);
     assert.equal(await page.$eval("#image", (el) => el.classList.contains("pending")), true);
     assert.deepEqual(await canvasPixels(page),
@@ -2923,6 +3154,7 @@ test("a surround refused twice leaves the loop as it was and Zoom out tries agai
     await waitForSurround(page);
     assert.equal(await finalStatus(page), done);
     assert.equal(log.wides.length, 5);
+    await assertStage(page, { zoom: 1 / 2, cx: 88, cy: 88 }, WIDE);
     assert.equal(await text(page, "#play"), "Pause");
     assertCleanRun(log);
   });
@@ -3005,7 +3237,7 @@ test("the date label gives the range of exposures over the fields in view",
 
 test("keys do nothing while the sky map is open; on a phone the timeline keeps its width",
   { timeout: TIMEOUT }, async () => {
-    const { page, log } = await openWithSurround();
+    const { page, log } = await openWithSurround({ plan: makePlan(DEEP_FRAMES) });
     await openMap(page);
     await page.evaluate(() => document.activeElement?.blur());
     await page.keyboard.type("+-");
@@ -3013,6 +3245,14 @@ test("keys do nothing while the sky map is open; on a phone the timeline keeps i
     await page.waitForTimeout(700);
     await page.click("#sky-close");
     await assertStage(page, { zoom: 1, cx: 88, cy: 88 }, WIDE);
+    assert.equal(log.searches.length, 1);
+    // A push at the edge whose rest ends while the map is open loads nothing.
+    await page.evaluate(() => document.activeElement?.blur());
+    await press(page, "ArrowLeft", 10);
+    await assertStage(page, { zoom: 1, cx: 29, cy: 88 }, WIDE);
+    await page.click("#pick");
+    await page.waitForTimeout(900);
+    await page.click("#sky-close");
     assert.equal(log.searches.length, 1);
 
     await page.setViewportSize({ width: 360, height: 740 });
@@ -3308,8 +3548,10 @@ test("each direction loads its own neighbour ahead; off centre across the move i
       assert.deepEqual(searchedAt(log.searches[1]),
         [fieldTexts(c.ra, c.dec).ra, fieldTexts(c.ra, c.dec).dec, "D2"], key);
       if (key === "ArrowUp") {
-        assert.equal(await waitForStatus(page, (t) => t.startsWith("The next area")),
-          "The next area could not be loaded: The archive search failed. Try again later.");
+        // The failure follows the summary of the frames still shown.
+        assert.equal(await waitForStatus(page, (t) => t.includes("The next area")),
+          "3 frames from 42 of 42 exposures. "
+          + "The next area could not be loaded: The archive search failed. Try again later.");
         await press(page, "ArrowUp", 4);
         await assertStage(page, { zoom: 1, cx: 88, cy: 53 }, WIDE);
         await page.waitForTimeout(300);
