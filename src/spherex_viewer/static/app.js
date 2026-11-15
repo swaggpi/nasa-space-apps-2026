@@ -3,12 +3,13 @@
 // a search position, and zooming and moving the view over the surrounding fields.
 
 import {
-  FIELD_PIXELS, WIDE_PIXELS, ZOOM_LEVELS, aheadShift, capNotice, centrePixels, clampView,
-  computeStretch, countRange, decodePixels, difference, fieldCorners, fieldTexts,
-  formatPosition, frameLabel, isClick, joinStatus, linkQuery, markerPercent, nextIndex,
-  noDataNote, offsetPosition, panStep, parseExample, parseLink, plural, previousIndex,
-  retryDelay, shiftedView, shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody,
-  validPlan, validWideBody, widenFrame, zoomStep,
+  FIELD_PIXELS, MAX_SEAM_PX, WIDE_PIXELS, ZOOM_LEVELS, aheadShift, capNotice, centreOutside,
+  centrePixels, clampView, computeStretch, countRange, decodePixels, difference, fieldCorners,
+  fieldTexts, fieldsInView, formatPosition, frameLabel, isClick, joinStatus, linkQuery,
+  markerPercent, nextIndex, noDataNote, notLoadedLayers, offsetPosition, panStep, parseExample,
+  parseLink, playbackNext, plural, previousIndex, pushShift, requestOrder, retryDelay,
+  sameVisits, seamOffset, shiftFrame, shiftedView, shouldPreload, stageBox, toDifferenceRGBA,
+  toRGBA, validFrameBody, validPlan, validWideBody, widenFrame, withCentre, zoomStep,
 } from "./lib.js";
 
 const PLAY_INTERVAL_MS = 500;
@@ -79,21 +80,20 @@ let map = null;
 let mapLoading = null;
 let selection = null;
 // The search answer behind the shown frames (null for the example), the example's position
-// and detector while it is shown, the loaded grid's size, whether the fields around the
-// centre of a wide grid hold data (until then they are drawn as not loaded), the view over
-// the grid, whether a search, the surround or the next area is loading, and the status text
-// of the shown frames.
+// and detector while it is shown, the loaded grid's size, the view over the grid, whether a
+// search, the surround or the next area is loading, and the status text of the shown frames.
+// A field of a frame whose count (nFields) is null is not loaded yet and is drawn plain.
 let plan = null;
 let example = null;
 let grid = FIELD_PIXELS;
-let surroundLoaded = false;
 let view = DEFAULT_VIEW;
 let loading = false;
 let summary = "";
 let restTimer = null;
-// Loading ahead: the next area once loaded but not yet joined on (the view not inside it), the
-// shift of a preload that failed (not tried again by itself), the time (ms) before which no
-// preload starts after the search limit was reached, its timer, and the last arrow press.
+// Loading ahead: the next area once it can be shown but is not yet joined on (the view not
+// inside it), the shift of a preload that failed (not tried again by itself), the time (ms)
+// before which no preload starts after the search limit was reached, its timer, and the last
+// arrow press.
 let ahead = null;
 let aheadFailed = null;
 let aheadPausedUntil = 0;
@@ -134,7 +134,6 @@ function reset() {
   plan = null;
   example = null;
   grid = FIELD_PIXELS;
-  surroundLoaded = false;
   view = DEFAULT_VIEW;
   summary = "";
   canvas.width = grid;
@@ -166,9 +165,14 @@ function widenable() {
   return frames.length > 0 && grid === FIELD_PIXELS && (plan !== null || example !== null);
 }
 
-/** Whether the wide grid's surrounding fields are missing and nothing is loading them. */
+/** Whether every field of every frame on the wide grid holds data. */
+function surroundLoaded() {
+  return grid === WIDE_PIXELS && frames.every((frame) => !frame.nFields.includes(null));
+}
+
+/** Whether fields of the wide grid are missing and nothing is loading them. */
 function retryable() {
-  return frames.length > 0 && grid === WIDE_PIXELS && !surroundLoaded && !loading;
+  return frames.length > 0 && grid === WIDE_PIXELS && !surroundLoaded() && !loading;
 }
 
 const atLowestZoom = () => view.zoom <= FIELD_PIXELS / grid;
@@ -181,8 +185,10 @@ function applyView() {
   stage.style.left = `${box.left}%`;
   stage.style.top = `${box.top}%`;
   stage.style.setProperty("--grid", String(grid));
-  canvas.classList.toggle("pending", grid === WIDE_PIXELS && !surroundLoaded);
   const loaded = frames.length > 0;
+  const layers = loaded ? notLoadedLayers(frames[current].nFields) : "";
+  canvas.classList.toggle("pending", layers !== "");
+  canvas.style.setProperty("--not-loaded-fields", layers);
   zoomInButton.disabled = !loaded || view.zoom >= ZOOM_LEVELS.at(-1);
   zoomOutButton.disabled = !loaded || (atLowestZoom() && !widenable() && !retryable());
   if (!loaded) return;
@@ -204,6 +210,11 @@ function show(index) {
   slider.value = String(index);
   placeMarker(frame);
   applyView();
+}
+
+/** Shows the frame playback steps to: the next one holding every field in view shown now. */
+function playNext() {
+  show(playbackNext(frames.map((frame) => frame.nFields), current, fieldsInView(view, grid)));
 }
 
 async function errorDetail(response) {
@@ -301,13 +312,16 @@ function summarise(searched, used, failed, reason) {
   );
 }
 
-/** Asks for one frame of the 59 grid; returns {body}, {reason} or null if aborted. */
-function requestNarrow(searched, uris, signal, step) {
+/**
+ * Asks for one frame of the 59 grid, a wait shown after `before`; returns {body}, {reason} or
+ * null if aborted.
+ */
+function requestNarrow(searched, uris, signal, step, before = "") {
   return request("api/frame", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ra_deg: searched.ra_deg, dec_deg: searched.dec_deg, uris }),
-  }, signal, validFrameBody, step);
+  }, signal, validFrameBody, step, true, before);
 }
 
 /** A loaded frame of the 59 grid from its api/frame answer and its planned frame. */
@@ -379,7 +393,6 @@ async function loadFrames(signal) {
 function widen() {
   frames = frames.map(widenFrame);
   grid = WIDE_PIXELS;
-  surroundLoaded = false;
   view = { ...view, cx: view.cx + FIELD_PIXELS, cy: view.cy + FIELD_PIXELS };
   canvas.width = grid;
   canvas.height = grid;
@@ -399,21 +412,31 @@ function expand() {
   if (!loading) loadAround();
 }
 
+/** A frame with the pixels and per-field counts of its wide frame answer. */
+function withWide(frame, outcome) {
+  return { ...frame, pixels: outcome.pixels, nFields: outcome.result.n_fields, copied: false };
+}
+
 /**
- * Loads the eight fields around the shown frames, one wide frame per loaded frame, and swaps
- * them in at once with the picture on screen unchanged; on any failure the fields stay not
- * loaded.
+ * Loads the fields the shown frames lack, one wide frame per frame lacking any, the frame on
+ * screen first, then the others in time order. Each frame's wide frame is drawn as soon as it
+ * is in (the picture on screen unchanged where it was loaded), unless some frame holds fields
+ * copied from the previous area: then all are swapped in at once, so that playback never
+ * mixes the two areas' grids. On any failure the fields still missing stay not loaded.
  */
 async function loadSurround(signal) {
   if (grid === FIELD_PIXELS) widen();
   loading = true;
   applyView();
-  const wide = [];
-  for (const [i, frame] of frames.entries()) {
+  const together = frames.some((frame) => frame.copied);
+  const missing = requestOrder(frames.length, current)
+    .filter((i) => frames[i].nFields.includes(null));
+  const wide = new Map();
+  for (const [j, i] of missing.entries()) {
     const step = joinStatus(summary,
-      `Loading the surrounding area: frame ${i + 1} of ${frames.length}…`);
+      `Loading the surrounding area: frame ${j + 1} of ${missing.length}…`);
     setStatus(step);
-    const outcome = await requestWide(plan, frame.uris, signal, step);
+    const outcome = await requestWide(plan, frames[i].uris, signal, step);
     if (outcome === null || signal.aborted) return;
     if (outcome.reason !== undefined) {
       loading = false;
@@ -422,12 +445,17 @@ async function loadSurround(signal) {
       applyView();
       return;
     }
-    wide.push(outcome);
+    if (together) {
+      wide.set(i, outcome);
+    } else {
+      frames = frames.map((frame, k) => (k === i ? withWide(frame, outcome) : frame));
+      show(current);
+    }
   }
-  frames = frames.map((frame, i) => ({
-    ...frame, pixels: wide[i].pixels, nFields: wide[i].result.n_fields,
-  }));
-  surroundLoaded = true;
+  if (together) {
+    frames = frames.map((frame, k) => (wide.has(k) ? withWide(frame, wide.get(k)) : frame));
+    stretch = computeStretch(frames.map(centrePixels));
+  }
   loading = false;
   setStatus(summary);
   show(current);
@@ -509,11 +537,37 @@ async function loadExampleArea(signal) {
 }
 
 /**
+ * Whether the frames of the area `next` (a search answer `shift` fields away) can be shown
+ * next to the loaded ones before its wide frames are in: its centre is new sky, both areas hold
+ * the same visits, and their grids meet within MAX_SEAM_PX.
+ */
+function combinable(next, shift) {
+  return centreOutside(shift)
+    && sameVisits(frames.map((frame) => frame.dates), next.frames.map((f) => f.label))
+    && seamOffset({ ra: plan.ra_deg, dec: plan.dec_deg }, { ra: next.ra_deg, dec: next.dec_deg },
+      shift) <= MAX_SEAM_PX;
+}
+
+/** Makes the next area available: joined on at once, or with `early` once the view is inside. */
+function offer(area, early) {
+  if (!early) {
+    join(area);
+    return;
+  }
+  ahead = area;
+  joinAhead();
+}
+
+/**
  * Searches the area `shift` whole fields away ({dx, dy}: right = west, down = south) and
- * loads its wide frames; the frames shown stay on screen and keep playing meanwhile. With
- * `early` it is a preload: answered 429 or 503, it waits for the server's delay and tries again
- * by itself; once loaded it joins on as soon as the view lies inside it. Otherwise (the view
- * rests at the edge) it joins on at once.
+ * loads it; the frames shown stay on screen and keep playing meanwhile. When its centre is new
+ * sky (the field the view enters) and it holds the same visits on a matching grid, it is made
+ * available at once with the fields it shares with the loaded area, its 6' frames are loaded
+ * first, the frame on screen first, each shown as soon as it is in, and then its wide frames,
+ * swapped in together. Otherwise only its wide frames load, the frame on screen first, and it
+ * is made available once they are in. With `early` it is a preload: answered 429 or 503, the
+ * search waits for the server's delay and is tried again by itself; the area joins on as soon
+ * as the view lies inside it. Otherwise (the view rests at the edge) it joins on at once.
  */
 async function loadNextArea(shift, early, signal) {
   loading = true;
@@ -548,57 +602,120 @@ async function loadNextArea(shift, early, signal) {
     fail(`No SPHEREx exposures cover the next area in ${next.detector}.`);
     return;
   }
-  const loaded = [];
+  const n = next.frames.length;
+  const area = { shift, plan: next, texts, frames: null, complete: false, note: "" };
+  // The frame on screen, by its date label: the same visit in the next area.
+  const onScreen = () => next.frames.findIndex((f) => f.label === frames[current].dates);
+  /** Puts a changed frame of the area in place, and on screen if the area is joined on. */
+  const update = (i, frame) => {
+    const joined = frames === area.frames;
+    area.frames = area.frames.map((f, k) => (k === i ? frame : f));
+    if (!joined) return;
+    frames = area.frames;
+    show(current);
+  };
   let used = 0;
   let failed = 0;
   let reason = "";
-  for (const [i, planned] of next.frames.entries()) {
-    step = `Loading the next area: frame ${i + 1} of ${next.frames.length}…`;
+  const combined = combinable(next, shift);
+  if (combined) {
+    area.frames = frames.map((frame, i) => ({
+      ...shiftFrame(frame, shift), uris: next.frames[i].uris,
+    }));
+    offer(area, early);
+    for (const [j, i] of requestOrder(n, onScreen()).entries()) {
+      step = `Loading the field ahead: frame ${j + 1} of ${n}…`;
+      setStatus(step);
+      const answer = await requestNarrow(next, next.frames[i].uris, signal, step, summary);
+      if (answer === null || signal.aborted) return;
+      if (answer.reason !== undefined) {
+        failed += 1;
+        reason = answer.reason;
+        continue;
+      }
+      used += answer.body.n_used;
+      update(i, withCentre(area.frames[i], answer.body.pixels, answer.body.n_used));
+    }
+  }
+  const wide = new Map();
+  let wideReason = "";
+  for (const [j, i] of requestOrder(n, onScreen()).entries()) {
+    step = `Loading the next area: frame ${j + 1} of ${n}…`;
     setStatus(step);
-    const answer = await requestWide(next, planned.uris, signal, step);
+    const answer = await requestWide(next, next.frames[i].uris, signal, step);
     if (answer === null || signal.aborted) return;
     if (answer.reason !== undefined) {
-      failed += 1;
-      reason = answer.reason;
+      wideReason = answer.reason;
       continue;
     }
-    loaded.push({
-      pixels: answer.pixels, width: WIDE_PIXELS, height: WIDE_PIXELS, dates: planned.label,
-      nUsed: answer.result.n_used, nFields: answer.result.n_fields, uris: planned.uris,
-    });
-    used += answer.result.n_used;
-  }
-  if (loaded.length === 0) {
-    fail(sentence(`The next area could not be loaded: ${reason}`));
-    return;
+    wide.set(i, answer);
   }
   loading = false;
-  const area = { shift, plan: next, frames: loaded, texts, used, failed, reason };
-  if (!early) {
+  if (combined && used === 0 && wide.size === 0 && ahead === area) {
+    ahead = null;
+    fail(sentence(`The next area could not be loaded: ${wideReason}`));
+    return;
+  }
+  if (combined && wide.size < n) {
+    // Some wide frames are missing: the frames stay as they are, the rest not loaded.
+    area.note = sentence(`The rest of the next area could not be loaded: ${wideReason}`);
+  } else if (combined) {
+    area.frames = area.frames.map((frame, i) => withWide(frame, wide.get(i)));
+    used = [...wide.values()].reduce((sum, answer) => sum + answer.result.n_used, 0);
+    failed = 0;
+  } else if (wide.size === 0) {
+    fail(sentence(`The next area could not be loaded: ${wideReason}`));
+    return;
+  } else {
+    area.frames = next.frames.flatMap((planned, i) => (wide.has(i) ? [{
+      pixels: wide.get(i).pixels, width: WIDE_PIXELS, height: WIDE_PIXELS, dates: planned.label,
+      nUsed: wide.get(i).result.n_used, nFields: wide.get(i).result.n_fields, uris: planned.uris,
+    }] : []));
+    used = [...wide.values()].reduce((sum, answer) => sum + answer.result.n_used, 0);
+    failed = n - wide.size;
+    reason = wideReason;
+  }
+  Object.assign(area, { complete: true, used, failed, reason });
+  if (combined && ahead !== area) {
+    // Joined on while loading: the frames on screen become the area's.
     join(area);
     return;
   }
-  ahead = area;
-  setStatus(summary);
-  applyView();
-  joinAhead();
+  if (combined) {
+    setStatus(summary);
+    applyView();
+    joinAhead();
+    return;
+  }
+  offer(area, early);
+  if (ahead === area) {
+    setStatus(summary);
+    applyView();
+  }
 }
 
 /**
- * Replaces the frames by those of a loaded next area with the sky under the view in place
- * (the view clamped into the area), and makes the link and RA/Dec fields name its centre.
+ * Replaces the frames by those of the next area with the sky under the view in place (the
+ * view clamped into the area), and makes the link and RA/Dec fields name its centre. While its
+ * frames hold fields copied from the loaded area they keep its stretch; before the area has
+ * loaded, the status keeps showing the load.
  */
 function join(area) {
   const { shift, texts } = area;
   const next = area.plan;
+  const already = plan === next;
   ahead = null;
   aheadFailed = null;
   frames = area.frames;
   plan = next;
-  stretch = computeStretch(frames.map(centrePixels));
-  view = clampView({
-    zoom: view.zoom, cx: view.cx - FIELD_PIXELS * shift.dx, cy: view.cy - FIELD_PIXELS * shift.dy,
-  }, grid);
+  if (area.complete && !frames.some((frame) => frame.copied)) {
+    stretch = computeStretch(frames.map(centrePixels));
+  }
+  if (!already) {
+    view = clampView({
+      zoom: view.zoom, cx: view.cx - FIELD_PIXELS * shift.dx, cy: view.cy - FIELD_PIXELS * shift.dy,
+    }, grid);
+  }
   current = Math.min(current, frames.length - 1);
   slider.max = String(frames.length - 1);
   if (frames.length < 2) differenceToggle.checked = false;
@@ -611,8 +728,10 @@ function join(area) {
     decInput.value = texts.dec;
   }
   history.replaceState(null, "", linkQuery(texts.ra, texts.dec, next.detector));
-  summary = summarise(next, area.used, area.failed, area.reason);
-  setStatus(summary);
+  if (area.complete) {
+    summary = summarise(next, area.used, area.failed, area.reason);
+    setStatus(joinStatus(summary, area.note));
+  }
   show(current);
 }
 
@@ -628,7 +747,7 @@ function joinAhead() {
  */
 function considerAhead(mx, my) {
   lastMove = [mx, my];
-  if (loading || plan === null || !surroundLoaded || !shouldPreload(plan) || !sky.hidden
+  if (loading || plan === null || !surroundLoaded() || !shouldPreload(plan) || !sky.hidden
     || Date.now() < aheadPausedUntil) return;
   const shift = aheadShift(view, grid, mx, my);
   if (shift === null || (shift.dx === 0 && shift.dy === 0)) return;
@@ -714,7 +833,7 @@ function move(dx, dy) {
     // started since the push cancels it.
     if (view !== pushedView || frames !== pushedFrames || !restLoadable()) return;
     if (retryable()) loadAround();
-    else loadNextArea({ dx, dy }, false, controller.signal);
+    else loadNextArea(pushShift(view, grid, dx, dy), false, controller.signal);
   }, REST_MS);
   return true;
 }
@@ -932,7 +1051,7 @@ playButton.addEventListener("click", () => {
     return;
   }
   playButton.textContent = "Pause";
-  timer = setInterval(() => show(nextIndex(current, frames.length)), PLAY_INTERVAL_MS);
+  timer = setInterval(playNext, PLAY_INTERVAL_MS);
 });
 
 markerToggle.addEventListener("change", () => {

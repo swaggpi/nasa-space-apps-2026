@@ -2,12 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  AHEAD_PIXELS, PRELOAD_MAX_EXPOSURES, WIDE_PIXELS, ZOOM_LEVELS, aheadShift, capNotice, centrePixels, clampView,
-  computeStretch, countRange, decodePixels, difference, fieldCorners, fieldTexts, formatPosition,
-  frameLabel, isClick, joinStatus, linkQuery, markerPercent, nextIndex, noDataNote,
-  offsetPosition, panStep, parseExample, parseLink, plural, previousIndex, retryDelay,
-  shiftedView, shouldPreload, stageBox, toDifferenceRGBA, toRGBA, validFrameBody, validPlan,
-  validWideBody, widenFrame, zoomStep,
+  AHEAD_PIXELS, MAX_SEAM_PX, PRELOAD_MAX_EXPOSURES, WIDE_PIXELS, ZOOM_LEVELS, aheadShift,
+  capNotice, centreOutside, centrePixels, clampView, computeStretch, countRange, decodePixels,
+  difference, fieldCorners, fieldTexts, fieldsInView, formatPosition, frameLabel, isClick,
+  joinStatus, linkQuery, markerPercent, nextIndex, noDataNote, notLoadedLayers, offsetPosition,
+  panStep, parseExample, parseLink, playbackNext, plural, previousIndex, pushShift,
+  requestOrder, retryDelay, sameVisits, seamOffset, shiftFrame, shiftedView, shouldPreload,
+  stageBox, toDifferenceRGBA, toRGBA, validFrameBody, validPlan, validWideBody, widenFrame,
+  withCentre, zoomStep,
 } from "../../src/spherex_viewer/static/lib.js";
 
 const SOURCE = 12;
@@ -751,14 +753,170 @@ test("aheadShift loads two fields on in the direction of a press near the edge",
   assert.equal(aheadShift(centre, 177, 0, 0), null);
 });
 
-test("aheadShift goes diagonal when the view is off centre across the press", () => {
-  // Up by more than a third of a field, then left: north-east; the view is held in y.
-  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 60 }, 177, -1, 0), { dx: -2, dy: -1 });
-  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 29 }, 177, -1, 0), { dx: -2, dy: -2 });
-  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 147 }, 177, -1, 0), { dx: -2, dy: 2 });
+test("aheadShift goes diagonal to the field row or column holding the view's centre", () => {
+  // Up by half a field or more, then left: north-east; the view is held in y.
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 58.5 }, 177, -1, 0), { dx: -2, dy: -1 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 29 }, 177, -1, 0), { dx: -2, dy: -1 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 147 }, 177, -1, 0), { dx: -2, dy: 1 });
   assert.deepEqual(aheadShift({ zoom: 1, cx: 140, cy: 120 }, 177, 0, 1), { dx: 1, dy: 2 });
-  // Less than a third of a field off centre across: straight on.
-  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 70 }, 177, -1, 0), { dx: -2, dy: 0 });
+  assert.deepEqual(aheadShift({ zoom: 4, cx: 81, cy: 6.875 }, 177, -1, 0), { dx: -2, dy: -1 });
+  // Less than half a field off centre across: straight on.
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 60 }, 177, -1, 0), { dx: -2, dy: 0 });
+  assert.deepEqual(aheadShift({ zoom: 1, cx: 81, cy: 117 }, 177, -1, 0), { dx: -2, dy: 0 });
+  // At 12' the view spans two fields: across, only at the grid's edge does a shift hold it.
+  assert.deepEqual(aheadShift({ zoom: 1 / 2, cx: 70, cy: 58.5 }, 177, -1, 0), { dx: -1, dy: -1 });
+  assert.deepEqual(aheadShift({ zoom: 1 / 2, cx: 70, cy: 70 }, 177, -1, 0), { dx: -1, dy: 0 });
+});
+
+test("with a view of at most one field, the field entered past the edge is the new centre, in "
+  + "every direction and off centre across it", () => {
+  const field = (c) => Math.floor((c + 0.5) / 59);
+  for (const zoom of [1, 2, 4]) {
+    const span = 59 / zoom;
+    for (const [mx, my] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+      for (const across of [-80, -59, -45, -29, -10, 0, 12, 30, 52, 59, 80]) {
+        let view = clampView({ zoom, cx: 88 + (my !== 0 ? across : 0),
+          cy: 88 + (mx !== 0 ? across : 0) }, 177);
+        const first = aheadShift(panStep(view, mx, my, 177).view, 177, mx, my);
+        while (!panStep(view, mx, my, 177).pushed) view = panStep(view, mx, my, 177).view;
+        const shift = pushShift(view, 177, mx, my);
+        const label = `zoom ${zoom} ${mx},${my} across ${across}`;
+        assert.deepEqual(aheadShift(view, 177, mx, my), shift, label);
+        if (first !== null) assert.deepEqual(first, shift, label);
+        assert.ok(centreOutside(shift), label);
+        // Joined on at the edge, one step on: the leading edge is in the new area's central
+        // field, and so is the view's centre across the movement.
+        const joined = shiftedView(view, 177, shift);
+        assert.ok(joined !== null, label);
+        const on = panStep(joined, mx, my, 177).view;
+        const lead = mx !== 0 ? on.cx + (mx * span) / 2 : on.cy + (my * span) / 2;
+        assert.equal(field(lead - (mx + my) * 0.5), 1, label);
+        assert.equal(field(mx !== 0 ? on.cy : on.cx), 1, label);
+      }
+    }
+  }
+});
+
+test("pushShift: the preload's area at a view of up to 12', one field on at 18'", () => {
+  assert.deepEqual(pushShift({ zoom: 1, cx: 29, cy: 88 }, 177, -1, 0), { dx: -2, dy: 0 });
+  assert.deepEqual(pushShift({ zoom: 2, cx: 161.75, cy: 30 }, 177, 1, 0), { dx: 2, dy: -1 });
+  assert.deepEqual(pushShift({ zoom: 1 / 2, cx: 58.5, cy: 88 }, 177, -1, 0), { dx: -1, dy: 0 });
+  assert.deepEqual(pushShift({ zoom: 1 / 3, cx: 88, cy: 88 }, 177, 0, -1), { dx: 0, dy: -1 });
+  assert.equal(centreOutside({ dx: -1, dy: 0 }), false);
+  assert.equal(centreOutside({ dx: 1, dy: 1 }), false);
+  assert.equal(centreOutside({ dx: 0, dy: 2 }), true);
+  assert.equal(centreOutside({ dx: -2, dy: 1 }), true);
+});
+
+test("sameVisits needs as many frames with identical date labels in order", () => {
+  assert.equal(sameVisits(["a", "b"], ["a", "b"]), true);
+  assert.equal(sameVisits([], []), true);
+  assert.equal(sameVisits(["a", "b"], ["a"]), false);
+  assert.equal(sameVisits(["a", "b"], ["b", "a"]), false);
+  assert.equal(sameVisits(["2025-05-06"], ["2025-05-06 \u2013 2025-05-07"]), false);
+});
+
+test("requestOrder puts the frame on screen first, then the others in time order", () => {
+  assert.deepEqual(requestOrder(4, 2), [2, 0, 1, 3]);
+  assert.deepEqual(requestOrder(4, 0), [0, 1, 2, 3]);
+  assert.deepEqual(requestOrder(3, -1), [0, 1, 2]);
+  assert.deepEqual(requestOrder(3, 5), [0, 1, 2]);
+  assert.deepEqual(requestOrder(0, 0), []);
+});
+
+test("seamOffset agrees with astropy's TAN WCS at the corners of the new central field", () => {
+  // [ra, dec, dx, dy, next centre as searched, misalignment in px from astropy.wcs]
+  const cases = [
+    [133.795129, -7.245147, -2, 0, 133.998334, -7.245102, 0.018849936917801277],
+    [180, 30, 2, 0, 179.767233, 29.999795, 0.08501887208399705],
+    [10, 58, -2, 0, 10.380398, 57.999433, 0.235165353177472],
+    [10, 60, -2, 0, 10.40316, 59.999386, 0.2544339366496928],
+    [200, -60, 2, 1, 199.595608, -60.100175, 0.25525905535691773],
+    [300, 75, 0, 2, 300.0, 74.798417, 0.0007967512605499429],
+    [300, 75, 1, 0, 299.610577, 74.999669, 0.2739940124884397],
+    [5, 85, -2, -1, 7.359036, 85.096656, 1.7113732122629088],
+    [359.99, 45, 2, 0, 359.70492, 44.999645, 0.14694860982412444],
+  ];
+  for (const [ra, dec, dx, dy, ra1, dec1, expected] of cases) {
+    const c = offsetPosition(ra, dec, 59 * dx, 59 * dy);
+    assert.deepEqual(fieldTexts(c.ra, c.dec), fieldTexts(ra1, dec1));
+    const actual = seamOffset({ ra, dec }, { ra: ra1, dec: dec1 }, { dx, dy });
+    assert.ok(Math.abs(actual - expected) < 1e-6, `${ra},${dec}: ${actual} vs ${expected}`);
+  }
+  assert.equal(MAX_SEAM_PX, 0.25);
+});
+
+test("fieldsInView lists the fields a view overlaps, north row first", () => {
+  assert.deepEqual(fieldsInView({ zoom: 1, cx: 88, cy: 88 }, 177), [4]);
+  assert.deepEqual(fieldsInView({ zoom: 1, cx: 81, cy: 88 }, 177), [3, 4]);
+  assert.deepEqual(fieldsInView({ zoom: 1 / 3, cx: 88, cy: 88 }, 177), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.deepEqual(fieldsInView({ zoom: 2, cx: 29, cy: 160 }, 177), [6]);
+  assert.deepEqual(fieldsInView({ zoom: 2, cx: 20, cy: 20 }, 59), [0]);
+});
+
+test("playbackNext skips frames lacking a field in view that the frame on screen shows", () => {
+  const full = [1, 1, 1, 1, 1, 1, 1, 1, 1];
+  const centre = [null, null, null, null, 1, null, null, null, null];
+  const none = new Array(9).fill(null);
+  const counts = [full, centre, full, centre];
+  assert.equal(playbackNext(counts, 0, [4]), 1);
+  assert.equal(playbackNext(counts, 0, [3, 4]), 2);
+  assert.equal(playbackNext(counts, 2, [3, 4]), 0);
+  // From a frame lacking the field, any frame may follow.
+  assert.equal(playbackNext(counts, 1, [3, 4]), 2);
+  assert.equal(playbackNext(counts, 3, [3, 4]), 0);
+  // Only the frame on screen has it: it stays.
+  assert.equal(playbackNext([centre, none, none], 0, [4]), 0);
+  assert.equal(playbackNext([centre], 0, [4]), 0);
+  assert.equal(playbackNext([[5], [6]], 1, [0]), 0);
+});
+
+test("notLoadedLayers draws one plain layer per field not loaded, in its third of the grid", () => {
+  assert.equal(notLoadedLayers([1, 1, 1, 1, 1, 1, 1, 1, 1]), "");
+  assert.equal(notLoadedLayers([7]), "");
+  const layer = (x, y) => `linear-gradient(var(--panel) 0 0) ${x}% ${y}% `
+    + "/ calc(100% / 3) calc(100% / 3) no-repeat, ";
+  assert.equal(notLoadedLayers([null, 1, 1, 1, 1, 1, 1, 1, null]), layer(0, 0) + layer(100, 100));
+  assert.equal(notLoadedLayers([1, 1, 1, 1, 1, null, 1, null, 1]), layer(100, 50) + layer(50, 100));
+});
+
+test("withCentre puts a 59-px field at the centre of a wide frame with its count", () => {
+  const frame = { pixels: new Array(177 * 177).fill(2), nFields: new Array(9).fill(3),
+    nUsed: 3, dates: "d" };
+  const narrow = Array.from({ length: 59 * 59 }, (_, i) => (i === 4 ? null : i + 10));
+  const out = withCentre(frame, narrow, 9);
+  assert.deepEqual(centrePixels({ ...out, width: 177 }), narrow);
+  assert.deepEqual(out.nFields, [3, 3, 3, 3, 9, 3, 3, 3, 3]);
+  assert.equal(out.nUsed, 9);
+  assert.equal(out.dates, "d");
+  assert.equal(out.pixels.filter((v) => v === 2).length, 177 * 177 - 59 * 59);
+  assert.deepEqual(frame.nFields, new Array(9).fill(3));
+  assert.equal(frame.pixels[88 * 177 + 88], 2);
+});
+
+test("shiftFrame copies the fields two areas share pixel for pixel; the rest is not loaded", () => {
+  const value = (x, y) => y * 1000 + x;
+  const frame = { pixels: Array.from({ length: 177 * 177 }, (_, i) => value(i % 177,
+    Math.floor(i / 177))), nFields: [0, 1, 2, 3, 4, 5, 6, 7, 8], nUsed: 4, dates: "d",
+    width: 177, height: 177, uris: ["u"], marker: { x: 1, y: 2 } };
+  const at = (f, x, y) => f.pixels[y * 177 + x];
+  // Two fields east (left): the loaded area's east column is the new area's west column.
+  const east = shiftFrame(frame, { dx: -2, dy: 0 });
+  assert.deepEqual(east.nFields, [null, null, 0, null, null, 3, null, null, 6]);
+  assert.equal(at(east, 118, 0), value(0, 0));
+  assert.equal(at(east, 176, 176), value(58, 176));
+  assert.equal(at(east, 117, 88), null);
+  assert.equal(east.pixels.filter((v) => v !== null).length, 59 * 177);
+  assert.equal(east.copied, true);
+  assert.equal("marker" in east, false);
+  assert.deepEqual([east.dates, east.uris, east.width], ["d", ["u"], 177]);
+  // Two fields south and one west: the new area's north-west field is the loaded south-east.
+  const diagonal = shiftFrame(frame, { dx: 1, dy: 2 });
+  assert.deepEqual(diagonal.nFields, [7, 8, null, null, null, null, null, null, null]);
+  assert.equal(at(diagonal, 0, 0), value(59, 118));
+  assert.equal(at(diagonal, 117, 58), value(176, 176));
+  assert.equal(at(diagonal, 118, 0), null);
+  assert.equal(at(diagonal, 0, 59), null);
 });
 
 test("shiftedView holds the view over the shifted area only when it fits there", () => {

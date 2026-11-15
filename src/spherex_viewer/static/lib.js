@@ -1,8 +1,8 @@
 // Pure helpers for the SPHEREx viewer page: common brightness stretch, pixel conversion,
 // status, date and position texts, frame stepping, marker placement, validation of the
 // bundled example and of API answers, the sky-map selection, the retry delay, the difference
-// view, result links, and zooming and moving the view over the loaded grid. No DOM access;
-// imported by app.js and by Node tests.
+// view, result links, zooming and moving the view over the loaded grid, and the order and
+// geometry of loading the next area. No DOM access; imported by app.js and by Node tests.
 
 function median(sorted) {
   const n = sorted.length;
@@ -321,9 +321,10 @@ export const AHEAD_PIXELS = 1.5 * FIELD_PIXELS;
  * new area's centre in whole fields from the loaded one, or null for no preload. Along the
  * press, the area moves two fields when the view spans at most one field (one when it spans
  * at most two; none when wider): the most that still holds the view once it reaches the
- * loaded edge, so it joins on there. Across the press, it moves the most whole fields that
- * still hold the view where it is, towards the side the view is off centre by at least a
- * third of a field.
+ * loaded edge, so it joins on there. Across the press, it moves to the field row (or column)
+ * that holds the view's centre (half a field off centre counts as the next one), unless the
+ * area would then not hold the view. With a view of at most one field, the field the view
+ * enters past the loaded edge is thus the new area's centre.
  * @param {{zoom: number, cx: number, cy: number}} view
  * @param {number} grid pixels per side of the loaded grid
  * @param {number} mx -1, 0 or 1: the press's movement (right = west)
@@ -341,14 +342,105 @@ export function aheadShift(view, grid, mx, my) {
   const axis = (c, m) => {
     if (m !== 0) return (m > 0 ? hi - c : c - lo) <= AHEAD_PIXELS ? m * Math.min(along, 2) : null;
     const offset = c - centre;
-    if (Math.abs(offset) < FIELD_PIXELS / 3) return 0;
-    const behind = offset > 0 ? c - lo : hi - c;
-    return Math.sign(offset) * Math.min(2, Math.floor((behind + 1e-9) / FIELD_PIXELS));
+    const fields = Math.floor(Math.abs(offset) / FIELD_PIXELS + 0.5 + 1e-9);
+    const nearest = offset < 0 && fields > 0 ? -fields : fields;
+    const held = c - FIELD_PIXELS * nearest;
+    return held >= lo - 1e-9 && held <= hi + 1e-9 ? nearest : 0;
   };
   const dx = axis(view.cx, mx);
   const dy = axis(view.cy, my);
   if (dx === null || dy === null) return null;
   return { dx, dy };
+}
+
+/**
+ * Where to load after an arrow key rested while pushing at the edge of the loaded area: the
+ * area a preload would load at that view (its centre is the field the view enters when the
+ * view spans at most one field), else, zoomed out to the whole area, one field on in the
+ * direction of the push.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid (177)
+ * @param {number} dx -1, 0 or 1: the push (right = west)
+ * @param {number} dy -1, 0 or 1 (down = south)
+ * @returns {{dx: number, dy: number}} fields right (west) and down (south)
+ */
+export function pushShift(view, grid, dx, dy) {
+  return aheadShift(view, grid, dx, dy) ?? { dx, dy };
+}
+
+/**
+ * Whether the centre of the area `shift` fields away lies outside the loaded 3 x 3 fields,
+ * so that its own 6' frames add sky that is not loaded yet.
+ * @param {{dx: number, dy: number}} shift
+ * @returns {boolean}
+ */
+export function centreOutside(shift) {
+  return Math.max(Math.abs(shift.dx), Math.abs(shift.dy)) >= 2;
+}
+
+/**
+ * Whether two areas hold the same visits: as many frames, with identical date labels in order.
+ * @param {Array<string>} a date labels of one area's frames
+ * @param {Array<string>} b date labels of the other's
+ * @returns {boolean}
+ */
+export function sameVisits(a, b) {
+  return a.length === b.length && a.every((label, i) => label === b[i]);
+}
+
+/**
+ * Order in which to request the frames of a load: the frame on screen first, then the others
+ * in time order.
+ * @param {number} count number of frames
+ * @param {number} first index of the frame on screen; -1 (or out of range) for none
+ * @returns {Array<number>} frame indices
+ */
+export function requestOrder(count, first) {
+  const all = Array.from({ length: count }, (_, i) => i);
+  return first >= 0 && first < count ? [first, ...all.filter((i) => i !== first)] : all;
+}
+
+/** Largest misalignment, in pixels, allowed at the seam between two areas' fields. */
+export const MAX_SEAM_PX = 0.25;
+
+/**
+ * Tangent-plane offsets of a sky position from a centre on the north-up gnomonic (TAN) plane;
+ * the inverse of fromTangent.
+ * @returns {[number, number]} [xi towards east, eta towards north] in radians
+ */
+function toTangent(raDeg, decDeg, ra, dec) {
+  const d0 = decDeg * RAD;
+  const d = dec * RAD;
+  const da = (ra - raDeg) * RAD;
+  const denom = Math.sin(d) * Math.sin(d0) + Math.cos(d) * Math.cos(d0) * Math.cos(da);
+  return [
+    (Math.cos(d) * Math.sin(da)) / denom,
+    (Math.sin(d) * Math.cos(d0) - Math.cos(d) * Math.sin(d0) * Math.cos(da)) / denom,
+  ];
+}
+
+/**
+ * Misalignment at the seam between the loaded area's grid and the grid of the area `shift`
+ * fields away: the largest distance, in pixels, over the corners of the new area's central
+ * field, between where the new grid puts a point and where the loaded grid, moved by the
+ * whole fields of the shift, puts it. Exact TAN arithmetic on both tangent planes; the error
+ * grows linearly from the new centre, so the corners bound it along the seam.
+ * @param {{ra: number, dec: number}} from centre of the loaded area, ICRS degrees
+ * @param {{ra: number, dec: number}} to centre of the new area (as its search answered)
+ * @param {{dx: number, dy: number}} shift fields right (west) and down (south)
+ * @returns {number} pixels
+ */
+export function seamOffset(from, to, shift) {
+  const scale = (PIXEL_SCALE_ARCSEC / 3600) * RAD;
+  const half = FIELD_PIXELS / 2;
+  let worst = 0;
+  for (const [u, v] of [[-half, -half], [half, -half], [-half, half], [half, half]]) {
+    const sky = offsetPosition(from.ra, from.dec,
+      FIELD_PIXELS * shift.dx + u, FIELD_PIXELS * shift.dy + v);
+    const [xi, eta] = toTangent(to.ra, to.dec, sky.ra, sky.dec);
+    worst = Math.max(worst, Math.hypot(-xi / scale - u, -eta / scale - v));
+  }
+  return worst;
 }
 
 /**
@@ -384,6 +476,26 @@ export function stageBox(view, grid) {
 }
 
 /**
+ * The fields a view overlaps.
+ * @param {{zoom: number, cx: number, cy: number}} view
+ * @param {number} grid pixels per side of the loaded grid
+ * @returns {Array<number>} field indices, row-major, north row first (0..8 on a 177 grid; 0 on
+ *   a 59 grid)
+ */
+export function fieldsInView(view, grid) {
+  if (grid === FIELD_PIXELS) return [0];
+  const span = FIELD_PIXELS / view.zoom;
+  const eps = 1e-6;
+  const lo = (c) => Math.max(0, Math.floor((c + 0.5 - span / 2 + eps) / FIELD_PIXELS));
+  const hi = (c) => Math.min(2, Math.floor((c + 0.5 + span / 2 - eps) / FIELD_PIXELS));
+  const fields = [];
+  for (let row = lo(view.cy); row <= hi(view.cy); row++) {
+    for (let col = lo(view.cx); col <= hi(view.cx); col++) fields.push(3 * row + col);
+  }
+  return fields;
+}
+
+/**
  * Range of exposure counts over the loaded fields a view overlaps.
  * @param {Array<number|null>} nFields counts per field, row-major, north row first (one on a
  *   59 grid, nine on a 177 grid); null for a field not loaded yet
@@ -393,22 +505,39 @@ export function stageBox(view, grid) {
  *   loaded
  */
 export function countRange(nFields, view, grid) {
-  if (grid === FIELD_PIXELS) return [nFields[0], nFields[0]];
-  const span = FIELD_PIXELS / view.zoom;
-  const eps = 1e-6;
-  const lo = (c) => Math.max(0, Math.floor((c + 0.5 - span / 2 + eps) / FIELD_PIXELS));
-  const hi = (c) => Math.min(2, Math.floor((c + 0.5 + span / 2 - eps) / FIELD_PIXELS));
-  let min = Infinity;
-  let max = -Infinity;
-  for (let row = lo(view.cy); row <= hi(view.cy); row++) {
-    for (let col = lo(view.cx); col <= hi(view.cx); col++) {
-      const n = nFields[3 * row + col];
-      if (n === null) continue;
-      min = Math.min(min, n);
-      max = Math.max(max, n);
-    }
+  const counts = fieldsInView(view, grid).map((f) => nFields[f]).filter((n) => n !== null);
+  return counts.length === 0 ? [null, null] : [Math.min(...counts), Math.max(...counts)];
+}
+
+/**
+ * The frame playback shows after `current`: the next one, wrapping, that has loaded every
+ * field in view that the frame on screen has loaded, so playback never turns sky into "not
+ * loaded"; frames still missing such a field are skipped (the frame on screen if all are).
+ * @param {Array<Array<number|null>>} counts each frame's per-field counts (null: not loaded)
+ * @param {number} current index of the frame on screen
+ * @param {Array<number>} fields the fields in view, from fieldsInView
+ * @returns {number}
+ */
+export function playbackNext(counts, current, fields) {
+  const shown = counts[current];
+  for (let k = 1; k < counts.length; k++) {
+    const i = (current + k) % counts.length;
+    if (fields.every((f) => shown[f] === null || counts[i][f] !== null)) return i;
   }
-  return min === Infinity ? [null, null] : [min, max];
+  return current;
+}
+
+/**
+ * CSS background layers that draw the not-loaded fields of a wide frame plain, each followed
+ * by a comma, to go in front of the no-data checkerboard; "" when every field is loaded.
+ * @param {Array<number|null>} nFields per-field counts, row-major, north row first
+ * @returns {string}
+ */
+export function notLoadedLayers(nFields) {
+  if (nFields.length !== 9) return "";
+  return nFields.map((n, i) => (n !== null ? ""
+    : `linear-gradient(var(--panel) 0 0) ${50 * (i % 3)}% ${50 * Math.floor(i / 3)}% `
+      + "/ calc(100% / 3) calc(100% / 3) no-repeat, ")).join("");
 }
 
 /**
@@ -419,19 +548,58 @@ export function countRange(nFields, view, grid) {
  * @returns {object} the same frame with width and height WIDE_PIXELS
  */
 export function widenFrame(frame) {
-  const pixels = new Array(WIDE_PIXELS * WIDE_PIXELS).fill(null);
-  for (let y = 0; y < FIELD_PIXELS; y++) {
-    for (let x = 0; x < FIELD_PIXELS; x++) {
-      const value = frame.pixels[y * FIELD_PIXELS + x];
-      pixels[(y + FIELD_PIXELS) * WIDE_PIXELS + x + FIELD_PIXELS] = value;
-    }
-  }
-  const nFields = [null, null, null, null, frame.nUsed, null, null, null, null];
-  const widened = { ...frame, pixels, width: WIDE_PIXELS, height: WIDE_PIXELS, nFields };
+  const empty = { ...frame, pixels: new Array(WIDE_PIXELS * WIDE_PIXELS).fill(null),
+    width: WIDE_PIXELS, height: WIDE_PIXELS, nFields: new Array(9).fill(null) };
+  const widened = withCentre(empty, frame.pixels, frame.nUsed);
   if (frame.marker !== undefined) {
     widened.marker = { x: frame.marker.x + FIELD_PIXELS, y: frame.marker.y + FIELD_PIXELS };
   }
   return widened;
+}
+
+/**
+ * A wide frame with a 59x59 field put at its centre, with that field's exposure count.
+ * @param {{pixels: Array<number|null>, nFields: Array<number|null>}} frame on the 177 grid
+ * @param {Array<number|null>} pixels the central field, row-major
+ * @param {number} nUsed exposures of the central field
+ * @returns {object} a new frame; `frame` is unchanged
+ */
+export function withCentre(frame, pixels, nUsed) {
+  const out = [...frame.pixels];
+  for (let y = 0; y < FIELD_PIXELS; y++) {
+    for (let x = 0; x < FIELD_PIXELS; x++) {
+      out[(y + FIELD_PIXELS) * WIDE_PIXELS + x + FIELD_PIXELS] = pixels[y * FIELD_PIXELS + x];
+    }
+  }
+  const nFields = [...frame.nFields];
+  nFields[4] = nUsed;
+  return { ...frame, pixels: out, nFields, nUsed };
+}
+
+/**
+ * A wide frame of the area `shift` fields away, before any of its own pixels: the fields it
+ * shares with `frame` (the loaded area's frame of the same visit) copied pixel for pixel,
+ * the others not loaded. Marked `copied`: its pixels lie on the loaded area's grid.
+ * @param {{pixels: Array<number|null>, nFields: Array<number|null>}} frame on the 177 grid
+ * @param {{dx: number, dy: number}} shift fields right (west) and down (south)
+ * @returns {object} a new frame without a marker
+ */
+export function shiftFrame(frame, shift) {
+  const pixels = new Array(WIDE_PIXELS * WIDE_PIXELS).fill(null);
+  const ox = FIELD_PIXELS * shift.dx;
+  const oy = FIELD_PIXELS * shift.dy;
+  for (let y = Math.max(0, -oy); y < Math.min(WIDE_PIXELS, WIDE_PIXELS - oy); y++) {
+    for (let x = Math.max(0, -ox); x < Math.min(WIDE_PIXELS, WIDE_PIXELS - ox); x++) {
+      pixels[y * WIDE_PIXELS + x] = frame.pixels[(y + oy) * WIDE_PIXELS + x + ox];
+    }
+  }
+  const nFields = Array.from({ length: 9 }, (_, i) => {
+    const row = Math.floor(i / 3) + shift.dy;
+    const col = (i % 3) + shift.dx;
+    return row >= 0 && row < 3 && col >= 0 && col < 3 ? frame.nFields[3 * row + col] : null;
+  });
+  const { marker, ...rest } = frame;
+  return { ...rest, pixels, nFields, copied: true };
 }
 
 /**
