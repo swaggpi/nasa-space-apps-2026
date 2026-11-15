@@ -613,7 +613,8 @@ test("the body holds exactly the agreed elements, in order, and nothing else", {
     assert.equal(await page.getAttribute("#marker", "aria-hidden"), "true");
     assert.deepEqual(await page.$$eval("#detector option", (els) => els.map((el) => el.value)),
       ["D1", "D2", "D3", "D4", "D5", "D6"]);
-    assert.equal(await page.inputValue("#detector"), "D2");
+    // The search fields start on the example.
+    assert.equal(await page.inputValue("#detector"), "D6");
     assert.deepEqual(await page.$eval("#image", (el) => [el.width, el.height]), [SIZE, SIZE]);
     assert.equal(await page.$eval("#ack", (el) => el.textContent.replace(/\s+/g, " ").trim()),
       ACK);
@@ -643,9 +644,9 @@ test("typing RA and Dec, choosing a detector and pressing Enter searches with no
     const { page, log } = await openPage({
       search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
     });
-    await page.click("#ra");
+    await page.click("#ra", { clickCount: 3 });
     await page.keyboard.type(RA);
-    await page.click("#dec");
+    await page.click("#dec", { clickCount: 3 });
     await page.keyboard.type(DEC);
     await page.selectOption("#detector", "D4");
     await page.focus("#dec");
@@ -1485,7 +1486,8 @@ test("a click selects: the position under it is shown and the 6' field is outlin
   await page.waitForTimeout(500);
   assert.deepEqual(log.searches, []);
   assert.deepEqual(log.frames, []);
-  assert.equal(await page.inputValue("#ra"), "");
+  assert.deepEqual([await page.inputValue("#ra"), await page.inputValue("#dec")],
+    [c.text[1], c.text[2]]);
   assert.equal(await page.isVisible("#sky"), true);
   assertCleanMapRun(log);
 });
@@ -1596,11 +1598,34 @@ test("a click on a challenge target's marker selects the target with its detecto
   assertCleanMapRun(log);
 });
 
-test("closing the map without searching leaves the page as it was; reopening starts afresh",
-  { timeout: TIMEOUT }, async () => {
+test("Show after a map selection searches the selected position; Show with empty RA and Dec "
+  + "sends nothing and keeps the example", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES, { detector: "D6" });
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+  });
+  await page.fill("#ra", "");
+  await page.fill("#dec", "");
+  await page.click("#submit");
+  await page.waitForTimeout(300);
+  assert.deepEqual(log.searches, []);
+  assert.equal(await text(page, "#name"), "Test Star");
+  assert.deepEqual(await canvasPixels(page), exampleRGBA(0));
+
+  await openMap(page);
+  const pick = await clickMap(page, 20, 20);
+  await page.click("#submit");
+  assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+  const params = log.searches[0].searchParams;
+  assert.deepEqual([params.get("ra"), params.get("dec")], [pick.text[1], pick.text[2]]);
+  assertCleanMapRun(log);
+});
+
+test("closing the map without searching leaves the selection in RA and Dec and the view as it "
+  + "was; reopening starts afresh", { timeout: TIMEOUT }, async () => {
     const { page, log } = await openPage({});
     await openMap(page);
-    await clickMap(page, 20, 20);
+    const pick = await clickMap(page, 20, 20);
     await page.click("#sky-close");
     assert.equal(await page.isVisible("#sky"), false);
     for (const id of ["#image", "#play", "#slider", "#date"]) {
@@ -1610,8 +1635,8 @@ test("closing the map without searching leaves the page as it was; reopening sta
     assert.equal(await text(page, "#name"), "Test Star");
     assert.equal(await dateText(page), EXAMPLE_LABELS[0]);
     assert.equal(await statusText(page), "");
-    assert.equal(await page.inputValue("#ra"), "");
-    assert.equal(await page.inputValue("#dec"), "");
+    assert.equal(await page.inputValue("#ra"), pick.text[1]);
+    assert.equal(await page.inputValue("#dec"), pick.text[2]);
     assert.equal(await page.getAttribute("#pick", "aria-expanded"), "false");
     assert.equal(await page.evaluate(() => document.activeElement?.id), "pick");
 

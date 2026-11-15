@@ -300,6 +300,13 @@ async function loadExample(signal) {
   }
   shown = { ra: data.ra_deg, dec: data.dec_deg };
   example = { ra: data.ra_deg, dec: data.dec_deg, detector: data.detector };
+  // The search fields start on the example, so Show repeats it in another detector.
+  if (raInput.value === "" && decInput.value === "") {
+    const texts = fieldTexts(example.ra, example.dec);
+    raInput.value = texts.ra;
+    decInput.value = texts.dec;
+    detectorSelect.value = example.detector;
+  }
   frames = parsed.frames;
   stretch = computeStretch(frames.map(centrePixels));
   slider.max = String(frames.length - 1);
@@ -950,6 +957,8 @@ function select(raDeg, decDeg) {
   map.centre.addSources([map.A.source(raDeg, decDeg)]);
   skySelection.textContent = `RA ${selection.ra}\u00b0, Dec ${selection.dec}\u00b0`;
   skySearch.disabled = false;
+  raInput.value = selection.ra;
+  decInput.value = selection.dec;
 }
 
 /** The target whose marker is nearest to map pixel (x, y), within TARGET_HIT_PX, if any. */
@@ -1059,8 +1068,6 @@ skyClose.addEventListener("click", () => {
 });
 
 skySearch.addEventListener("click", () => {
-  raInput.value = selection.ra;
-  decInput.value = selection.dec;
   history.replaceState(null, "", linkQuery(raInput.value, decInput.value, detectorSelect.value));
   search(raInput.value, decInput.value, detectorSelect.value);
   // The map, and this button in it, are now hidden; the keys act from where the map was opened.

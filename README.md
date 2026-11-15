@@ -24,7 +24,9 @@ The page shows the sky image with Play/Pause, previous and next frame and a time
 and the date (or date range) and exposure count of the shown frame. The target panel beside it
 (below it on narrow screens) names what is shown, gives a short hint for the example, toggles
 the marker and the difference view, and always shows the search: "Pick on sky map", the RA and
-Dec fields, the detector with its wavelength range (D2 by default) and "Show".
+Dec fields, the detector with its wavelength range and "Show". The fields start on the example
+(Barnard's Star, D6), so "Show" with another detector searches it there; empty fields are not
+submitted.
 
 The − and + buttons beside the timeline, or the − and + keys, zoom the image while it plays,
 from 18′ to 1.5′ across; the arrow keys move the view (Left is east, Up is north). They act at
@@ -94,7 +96,7 @@ After a search from the RA/Dec fields with Enter has been accepted, the focus mo
 near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
 scroll, pinch or use −/+ to zoom between the whole sky and 2′. A click or tap selects a
 position: the map outlines the 6′ field around it that a search would fetch and shows its
-RA/Dec. The five challenge targets listed below are marked and labelled on the map; a click on
+RA/Dec, which also fill the RA and Dec fields. The five challenge targets listed below are marked and labelled on the map; a click on
 one selects it at its exact position and sets its detector. "Search here" runs the search
 there with the chosen detector, exactly as if the coordinates had been typed; "Close map"
 returns without searching. Selecting alone never searches.
