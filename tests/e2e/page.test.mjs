@@ -3548,8 +3548,10 @@ test("each direction loads its own neighbour ahead; off centre across the move i
       assert.deepEqual(searchedAt(log.searches[1]),
         [fieldTexts(c.ra, c.dec).ra, fieldTexts(c.ra, c.dec).dec, "D2"], key);
       if (key === "ArrowUp") {
-        assert.equal(await waitForStatus(page, (t) => t.startsWith("The next area")),
-          "The next area could not be loaded: The archive search failed. Try again later.");
+        // The failure follows the summary of the frames still shown.
+        assert.equal(await waitForStatus(page, (t) => t.includes("The next area")),
+          "3 frames from 42 of 42 exposures. "
+          + "The next area could not be loaded: The archive search failed. Try again later.");
         await press(page, "ArrowUp", 4);
         await assertStage(page, { zoom: 1, cx: 88, cy: 53 }, WIDE);
         await page.waitForTimeout(300);
