@@ -94,9 +94,10 @@ After a search from the RA/Dec fields with Enter has been accepted, the focus mo
 near-infrared like SPHEREx), centred on the position shown, about 1.5° across. Drag to pan,
 scroll, pinch or use −/+ to zoom between the whole sky and 2′. A click or tap selects a
 position: the map outlines the 6′ field around it that a search would fetch and shows its
-RA/Dec. "Search here" runs the search there with the chosen detector, exactly as if the
-coordinates had been typed; "Close map" returns without searching. Selecting alone never
-searches.
+RA/Dec. The five challenge targets listed below are marked and labelled on the map; a click on
+one selects it at its exact position and sets its detector. "Search here" runs the search
+there with the chosen detector, exactly as if the coordinates had been typed; "Close map"
+returns without searching. Selecting alone never searches.
 
 The map uses [Aladin Lite](https://github.com/cds-astro/aladin-lite) 3.8.2 (CDS, Strasbourg),
 vendored unmodified as `src/spherex_viewer/static/vendor/aladin.js` with its licence (GNU LGPL

@@ -1563,6 +1563,39 @@ test("Search here searches the selection with the current detector, closes the m
   assertCleanMapRun(log);
 });
 
+test("a click on a challenge target's marker selects the target with its detector; Search here "
+  + "searches it", { timeout: TIMEOUT }, async () => {
+  const plan = makePlan(THREE_FRAMES, { detector: "D6" });
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }), frame: frameOk(plan),
+  });
+  // The map opens centred on the example, Barnard's Star, where its marker is. A plain click
+  // 8 px away would select a position about 0.002 degrees off.
+  await openMap(page);
+  const barnard = fieldTexts(269.4462683, 4.7682045);
+  const pick = await clickMap(page, 6, -5);
+  assert.deepEqual([pick.text[1], pick.text[2]], [barnard.ra, barnard.dec]);
+  assert.equal(await page.inputValue("#detector"), "D6");
+  await page.waitForTimeout(300);
+  assert.deepEqual(log.searches, []);
+  await page.click("#sky-search");
+  assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+  const params = log.searches[0].searchParams;
+  assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
+    [barnard.ra, barnard.dec, "D6"]);
+
+  // The stub plan is centred on WISE 0855 (08h55m10.831s, -7d14m42.53s), where the map reopens.
+  await page.selectOption("#detector", "D1");
+  await openMap(page);
+  // A click in the same instant as reopening can reach the map before it has moved.
+  await page.waitForTimeout(500);
+  const wise = await clickMap(page, -5, 6);
+  assert.deepEqual([wise.text[1], wise.text[2]], ["133.795129", "-7.245147"]);
+  assert.equal(await page.inputValue("#detector"), "D6");
+  assert.equal(log.searches.length, 1);
+  assertCleanMapRun(log);
+});
+
 test("closing the map without searching leaves the page as it was; reopening starts afresh",
   { timeout: TIMEOUT }, async () => {
     const { page, log } = await openPage({});

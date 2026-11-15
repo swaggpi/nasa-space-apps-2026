@@ -30,6 +30,19 @@ const MAP_MAX_FOV_DEG = 359;
 // Shown when no position is known yet (the example failed): the Galactic centre, whole sky.
 const MAP_FALLBACK = { ra: 266.405, dec: -28.936, fov: MAP_MAX_FOV_DEG };
 const SELECTION_COLOR = "rgb(255, 184, 28)";
+// The challenge's test targets, marked on the sky map; clicking one selects it with its detector.
+// WISE 0855 is 08h55m10.831s, -7d14m42.53s, converted by the server's parse_ra and parse_dec.
+const TARGETS = [
+  { name: "Barnard's Star", ra: 269.4462683, dec: 4.7682045, detector: "D6" },
+  { name: "Epsilon Indi B", ra: 331.0965743, dec: -56.8010859, detector: "D5" },
+  { name: "WISE 0855", ra: 133.79512917, dec: -7.24514722, detector: "D6" },
+  { name: "RW Aurigae", ra: 76.9560812, dec: 30.40120459, detector: "D5" },
+  { name: "R Draconis", ra: 248.16737837, dec: 66.75500675, detector: "D6" },
+];
+const TARGET_COLOR = "rgb(80, 220, 255)";
+const TARGET_SIZE_PX = 18;
+// A click this close to a target's marker (CSS pixels) selects the target.
+const TARGET_HIT_PX = 12;
 const DIFFERENCE_LABEL =
   "Difference between the selected frame and the other frames, north up, east left";
 // How long an arrow key must rest at the edge of the loaded area before the next one loads.
@@ -909,6 +922,13 @@ function createMap(A, view) {
     hoverColor: SELECTION_COLOR };
   const field = A.graphicOverlay({ ...colors, lineWidth: 2 });
   aladin.addOverlay(field);
+  // Read-only, so Aladin neither hovers nor selects them; the pointerup handler hit-tests them.
+  const targets = A.catalog({
+    color: TARGET_COLOR, shape: "circle", sourceSize: TARGET_SIZE_PX, readOnly: true,
+    displayLabel: true, labelColumn: "name", labelFont: "13px sans-serif",
+  });
+  aladin.addCatalog(targets);
+  targets.addSources(TARGETS.map((t) => A.source(t.ra, t.dec, { name: t.name })));
   const centre = A.catalog({ ...colors, shape: "cross", sourceSize: 14 });
   aladin.addCatalog(centre);
   return { A, aladin, field, centre };
@@ -930,6 +950,23 @@ function select(raDeg, decDeg) {
   map.centre.addSources([map.A.source(raDeg, decDeg)]);
   skySelection.textContent = `RA ${selection.ra}\u00b0, Dec ${selection.dec}\u00b0`;
   skySearch.disabled = false;
+}
+
+/** The target whose marker is nearest to map pixel (x, y), within TARGET_HIT_PX, if any. */
+function targetAt(x, y) {
+  let nearest;
+  let best = TARGET_HIT_PX;
+  for (const target of TARGETS) {
+    // Aladin 3.8.2's world2pix fails when given a frame name; the map's frame is ICRS.
+    const pixel = map.aladin.world2pix(target.ra, target.dec);
+    if (!pixel) continue;
+    const distance = Math.hypot(pixel[0] - x, pixel[1] - y);
+    if (distance <= best) {
+      best = distance;
+      nearest = target;
+    }
+  }
+  return nearest;
 }
 
 function showMap(open) {
@@ -993,6 +1030,12 @@ skyMap.addEventListener("pointerup", (event) => {
   const rect = skyMap.getBoundingClientRect();
   const x = release.x - rect.left;
   const y = release.y - rect.top;
+  const target = targetAt(x, y);
+  if (target !== undefined) {
+    detectorSelect.value = target.detector;
+    select(target.ra, target.dec);
+    return;
+  }
   const { aladin } = map;
   let position;
   try {
