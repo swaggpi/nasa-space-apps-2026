@@ -30,28 +30,57 @@ The − and + buttons beside the timeline, or the − and + keys, zoom the image
 from 18′ to 1.5′ across; the arrow keys move the view (Left is east, Up is north). They act at
 once: after the last frame of a search has loaded, the page loads the surrounding area (one
 18′ frame, 3×3 fields, per visit, from the same exposures, about 2.6 times the archive bytes
-of the normal frames), and until it has arrived the fields around the centre are drawn plain
-grey ("not loaded yet", unlike the checkerboard of pixels without data) and fill in where
-they are, the view staying put. For loops of more than 120 exposures it loads only at the
-first zoom-out or move past the field. The surround uses each exposure's sky level from the
-central field, so the picture in the centre does not change when the surround arrives; it
-has fewer exposures towards the edges (the label then shows a range such as `23–24 exposures`)
-and can show a faint brightness ramp (see Limitations). On the example, the first zoom-out or move
+of the normal frames), the frame on screen first, then the others in time order. Until a
+frame's surround has arrived its fields around the centre are drawn plain grey ("not loaded
+yet", unlike the checkerboard of pixels without data); they fill in frame by frame, each as
+soon as its own 18′ frame is in, the view staying put. Playback steps only to frames that show
+every field in view that the frame on screen shows, skipping the others until theirs are in,
+so sky never turns grey while it plays; the frame buttons and the timeline still reach every
+frame. For loops of more than 120 exposures it loads only at the first zoom-out or move past
+the field. The surround uses each exposure's sky level from the central field, so the picture
+in the centre does not change when the surround arrives; it has fewer exposures towards the
+edges (the label then shows a range such as `23–24 exposures`) and can show a faint
+brightness ramp (see Limitations). On the example, the first zoom-out or move
 past its field searches the archive at the example's position and detector, exactly as a
 search there; the example keeps playing until those frames replace it.
 
-Moving towards an edge loads the area further on ahead, one search and its 18′ frames: an
-arrow press that leaves the view within 1.5 fields (9′) of the edge it moves towards starts
-it, centred two fields (12′) on in that direction (one field when zoomed out to 12′; also one
-or two fields across when the view is that far off centre, so diagonally). The frames shown
-keep playing meanwhile; the new area replaces them when the view lies wholly inside it — at
-the latest at the old edge — with the sky in place, and the address bar and the RA/Dec
-fields then name its centre. One such load runs at a time, never while anything else loads,
-not in loops of more than 120 exposures, and not again for the area of the last one that
-failed; when the search limit is reached the status line says so once and loading resumes by
-itself when the limit allows. At the edge itself, holding an arrow key and resting for half a
-second searches the next 6′ field in that direction, unless something is loading or the
-search limit pauses loading.
+Moving towards an edge loads the area further on ahead: an arrow press that leaves the view
+within 1.5 fields (9′) of the edge it moves towards starts it, centred two fields (12′) on in
+that direction, across it on the field row (or column) that holds the view's centre — one field
+across, so diagonally, once the view's centre is half a field or more off the middle. So at
+views of 6′ and less the field the view enters past the edge is that area's centre. Zoomed out
+to 12′ the area is one field on (a view two fields wide must fit in it at the old edge), and its
+centre is already loaded. What the view heads into loads first. When both areas hold the same
+visits (as many frames, identical dates) and their grids meet within 0.25 px at the seam, the
+area's one search is followed by its centre as normal 6′ frames (exactly what a search there
+shows), the frame on screen first, then the others in time order, and then by its 18′ frames in
+the same order; the new area takes over as soon as the view lies wholly inside it, with the
+fields it shares copied from the loaded area and the sky in place: the view runs on past the old
+edge at once, the field ahead is grey in each frame until that frame's 6′ frame is in and then
+shows sky (playback as for the surround), the exposure label gives the range over the fields in
+view, and the 18′ frames replace the frames all together once every one is in (so playback never
+mixes the two areas' grids). Otherwise (zoomed out to 12′; other visits; or east or west beyond
+about |Dec| 59.5°, where the two grids are turned against each other by more than that) no 6′
+frames are loaded: its 18′ frames load, the frame on screen first, and the new area replaces the
+frames once all are in, at the latest at the old edge. The frames shown keep playing meanwhile,
+and the address bar and the RA/Dec fields name the new area's centre once it has taken over. One
+such load runs at a time, never while anything else loads, not in loops of more than 120
+exposures, and not again for the area of the last one that failed; when the search limit is
+reached the status line says so once and loading resumes by itself when the limit allows. At the
+edge itself, holding an arrow key and resting for half a second loads the area a preload would
+(zoomed out to 18′, the view spans the whole area and enters a strip of three fields that no
+single 6′ frame covers, so the area one field on and only its 18′ frames), unless something is
+loading or the search limit pauses loading.
+
+Each area costs one search. Its 18′ frames read about 2.6 times the archive bytes of 6′
+frames (narrow and wide cutouts are cached separately), so where its centre loads first as
+6′ frames an area reads about 3.6 instead of 2.6 times, some 40% more; elsewhere it reads
+what it did before. The 6′ frames count towards the per-visitor frame limit, the 18′ frames
+towards the wide limit (see Limits). Moving at one press per second at 6′ (7 pixels a press),
+the view crosses a field in about 8.4 s and needs a new area every two fields, about every
+17 s: at most 3.5 searches a minute (limit 6) and 3.5 times the visit count of frame and of
+wide frame requests a minute, within 18 a minute each for up to five visits; zoomed in, it
+moves slower. At 12′ and 18′ an area costs one search and its 18′ frames, as before.
 
 The arrow keys act on the page, its buttons and checkboxes, not while typing in RA or Dec,
 in the detector list, on the timeline (where they step frames; − and + still zoom) or with
@@ -249,7 +278,8 @@ asked again after the wait it names. On a failed check or an unreachable server 
   two exposures can have empty patches there. One constant per exposure leaves the real sky
   gradient: across 18′ the field medians differ by about one frame noise level, differently
   per frame, so a faint brightness ramp can show (in the 6′ frame about a third of that).
-- **Next area**: every step beyond the loaded area is a new search plus its 18′ frames. A
+- **Next area**: every step beyond the loaded area is a new search plus its 18′ frames (and,
+  at views of 6′ and less, first its centre's 6′ frames). A
   step straight back north or south returns to the same position and its frames are served
   from the cache; after an east, west or diagonal step the way back usually ends slightly off
   (the step follows the tangent plane of the area it starts from and is rounded to six

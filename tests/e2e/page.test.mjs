@@ -2389,11 +2389,15 @@ const DEEP_FRAMES = [
   { label: "2026-04-20", n_available: 41, n_used: 41 },
 ];
 
-/** Waits until the surround's pixels have replaced the "not loaded" fields of the wide grid. */
+/**
+ * Waits until the surround's pixels have replaced the "not loaded" fields of the wide grid and
+ * nothing loads any more (the frame on screen gets its surround before the others).
+ */
 async function waitForSurround(page) {
   await page.waitForFunction((n) => {
     const image = document.querySelector("#image");
-    return image.width === n && !image.classList.contains("pending");
+    return image.width === n && !image.classList.contains("pending")
+      && !document.querySelector("#status").textContent.includes("Loading");
   }, WIDE);
 }
 
@@ -2571,7 +2575,8 @@ test("in a deep field a key held at the edge searches the next area once, only a
       await waitForStatus(page, (t) => t === "Searching the next area…");
       assert.equal(log.searches.length, 2);
       const params = log.searches[1].searchParams;
-      const east = offsetPosition(plan.ra_deg, plan.dec_deg, -SIZE, 0);
+      // Two fields on: the field the view enters is the new area's centre.
+      const east = offsetPosition(plan.ra_deg, plan.dec_deg, -2 * SIZE, 0);
       assert.deepEqual([params.get("ra"), params.get("dec"), params.get("detector")],
         [fieldTexts(east.ra, east.dec).ra, fieldTexts(east.ra, east.dec).dec, "D2"]);
 
@@ -2729,7 +2734,7 @@ test("the next area keeps the loaded detector, clamps the frame, unticks Differe
 test("the next area replaces the frames with the view, zoom and playback kept and a new link",
   { timeout: TIMEOUT }, async () => {
     const first = makePlan(DEEP_FRAMES);
-    const east = offsetPosition(first.ra_deg, first.dec_deg, -SIZE, 0);
+    const east = offsetPosition(first.ra_deg, first.dec_deg, -2 * SIZE, 0);
     const eastTexts = fieldTexts(east.ra, east.dec);
     const second = {
       ...makePlan([
@@ -2769,7 +2774,7 @@ test("the next area replaces the frames with the view, zoom and playback kept an
       [eastTexts.ra, eastTexts.dec]);
     assert.equal(await text(page, "#name"), `RA ${eastTexts.ra}, Dec ${eastTexts.dec}`);
     assert.equal(await text(page, "#position"), formatPosition(east.ra, east.dec, "D2"));
-    await assertStage(page, { zoom: 2, cx: 14.25 + SIZE, cy: 88 }, WIDE);
+    await assertStage(page, { zoom: 2, cx: 14.25 + 2 * SIZE, cy: 88 }, WIDE);
     assert.equal((await sliderState(page)).max, 1);
     assert.equal(log.wides.filter((p) => p.ra_deg === east.ra).length, 2);
     assert.equal(log.frames.length, 3);
@@ -2784,7 +2789,7 @@ test("the next area replaces the frames with the view, zoom and playback kept an
       Array.from(toRGBA(centres[shownFrame], computeStretch(centres))));
 
     const summary = `2 frames from 150 of 150 exposures. ${NO_DATA}`;
-    await press(page, "ArrowLeft", 20);
+    await press(page, "ArrowLeft", 35);
     assert.equal(await waitForStatus(page, (t) => t.includes("The next area")),
       `${summary} The next area could not be loaded: The archive could not be reached.`);
     assert.equal(log.searches.length, 3);
@@ -3566,3 +3571,335 @@ test("each direction loads its own neighbour ahead; off centre across the move i
       await page.close();
     }
   });
+
+/** As renderedCanvas, with the bytes passed as base64 (fast enough to sample during playback). */
+async function renderedImage(page) {
+  const png = await page.locator("#frame").screenshot();
+  const { width, height, b64 } = await page.evaluate(async (data) => {
+    const bytes = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bitmap, 0, 0);
+    const rgba = ctx.getImageData(0, 0, bitmap.width, bitmap.height).data;
+    let text = "";
+    for (let i = 0; i < rgba.length; i += 0x8000) {
+      text += String.fromCharCode(...rgba.subarray(i, i + 0x8000));
+    }
+    return { width: bitmap.width, height: bitmap.height, b64: btoa(text) };
+  }, png.toString("base64"));
+  return { width, height, data: Buffer.from(b64, "base64") };
+}
+
+const PANEL = [21, 25, 34]; // --panel, #151922: fields not loaded yet
+const isPanel = (data, i) => data[i] === PANEL[0] && data[i + 1] === PANEL[1]
+  && data[i + 2] === PANEL[2];
+const isSky = (data, i) => data[i] === data[i + 1] && data[i + 1] === data[i + 2];
+
+/** Rendered pixels drawn as not loaded. */
+function notLoaded(render) {
+  let n = 0;
+  for (let i = 0; i < render.data.length; i += 4) if (isPanel(render.data, i)) n += 1;
+  return n;
+}
+
+/** Rendered pixels that showed sky in `before` and are drawn as not loaded in `after`. */
+function turnedGrey(before, after) {
+  assert.deepEqual([before.width, before.height], [after.width, after.height]);
+  let n = 0;
+  for (let i = 0; i < before.data.length; i += 4) {
+    if (isSky(before.data, i) && isPanel(after.data, i)) n += 1;
+  }
+  return n;
+}
+
+/**
+ * Stubs as tiledStubs, every search answering THREE_FRAMES at its position, with the 6' and
+ * wide frame answers of areas other than `plan`'s held until the test releases them:
+ * `narrow[i]` and `wide[i]` per plan index. Logs the plan indices of those requests.
+ */
+function heldNextArea(plan, nextPlan = planAt) {
+  const stubs = tiledStubs((url) => (url.searchParams.get("ra") === RA
+    ? { status: 200, body: plan } : { status: 200, body: nextPlan(url) }));
+  const gates = { narrow: [0, 1, 2, 3].map(deferred), wide: [0, 1, 2, 3].map(deferred) };
+  const next = { narrow: [], wide: [] };
+  const elsewhere = (p) => p.ra_deg !== plan.ra_deg || p.dec_deg !== plan.dec_deg;
+  return {
+    gates, next,
+    release: () => [...gates.narrow, ...gates.wide].forEach((g) => g.release()),
+    stubs: {
+      search: stubs.search,
+      frame: async (n, payload) => {
+        if (elsewhere(payload)) {
+          const i = visitIndex(payload);
+          next.narrow.push(i);
+          await gates.narrow[i].promise;
+        }
+        return stubs.frame(n, payload);
+      },
+      wide: async (n, payload) => {
+        if (elsewhere(payload)) {
+          const i = visitIndex(payload);
+          next.wide.push(i);
+          await gates.wide[i].promise;
+        }
+        return stubs.wide(n, payload);
+      },
+    },
+  };
+}
+
+/** Index of the visit a frame request asks for, in any plan from makePlan. */
+const visitIndex = (payload) => Number(/\/f(\d+)_/.exec(payload.uris[0])[1]);
+
+/** Renders the image until `done(render)` holds, for at most 10 s. */
+async function renderUntil(page, done) {
+  const deadline = Date.now() + 10_000;
+  let render;
+  do {
+    render = await renderedImage(page);
+    if (done(render)) return render;
+    await page.waitForTimeout(50);
+  } while (Date.now() < deadline);
+  throw new Error("the picture never reached the expected state");
+}
+
+test("moving into the next area shows the field ahead as soon as the frame on screen's 6' "
+  + "frame is in, before any of its wide frames, sky never turning grey, with one search",
+{ timeout: 60_000 }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const held = heldNextArea(plan);
+  const { page, log } = await openWithSurround({ plan, ...held.stubs });
+  try {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await selectFrame(page, 1);
+    await page.evaluate(() => document.activeElement.blur());
+    await press(page, "ArrowLeft");
+    // The frame on screen's 6' frame of the next area's centre is asked for first.
+    await waitForCount(held.next.narrow, 1);
+    assert.deepEqual(held.next.narrow, [1]);
+    const east = offsetPosition(plan.ra_deg, plan.dec_deg, -2 * SIZE, 0);
+    const eastTexts = fieldTexts(east.ra, east.dec);
+    assert.deepEqual(searchedAt(log.searches[1]), [eastTexts.ra, eastTexts.dec, "D2"]);
+    // At the old edge the area joins on, with the fields it shares: nothing turns grey.
+    await press(page, "ArrowLeft", 8);
+    await assertStage(page, { zoom: 1, cx: 147, cy: 88 }, WIDE);
+    assert.equal(await page.evaluate(() => location.search),
+      `?ra=${eastTexts.ra}&dec=${eastTexts.dec}&detector=D2`);
+    assert.equal(notLoaded(await renderedImage(page)), 0);
+    // On into the field ahead: not loaded yet, drawn plain.
+    await press(page, "ArrowLeft", 4);
+    await assertStage(page, { zoom: 1, cx: 119, cy: 88 }, WIDE);
+    const entered = await renderedImage(page);
+    assert.ok(notLoaded(entered) > entered.width * entered.height / 5, "field ahead not plain");
+    assert.ok(isPanel(entered.data, 4 * (Math.round(entered.height / 2) * entered.width + 2)));
+
+    held.gates.narrow[1].release();
+    const shownSky = await renderUntil(page, (r) => notLoaded(r) === 0);
+    assert.equal(turnedGrey(entered, shownSky), 0);
+    // Shown before any wide frame of the next area was even asked for.
+    assert.deepEqual(held.next.wide, []);
+    await waitForCount(held.next.narrow, 2);
+    assert.deepEqual(held.next.narrow, [1, 0]);
+
+    // Playback skips the frames whose field ahead is not in yet, so it never shows grey.
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    for (let i = 0; i < 8; i++) {
+      assert.equal(turnedGrey(shownSky, await renderedImage(page)), 0);
+      assert.equal((await sliderState(page)).value, 1);
+      await page.waitForTimeout(150);
+    }
+    held.gates.narrow[0].release();
+    const seen = new Set();
+    const deadline = Date.now() + 5000;
+    while (seen.size < 2 && Date.now() < deadline) {
+      assert.equal(turnedGrey(shownSky, await renderedImage(page)), 0);
+      seen.add((await sliderState(page)).value);
+    }
+    assert.deepEqual([...seen].sort(), [0, 1]);
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    const paused = (await sliderState(page)).value;
+    const before = await renderedImage(page);
+    held.gates.narrow[2].release();
+    // Then the wide frames, the frame on screen first.
+    await waitForCount(held.next.wide, 1);
+    assert.deepEqual(held.next.wide, [paused]);
+    assert.equal(turnedGrey(before, await renderedImage(page)), 0);
+    for (const gate of held.gates.wide) gate.release();
+    await waitForSurround(page);
+    assert.equal(await finalStatus(page), "3 frames from 42 of 42 exposures.");
+    assert.deepEqual(held.next.wide, requestOrderOf(paused, 3));
+    assert.equal(turnedGrey(before, await renderedImage(page)), 0);
+    await assertStage(page, { zoom: 1, cx: 119, cy: 88 }, WIDE);
+    assert.equal(log.searches.length, 2);
+    assert.equal(log.frames.length, 6);
+    assert.equal(log.wides.length, 6);
+    assertCleanRun(log);
+  } finally {
+    held.release();
+  }
+});
+
+/** The frame on screen first, then the others in time order. */
+function requestOrderOf(first, n) {
+  return [first, ...Array.from({ length: n }, (_, i) => i).filter((i) => i !== first)];
+}
+
+test("when the next area's visits differ, or its grid would meet the loaded one off by more "
+  + "than 0.25 px, nothing of it shows before all its wide frames are in", { timeout: 60_000 },
+async () => {
+  const cases = {
+    "other visits": [makePlan(THREE_FRAMES), (url) => ({
+      ...makePlan([...THREE_FRAMES, { label: "2026-10-01", n_available: 5, n_used: 5 }]),
+      ra_deg: Number(url.searchParams.get("ra")), dec_deg: Number(url.searchParams.get("dec")),
+    })],
+    // Two fields east at Dec 70 the grids are 0.41 px apart at the seam.
+    "Dec 70": [{ ...makePlan(THREE_FRAMES), dec_deg: 70 }, planAt],
+  };
+  for (const [name, [plan, nextPlan]] of Object.entries(cases)) {
+    const held = heldNextArea(plan, nextPlan);
+    const { page, log } = await openWithSurround({ plan, ...held.stubs });
+    try {
+      await page.setViewportSize({ width: 1366, height: 768 });
+      await selectFrame(page, 2);
+      await page.evaluate(() => document.activeElement.blur());
+      const link = await page.evaluate(() => location.search);
+      await press(page, "ArrowLeft");
+      await waitForCount(held.next.wide, 1);
+      // No 6' frame there; the frame on screen's wide frame first.
+      assert.deepEqual(held.next.wide, [2], name);
+      await press(page, "ArrowLeft", 8);
+      await recordKeyDefaults(page);
+      await press(page, "ArrowLeft", 3);
+      // The view waits at the old edge, the pushes not used, the old area unchanged.
+      await assertStage(page, { zoom: 1, cx: 29, cy: 88 }, WIDE);
+      assert.deepEqual(await keyDefaults(page), Array(3).fill(["ArrowLeft", false]), name);
+      const atEdge = await renderedImage(page);
+      assert.equal(notLoaded(atEdge), 0, name);
+      assert.equal(await page.evaluate(() => location.search), link, name);
+      held.gates.wide[2].release();
+      await waitForCount(held.next.wide, 2);
+      held.gates.wide[0].release();
+      await waitForCount(held.next.wide, 3);
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => location.search), link, name);
+      assert.equal(turnedGrey(atEdge, await renderedImage(page)), 0, name);
+      for (const gate of held.gates.wide) gate.release();
+      await page.waitForFunction((old) => location.search !== old, link);
+      await assertStage(page, { zoom: 1, cx: 147, cy: 88 }, WIDE);
+      await finalStatus(page);
+      assert.deepEqual(held.next.narrow, [], name);
+      const n = name === "other visits" ? 4 : 3;
+      assert.deepEqual(held.next.wide, requestOrderOf(2, n), name);
+      assert.equal(log.searches.length, 2, name);
+      assertCleanRun(log);
+    } finally {
+      held.release();
+      await page.close();
+    }
+  }
+});
+
+test("the surround loads the frame on screen first, each frame's as soon as it is in; playback "
+  + "skips frames still without it, so the picture never flashes grey", { timeout: 60_000 },
+async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const last = deferred();
+  const gates = [0, 1, 2].map(deferred);
+  const order = [];
+  const { page, log } = await openPage({
+    search: () => ({ status: 200, body: plan }),
+    frame: async (n, payload) => {
+      if (n === 2) await last.promise;
+      return frameOk(plan)(n, payload);
+    },
+    wide: async (n, payload, served) => {
+      const i = planIndex(plan, payload);
+      order.push(i);
+      await gates[i].promise;
+      return texturedWide(n, payload, served);
+    },
+  });
+  try {
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await submit(page);
+    await waitForStatus(page, (t) => t.startsWith("Loading frame 3"));
+    await selectFrame(page, 1);
+    last.release();
+    await waitForCount(order, 1);
+    assert.deepEqual(order, [1]);
+    await page.evaluate(() => document.activeElement.blur());
+    await page.keyboard.type("-");
+    await page.keyboard.type("-");
+    await assertStage(page, { zoom: 1 / 3, cx: 88, cy: 88 }, WIDE);
+    const plain = await renderedImage(page);
+    assert.ok(notLoaded(plain) > plain.width * plain.height / 2);
+    gates[1].release();
+    const surround = await renderUntil(page, (r) => notLoaded(r) === 0);
+    assert.equal(turnedGrey(plain, surround), 0);
+    await waitForCount(order, 2);
+    assert.deepEqual(order, [1, 0]);
+    await page.click("#play");
+    await page.evaluate(() => document.activeElement.blur());
+    for (let i = 0; i < 8; i++) {
+      assert.equal(notLoaded(await renderedImage(page)), 0);
+      assert.equal((await sliderState(page)).value, 1);
+      await page.waitForTimeout(150);
+    }
+    gates[0].release();
+    const seen = new Set();
+    const deadline = Date.now() + 5000;
+    while (seen.size < 2 && Date.now() < deadline) {
+      assert.equal(notLoaded(await renderedImage(page)), 0);
+      seen.add((await sliderState(page)).value);
+    }
+    assert.deepEqual([...seen].sort(), [0, 1]);
+    // The frame buttons still reach a frame without its surround.
+    await page.click("#play");
+    await selectFrame(page, 2);
+    assert.ok(notLoaded(await renderedImage(page)) > 0);
+    gates[2].release();
+    await waitForSurround(page);
+    assert.equal(await finalStatus(page), `3 frames from 42 of 42 exposures. ${NO_DATA}`);
+    assert.deepEqual(order, [1, 0, 2]);
+    assert.equal(log.searches.length, 1);
+    assertCleanRun(log);
+  } finally {
+    last.release();
+    gates.forEach((g) => g.release());
+  }
+});
+
+test("while the next area loads after joining on, a push at its edge is not used and nothing "
+  + "loads after it; a key held there queues nothing", { timeout: 60_000 }, async () => {
+  const plan = makePlan(THREE_FRAMES);
+  const held = heldNextArea(plan);
+  const { page, log } = await openWithSurround({ plan, ...held.stubs });
+  try {
+    await page.setViewportSize({ width: 700, height: 400 });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await press(page, "ArrowDown");
+    await waitForCount(held.next.narrow, 1);
+    await press(page, "ArrowDown", 8);
+    await assertStage(page, { zoom: 1, cx: 88, cy: 29 }, WIDE);
+    held.gates.narrow[0].release();
+    await press(page, "ArrowDown", 17);
+    await assertStage(page, { zoom: 1, cx: 88, cy: 147 }, WIDE);
+    assert.equal(await page.evaluate(() => window.scrollY), 0);
+    await recordKeyDefaults(page);
+    for (let i = 0; i < 6; i++) await page.keyboard.down("ArrowDown");
+    await page.keyboard.up("ArrowDown");
+    assert.deepEqual(await keyDefaults(page), Array(6).fill(["ArrowDown", false]));
+    held.release();
+    await waitForSurround(page);
+    await page.waitForTimeout(900);
+    assert.ok(await page.evaluate(() => window.scrollY) > 0, "ArrowDown did not scroll");
+    assert.equal(log.searches.length, 2);
+    assert.deepEqual([held.next.narrow, held.next.wide], [[0, 1, 2], [0, 1, 2]]);
+    assertCleanRun(log);
+  } finally {
+    held.release();
+  }
+});
